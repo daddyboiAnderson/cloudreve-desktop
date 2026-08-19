@@ -39,6 +39,8 @@ use std::{
 use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
 #[cfg(windows)]
+use crate::cfapi::utility::WriteAt;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::SHCNE_ATTRIBUTES;
 #[cfg(not(windows))]
 const SHCNE_ATTRIBUTES: u32 = 0;
