@@ -44,8 +44,54 @@ cargo tauri build              # Production build
 │   ├── cloudreve-sync/  # Core sync service (main logic)
 │   ├── cloudreve-api/   # Async REST client for Cloudreve server
 │   └── win32_notif/     # Windows notification utilities
+├── macos/               # macOS File Provider (NSFileProvider) integration
 └── ui/                  # React frontend (Vite + MUI)
 ```
+
+### macOS File Provider (`macos/`)
+
+- `fileprovider/Sources/`: Swift `NSFileProviderReplicatedExtension` backed by the Cloudreve API — enumerates directories, downloads file contents on demand, and supports mutations (create/upload, rename, move, delete-to-trash; local/relay storage policies only). Reads `~/.cloudreve/drives.json` via a sandbox temporary-exception (local dev only; use an app group for distribution).
+- On macOS, drives are **File Provider only**: `Mount::start()` is a no-op (no sync folder, no FS watcher, no initial sync), `MountCommand::Sync` is ignored, and `get_drives_info` reports the domain's user-visible URL (`~/Library/CloudStorage/...`) instead of `sync_path`.
+- Remote-change feed: the app's SSE listener (`remote_events.rs`) appends events to `~/.cloudreve/fp-events/<drive-id>.jsonl` and calls `signalEnumerator(workingSet)` — the extension replays the log in `enumerateChanges`. The extension itself cannot hold a long-lived SSE connection (XPC services are suspended when idle). Only the working-set container may be signaled for replicated extensions (per NSFileProviderManager.h docs); anchors are event timestamps (`evt-<millis>`), unknown anchors yield `syncAnchorExpired` (full rescan).
+- Client IDs: the app sends `X-Cr-Client-Id` derived from the drive UUID (`api_client_id` in mounts.rs) — sharing one ID across processes breaks the server-side event channel.
+- `fileprovider/Support/`: appex `Info.plist` (`com.apple.fileprovider-nonui` extension point) and entitlements
+- `fpctl/fpctl.swift`: generic CLI to list/add/remove FP domains; run it from inside a host app bundle to manage that bundle's domains
+- `testhost/`: minimal host app for testing the extension without building the Tauri app
+- `scripts/build-extension.sh`: builds the appex with raw `swiftc` (no Xcode project), ad-hoc signs it
+- `scripts/embed-into-app.sh`: embeds the appex into a built `Cloudreve.app`, re-signs, refreshes LS/pluginkit — run after every `cargo tauri build --bundles app`
+
+Rust-side domain lifecycle: `crates/cloudreve-sync/src/fileprovider.rs` (one domain per drive, `NSFileProviderManager` via hand-rolled `msg_send!` since `objc2-file-provider` lacks Manager bindings; domain registration is called from `src-tauri` on startup and on add/remove drive).
+
+#### Cloudreve API reference (up-to-date docs)
+
+- API overview: https://docs.cloudreve.org/en/api/overview
+- Events (SSE): https://docs.cloudreve.org/en/api/events
+- Complete v4 API reference (Apifox): https://cloudrevev4.apifox.cn/
+- Rename file endpoint: https://cloudrevev4.apifox.cn/rename-file-300254639e0
+
+Endpoints used by the extension (all under `{instance_url}/api/v4`, auth via `Authorization: Bearer <access_token>`):
+- `GET /file?uri=<cloudreve://my/...>&page_size=&next_page_token=|page=` — list directory (token- or page-based pagination)
+- `GET /file/info?uri=` — file metadata (`type` 0=file/1=folder, `path` is a full `cloudreve://my/...` URI)
+- `POST /file/url` `{uris, download:true}` → presigned download URLs
+- `PUT /file/upload` `{uri, size, policy_id:"", entity_type:"version"?}` → upload session; chunks via `POST /file/upload/{session_id}/{index}` (local/relay policies auto-complete). Failed sessions leave file locks (error 40073) — release via `DELETE /file/lock` `{tokens:[...]}` (tokens are in the error's `data`), or cancel via `DELETE /file/upload` `{id, uri}`
+- `POST /file/create` `{uri, type:"file"|"folder"}`, `POST /file/rename` `{uri, new_name}`, `POST /file/move` `{uris, dst}`, `DELETE /file` `{uris}` — mutations; DELETE without `unlink` is a soft delete (server trash; trash listing URI is `cloudreve://trash`)
+- `POST /file/restore` `{uris}` — restore from trash. **Quirk:** trash items live at `cloudreve://trash/<uuid>`, and restore emits `create` events with that bogus UUID path — always verify create/modify event paths with `/file/info`; on 404, force a full rescan instead of replaying the event.
+- `POST /session/token/refresh` `{refresh_token}` → new token pair
+- `GET /file/events?uri=` — SSE stream (`event:` subscribed/resumed/keep-alive/reconnect-required/event; data is a JSON array of `{type: create|modify|rename|delete, file_id, from, to}`, paths relative to subscribed URI, leading slash). Requires an `X-Cr-Client-Id` header with a UUID. One live channel per client ID: reconnecting with a used ID attaches to a dead channel ("resumed") that receives nothing — always subscribe with a fresh UUID.
+
+#### NSFileProvider implementation knowledge (hard-won)
+
+- Replicated extensions only honor `signalEnumerator` for the **working-set container**; per-container signals are silently ignored (see NSFileProviderManager.h).
+- XPC services are suspended when idle — no long-lived SSE in the extension; the app owns the event stream and shares events via `~/.cloudreve/fp-events/<drive-id>.jsonl` (JSON lines: `{ts, type, from, to}`; `type: "rescan"` forces a full rescan).
+- Sync anchors are `evt-<millis>` event-log timestamps; unknown anchors → `syncAnchorExpired` → full rescan (safe recovery after extension restarts).
+- Declaring the trash container unsupported (`enumerator(for: .trashContainer)` throws `NSFeatureUnsupportedError`) makes the system route Finder "Move to Trash" straight to `deleteItem`, which soft-deletes to the server trash.
+- Items returned to the system must have an `itemVersion` or the extension crashes (`__FILEPROVIDER_BAD_ITEM_MISSING_ITEMVERSION__`).
+
+macOS development notes:
+- The dev build uses bundle id `cloudreve.desktop.dev` so it never clashes with an installed `/Applications/Cloudreve.app` (`NSFileProviderManager` resolves providers per host bundle id).
+- New File Provider domains start **user-disabled**; enable once in System Settings → General → Login Items & Extensions → File Providers.
+- `pluginkit -a <appex>` is needed to register hand-built extensions; `fileproviderctl dump <domain>` shows sync engine state.
+- `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.dev.fileprovider"'` for extension logs.
 
 ### Tauri Layer (`src-tauri/`)
 

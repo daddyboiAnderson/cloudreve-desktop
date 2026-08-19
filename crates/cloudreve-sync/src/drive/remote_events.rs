@@ -3,10 +3,11 @@ use crate::{
     drive::{commands::MountCommand, mounts::Mount, sync::SyncMode},
 };
 use anyhow::{Context, Result};
-use cloudreve_api::{
-    api::explorer::FileEventsApi,
-    models::explorer::{FileEvent, FileEventData, FileEventType},
-};
+use cloudreve_api::models::explorer::{FileEvent, FileEventData, FileEventType};
+#[cfg(target_os = "macos")]
+use cloudreve_api::api::explorer::ExplorerApi;
+#[cfg(not(target_os = "macos"))]
+use cloudreve_api::api::explorer::FileEventsApi;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -114,7 +115,22 @@ impl Mount {
             (config.remote_path.clone(), config.sync_path.clone())
         };
 
-        let mut subscription = match self.cr_client.subscribe_file_events(&remote_base).await {
+        // macOS: subscribe with a fresh client ID per attempt. The server keeps
+        // one event channel per client ID, and reusing an ID can attach to a
+        // dead channel ("resumed") that never delivers live events. Gaps from
+        // downtime are covered by the rescan marker written on subscribe.
+        #[cfg(target_os = "macos")]
+        let subscription = self
+            .cr_client
+            .subscribe_file_events_with_client_id(
+                &remote_base,
+                &uuid::Uuid::new_v4().to_string(),
+            )
+            .await;
+        #[cfg(not(target_os = "macos"))]
+        let subscription = self.cr_client.subscribe_file_events(&remote_base).await;
+
+        let mut subscription = match subscription {
             Ok(sub) => sub,
             Err(e) => return ListenResult::Error(e.into()),
         };
@@ -131,15 +147,24 @@ impl Mount {
                     FileEvent::Resumed => {
                         self.set_event_push_subscribed(true).await;
                         tracing::debug!(target: "drive::remote_events", "Subscription resumed");
+                        #[cfg(target_os = "macos")]
+                        self.record_rescan_marker().await;
                     }
                     FileEvent::Subscribed => {
                         self.set_event_push_subscribed(true).await;
                         tracing::info!(target: "drive::remote_events", "New subscribtion, triggger full sync...");
-                        let _ = self.command_tx.send(MountCommand::Sync {
-                            local_paths: vec![sync_path.clone()],
-                            mode: SyncMode::FullHierarchy,
-                            user_initiated: false,
-                        });
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.record_rescan_marker().await;
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let _ = self.command_tx.send(MountCommand::Sync {
+                                local_paths: vec![sync_path.clone()],
+                                mode: SyncMode::FullHierarchy,
+                                user_initiated: false,
+                            });
+                        }
                     }
                     FileEvent::KeepAlive => {
                         tracing::trace!(target: "drive::remote_events", "Keep-alive");
@@ -162,44 +187,172 @@ impl Mount {
         }
     }
 
+    /// On macOS, after every (re)subscription write a "rescan" marker to the
+    /// FP event log and signal the working set. The extension answers with a
+    /// syncAnchorExpired full rescan, closing gaps from events missed while
+    /// the stream was down.
+    #[cfg(target_os = "macos")]
+    async fn record_rescan_marker(&self) {
+        let (drive_id, drive_name) = {
+            let config = self.config.read().await;
+            (config.id.clone(), config.name.clone())
+        };
+        if let Err(e) = crate::fileprovider::append_rescan_marker(&drive_id) {
+            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP rescan marker");
+        }
+        crate::fileprovider::signal_containers(
+            &crate::fileprovider::domain_identifier(&drive_id),
+            &drive_name,
+            &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
+        );
+    }
+
     async fn handle_file_events(
         &self,
         sync_root: PathBuf,
         events: Vec<FileEventData>,
     ) -> Result<()> {
-        // Group events by type
-        let mut create_update_events: Vec<FileEventData> = Vec::new();
-        let mut rename_events: Vec<FileEventData> = Vec::new();
-        let mut delete_events: Vec<FileEventData> = Vec::new();
+        // On macOS the File Provider extension owns the file view; instead of
+        // writing to a local replica, record the events to a shared log the
+        // extension replays from, then signal the domain's working set so the
+        // system pulls the changes. Note: for replicated extensions the
+        // system ignores signals for any container other than the working set.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = sync_root;
+            let (drive_id, drive_name, remote_path) = {
+                let config = self.config.read().await;
+                (
+                    config.id.clone(),
+                    config.name.clone(),
+                    config.remote_path.clone(),
+                )
+            };
 
-        for event in events {
-            match event.event_type {
-                FileEventType::Create => create_update_events.push(event),
-                FileEventType::Modify => create_update_events.push(event),
-                FileEventType::Rename => rename_events.push(event),
-                FileEventType::Delete => delete_events.push(event),
+            // Some server-side operations (notably trash restore) emit events
+            // whose paths don't exist (e.g. internal storage UUIDs). Verify
+            // create/modify events; bogus ones trigger a full rescan instead.
+            let mut verified_events: Vec<&FileEventData> = Vec::new();
+            let mut needs_rescan = false;
+            for e in &events {
+                match e.event_type {
+                    FileEventType::Create | FileEventType::Modify => {
+                        let uri = format!("{}{}", remote_path, e.from);
+                        let info = self
+                            .cr_client
+                            .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
+                                uri: Some(uri),
+                                ..Default::default()
+                            })
+                            .await;
+                        if info.is_ok() {
+                            verified_events.push(e);
+                        } else {
+                            needs_rescan = true;
+                        }
+                    }
+                    _ => verified_events.push(e),
+                }
             }
+
+            if needs_rescan {
+                if let Err(e) = crate::fileprovider::append_rescan_marker(&drive_id) {
+                    tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP rescan marker");
+                }
+            }
+            let events_to_log: Vec<FileEventData> =
+                verified_events.iter().map(|e| (*e).clone()).collect();
+            if !events_to_log.is_empty() {
+                if let Err(e) = crate::fileprovider::append_domain_events(&drive_id, &events_to_log)
+                {
+                    tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP domain events");
+                }
+            }
+
+            // Record activity so the tray popup's RECENT list reflects FP
+            // sync. Paths point at the File Provider location.
+            let fp_root = crate::fileprovider::user_visible_url(
+                &crate::fileprovider::domain_identifier(&drive_id),
+                &drive_name,
+            )
+            .await;
+            for e in &events_to_log {
+                let rel = if e.to.is_empty() { &e.from } else { &e.to };
+                if rel
+                    .rsplit('/')
+                    .next()
+                    .map(|name| name == ".DS_Store" || name.starts_with("._"))
+                    .unwrap_or(true)
+                {
+                    continue; // Finder metadata, not real activity
+                }
+                let local_path = match &fp_root {
+                    Some(root) => format!("{}{}", root.trim_end_matches('/'), rel),
+                    None => rel.clone(),
+                };
+                let mut record = crate::inventory::NewTaskRecord::new(
+                    format!("fp-{}", uuid::Uuid::new_v4()),
+                    drive_id.clone(),
+                    "download",
+                    local_path,
+                );
+                record.status = crate::inventory::TaskStatus::Completed;
+                record.progress = 1.0;
+                if let Err(err) = self.inventory.insert_task_if_not_exist(&record) {
+                    tracing::warn!(target: "drive::remote_events", error = %err, "Failed to record FP activity");
+                }
+            }
+
+            tracing::info!(
+                target: "drive::remote_events",
+                id = %drive_id,
+                count = events.len(),
+                "Signaling File Provider working set for remote changes"
+            );
+            crate::fileprovider::signal_containers(
+                &crate::fileprovider::domain_identifier(&drive_id),
+                &drive_name,
+                &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
+            );
+            return Ok(());
         }
 
-        // Handle Create events grouped by parent
-        if !create_update_events.is_empty() {
-            self.handle_create_update_events(sync_root.clone(), create_update_events)
-                .await?;
-        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Group events by type
+            let mut create_update_events: Vec<FileEventData> = Vec::new();
+            let mut rename_events: Vec<FileEventData> = Vec::new();
+            let mut delete_events: Vec<FileEventData> = Vec::new();
 
-        // Handle Delete events
-        if !delete_events.is_empty() {
-            self.handle_delete_events(sync_root.clone(), delete_events)
-                .await?;
-        }
+            for event in events {
+                match event.event_type {
+                    FileEventType::Create => create_update_events.push(event),
+                    FileEventType::Modify => create_update_events.push(event),
+                    FileEventType::Rename => rename_events.push(event),
+                    FileEventType::Delete => delete_events.push(event),
+                }
+            }
 
-        // Handle Rename events
-        if !rename_events.is_empty() {
-            self.handle_rename_events(sync_root.clone(), rename_events)
-                .await?;
-        }
+            // Handle Create events grouped by parent
+            if !create_update_events.is_empty() {
+                self.handle_create_update_events(sync_root.clone(), create_update_events)
+                    .await?;
+            }
 
-        Ok(())
+            // Handle Delete events
+            if !delete_events.is_empty() {
+                self.handle_delete_events(sync_root.clone(), delete_events)
+                    .await?;
+            }
+
+            // Handle Rename events
+            if !rename_events.is_empty() {
+                self.handle_rename_events(sync_root.clone(), rename_events)
+                    .await?;
+            }
+
+            Ok(())
+        }
     }
 
     async fn handle_rename_events(

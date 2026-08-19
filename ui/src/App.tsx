@@ -1,4 +1,4 @@
-import { Suspense, useMemo } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ThemeProvider,
   CssBaseline,
@@ -6,6 +6,8 @@ import {
   useMediaQuery,
 } from "@mui/material";
 import { Routes, Route, HashRouter } from "react-router-dom";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { Theme as TauriTheme } from "@tauri-apps/api/window";
 import "@fontsource/roboto/300.css";
 import "@fontsource/roboto/400.css";
 import "@fontsource/roboto/500.css";
@@ -30,25 +32,58 @@ function LoadingFallback() {
   );
 }
 
+/**
+ * Resolve the UI theme from the native window appearance (Tauri) and fall
+ * back to the CSS media query. Some windows (transparent/undecorated tray
+ * popups, overlay title bars) misreport `prefers-color-scheme` in WKWebView,
+ * so the native value wins when available.
+ */
+function useDarkMode(): boolean {
+  const mediaDark = useMediaQuery("(prefers-color-scheme: dark)");
+  const [nativeDark, setNativeDark] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    const win = getCurrentWindow();
+    win
+      .theme()
+      .then((t: TauriTheme | null) => setNativeDark(t === "dark"))
+      .catch(() => setNativeDark(null));
+    win
+      .onThemeChanged(({ payload }) => setNativeDark(payload === "dark"))
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => unlisten?.();
+  }, []);
+
+  return nativeDark ?? mediaDark;
+}
+
 function App() {
-  const prefersDarkMode = useMediaQuery("(prefers-color-scheme: dark)");
+  const darkMode = useDarkMode();
   const theme = useMemo(
-    () => createAppTheme(prefersDarkMode ? "dark" : "light"),
-    [prefersDarkMode]
+    () => createAppTheme(darkMode ? "dark" : "light"),
+    [darkMode]
   );
 
   return (
     <Suspense fallback={<LoadingFallback />}>
       <ThemeProvider theme={theme}>
         <CssBaseline enableColorScheme />
-        <HashRouter>
-          <Routes>
-            <Route path="/add-drive" element={<AddDrive />} />
-            <Route path="/reauthorize/:driveId/:siteUrl/:driveName" element={<AddDrive mode="reauthorize" />} />
-            <Route path="/popup" element={<Popup />} />
-            <Route path="/settings" element={<Settings />} />
-          </Routes>
-        </HashRouter>
+        {/* Paint the resolved theme background so windows with a fixed native
+            background color never show through. */}
+        <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
+          <HashRouter>
+            <Routes>
+              <Route path="/add-drive" element={<AddDrive />} />
+              <Route path="/reauthorize/:driveId/:siteUrl/:driveName" element={<AddDrive mode="reauthorize" />} />
+              <Route path="/popup" element={<Popup />} />
+              <Route path="/settings" element={<Settings />} />
+            </Routes>
+          </HashRouter>
+        </Box>
       </ThemeProvider>
     </Suspense>
   );

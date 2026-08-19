@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ExtensionKit requires the sandbox on macOS 14+. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!--
+	Local development shortcut: let the sandboxed extension read the main
+	app's config (~/.cloudreve/drives.json) for drive settings + tokens.
+	A distributed build should share state via an app group instead
+	(requires a paid Developer team ID).
+	-->
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
+	<array>
+		<string>/.cloudreve/</string>
+	</array>
+</dict>
+</plist>
