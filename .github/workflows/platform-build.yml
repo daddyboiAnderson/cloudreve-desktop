@@ -31,9 +31,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version 2.11.4 --locked
-
       - name: Install frontend dependencies
         working-directory: ui
         run: yarn install --frozen-lockfile
@@ -46,7 +43,7 @@ jobs:
         run: cargo check --workspace
 
       - name: Compile desktop application
-        run: cargo tauri build --no-bundle
+        run: cargo build --manifest-path src-tauri/Cargo.toml
 
       - name: Compile macOS File Provider extension
         if: runner.os == 'macOS'
