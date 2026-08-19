@@ -1,0 +1,53 @@
+name: Platform builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            os: macos-latest
+          - platform: Windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: ui/yarn.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Install frontend dependencies
+        working-directory: ui
+        run: yarn install --frozen-lockfile
+
+      - name: Build frontend
+        working-directory: ui
+        run: yarn build
+
+      - name: Check Rust workspace
+        run: cargo check --workspace
+
+      - name: Compile desktop application
+        run: cargo tauri build --no-bundle
+
+      - name: Compile macOS File Provider extension
+        if: runner.os == 'macOS'
+        run: ./macos/scripts/build-extension.sh
