@@ -803,7 +803,9 @@ pub trait FileEventsApi {
     ///     while let Some(event) = subscription.next_event().await? {
     ///         match event {
     ///             cloudreve_api::models::explorer::FileEvent::Event(data) => {
-    ///                 println!("File event: {:?} on {}", data.event_type, data.from);
+    ///                 for item in data {
+    ///                     println!("File event: {:?} on {}", item.event_type, item.from);
+    ///                 }
     ///             }
     ///             _ => {}
     ///         }
@@ -818,6 +820,23 @@ pub trait FileEventsApi {
 #[async_trait]
 impl FileEventsApi for Client {
     async fn subscribe_file_events(&self, uri: &str) -> ApiResult<FileEventSubscription> {
+        self.subscribe_file_events_with_client_id(uri, &self.config.client_id.clone())
+            .await
+    }
+}
+
+impl Client {
+    /// Subscribe to file events with an explicit client ID.
+    ///
+    /// The server keeps one event channel per client ID; reconnecting with a
+    /// previously used ID can attach to a dead server-side channel ("resumed")
+    /// that never delivers live events. Callers that need reliable delivery
+    /// should pass a fresh UUID per subscription attempt.
+    pub async fn subscribe_file_events_with_client_id(
+        &self,
+        uri: &str,
+        client_id: &str,
+    ) -> ApiResult<FileEventSubscription> {
         let query = format!("?uri={}", urlencoding::encode(uri));
         let url = self.build_url(&format!("/file/events{}", query));
         let token = self.get_access_token().await?;
@@ -825,10 +844,7 @@ impl FileEventsApi for Client {
         let response = self
             .http_client
             .get(&url)
-            .header(
-                format!("{}Client-Id", CR_HEADER_PREFIX),
-                self.config.client_id.clone(),
-            )
+            .header(format!("{}Client-Id", CR_HEADER_PREFIX), client_id)
             .header("Authorization", format!("Bearer {}", token))
             .header("Accept", "text/event-stream")
             .send()

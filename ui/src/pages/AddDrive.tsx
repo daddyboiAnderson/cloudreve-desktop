@@ -1,4 +1,5 @@
-import { Alert, Box, Button, CircularProgress, Container, InputAdornment, Snackbar, Typography } from "@mui/material";
+import { Alert, Box, Button, CircularProgress, Container, IconButton, InputAdornment, Snackbar, Typography } from "@mui/material";
+import CloseIcon from "@mui/icons-material/Close";
 import { openUrl, openPath } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { invoke } from '@tauri-apps/api/core';
@@ -8,7 +9,6 @@ import { useTranslation } from "react-i18next";
 import { useParams } from "react-router-dom";
 import defaultLogo from "../assets/cloudreve.svg";
 import { FilledTextField } from "../common/StyledComponent";
-import { useIsWindows10 } from "../hooks/useIsWindows10";
 import { fetchSiteIcon, isValidUrl } from "../utils/manifest";
 import { generatePKCEPair, randomCryptoString } from "../utils/pkce";
 import {
@@ -19,6 +19,8 @@ import {
 } from "../utils/siteValidation";
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { platform } from '@tauri-apps/plugin-os';
+import { homeDir } from '@tauri-apps/api/path';
 import { CALLBACK_PATH, CLIENT_ID, SCOPES } from "../utils/constants";
 
 type PageState = "url_input" | "waiting" | "final_setup" | "setting_up" | "success";
@@ -87,7 +89,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   const { driveId, siteUrl: encodedSiteUrl, driveName: driveNameQuery } = useParams<{ driveId?: string; siteUrl?: string, driveName: string }>();
   const isReauthorize = mode === "reauthorize" && driveId && encodedSiteUrl;
   const decodedSiteUrl = encodedSiteUrl ? decodeURIComponent(encodedSiteUrl) : "";
-  const isWindows10 = useIsWindows10();
+  // macOS uses the native File Provider integration (Finder location) instead
+  // of syncing to a user-chosen local folder, so no local path is needed.
+  const [isMacOS] = useState(() => platform() === "macos");
 
   const [siteUrl, setSiteUrl] = useState(isReauthorize ? decodedSiteUrl : "");
   const [loading, setLoading] = useState(false);
@@ -128,7 +132,9 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
       pkceSessionRef.current.callbackData = callbackData;
 
       // Transition to final setup page
-      callbackData.name && setDriveName(callbackData.name);
+      if (callbackData.name) {
+        setDriveName(callbackData.name);
+      }
       setPageState("final_setup");
     }).then((fn) => {
       unlisten = fn;
@@ -359,13 +365,27 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   }
 
   const handleOpenDriveAndClose = async () => {
-    const pathToOpen = localPath.endsWith('/') || localPath.endsWith('\\') ? localPath : localPath + '/';
-    await openPath(pathToOpen);
+    if (isMacOS) {
+      // On macOS the drive lives in Finder's CloudStorage locations.
+      const home = await homeDir();
+      await openPath(`${home}/Library/CloudStorage`);
+    } else {
+      const pathToOpen = localPath.endsWith('/') || localPath.endsWith('\\') ? localPath : localPath + '/';
+      await openPath(pathToOpen);
+    }
     await getCurrentWindow().close();
   }
 
   return (
-    <Container maxWidth="sm" sx={{ backgroundColor: isWindows10 ? "#fff" : undefined, minHeight: "100vh" }}>
+    <Container
+      maxWidth="sm"
+      sx={{
+        bgcolor: "background.default",
+        color: "text.primary",
+        minHeight: "100vh",
+        position: "relative",
+      }}
+    >
       <Box
         sx={{
           minHeight: "100vh",
@@ -376,6 +396,33 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           py: 4,
         }}
       >
+        {/* Drag region with close button */}<Box
+          data-tauri-drag-region
+          sx={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            height: 32,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            px: 0.5,
+            zIndex: 1,
+          }}
+        >
+          <IconButton
+            size="small"
+            onClick={() => getCurrentWindow().close()}
+            sx={{
+              // Keep the button itself draggable-region-free so clicks work.
+              WebkitAppRegion: "no-drag",
+              appRegion: "no-drag",
+            }}
+          >
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </Box>
         <Box
           sx={{
             p: 4,
@@ -504,7 +551,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   required
                 />
 
-                {!isReauthorize && (
+                {!isReauthorize && !isMacOS && (
                   <>
                     <FilledTextField
                       fullWidth
@@ -535,8 +582,11 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                       }}
                     />
                     {folderNotEmpty && (
-                      <Alert severity="error" sx={{ mt: -1 }}>
-                        {t("addDrive.folderNotEmpty")}
+                      <Alert severity="info" sx={{ mt: -1 }}>
+                        {t(
+                          "addDrive.folderNotEmptyWillSync",
+                          "This folder already has files. Existing local content will be merged into the remote drive; same-name files with matching hashes will be treated as already synced."
+                        )}
                       </Alert>
                     )}
                   </>
@@ -547,7 +597,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                   variant="contained"
                   size="large"
                   fullWidth
-                  disabled={folderNotEmpty}
                 >
                   {isReauthorize ? t("addDrive.reauthorizeConfirm") : t("addDrive.finish")}
                 </Button>

@@ -22,3 +22,8 @@ Cargo.lock
 /debug/
 dist/
 package/*.exe
+
+# Package manager files not used by the current Yarn-based build
+ui/pnpm-lock.yaml
+ui/pnpm-workspace.yaml
+macos/build/
