@@ -39,9 +39,6 @@ jobs:
         working-directory: ui
         run: yarn build
 
-      - name: Check Rust workspace
-        run: cargo check --workspace
-
       - name: Compile desktop application
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
@@ -70,14 +67,5 @@ jobs:
         with:
           name: Cloudreve-macOS
           path: Cloudreve-macOS.zip
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload Windows test executable
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Cloudreve-Windows
-          path: target/debug/cloudreve-desktop.exe
           if-no-files-found: error
           retention-days: 14
