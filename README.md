@@ -8,9 +8,11 @@
   </a>
 </p>
 
-A Windows desktop client for [Cloudreve](https://github.com/cloudreve/Cloudreve) cloud storage, built with Tauri and React. Provides seamless file synchronization using the Windows Cloud Files API.
+A desktop client for [Cloudreve](https://github.com/cloudreve/Cloudreve) cloud storage, built with Tauri and React. Provides seamless file synchronization using the Windows Cloud Files API and the native macOS File Provider framework.
 
 ## Features
+
+### Windows
 
 - Real-time bidirectional file synchronization
 - On-demand file hydration (files download only when accessed)
@@ -18,11 +20,21 @@ A Windows desktop client for [Cloudreve](https://github.com/cloudreve/Cloudreve)
 - Multiple storage provider support, aligned with Cloudreve server
 - System tray application
 
+### macOS
+
+- Native Finder integration through the macOS File Provider framework
+- On-demand file downloads managed by macOS
+- Real-time updates for remote file changes
+- Create, rename, move, and delete files directly in Finder
+- Multiple Cloudreve drives under Finder's Locations section
+- Lightweight menu bar application
+
 ## Prerequisites
 
 ### For Users
 
 - Windows 10 version 1903 (build 18362) or later
+- macOS 13 or later
 - A Cloudreve server instance
 
 ### For Developers
@@ -42,6 +54,13 @@ Install Rust targets for cross-compilation:
 rustup target add x86_64-pc-windows-msvc
 rustup target add aarch64-pc-windows-msvc
 ```
+
+### macOS Developers
+
+- **macOS 13** or later
+- **Xcode Command Line Tools** (`xcode-select --install`)
+- **Rust** toolchain (install via [rustup](https://rustup.rs/))
+- **Node.js** 18+ and **Yarn**
 
 ## Build & Run
 
@@ -64,6 +83,26 @@ cargo tauri build
 ```
 
 The built binary will be at `target/release/cloudreve-desktop.exe`.
+
+### macOS Release Build
+
+```bash
+# Install frontend dependencies
+cd ui
+yarn install
+cd ..
+
+# Build the Tauri application bundle
+npx --yes @tauri-apps/cli@2.11.4 build --bundles app
+
+# Build and embed the native File Provider extension
+FP_CONFIGURATION=Release ./macos/scripts/embed-into-app.sh \
+  target/release/bundle/macos/Cloudreve.app
+```
+
+The built application will be at `target/release/bundle/macos/Cloudreve.app`.
+
+The embed script builds the File Provider extension, places it inside the app bundle, ad-hoc signs the complete application, and registers the extension for local testing. A paid Apple Developer certificate is only required for notarized distribution builds.
 
 ## Development Installation (Full Feature Testing)
 
@@ -135,6 +174,7 @@ dist/
 │   ├── cloudreve-api/   # REST client for Cloudreve server
 │   └── win32_notif/     # Windows notification utilities
 ├── ui/                  # React frontend (Vite + MUI)
+├── macos/               # Native File Provider extension and build scripts
 ├── package/             # MSIX packaging assets
 ├── dev-install.ps1      # Dev build + register script
 └── build-msix.ps1       # Production MSIX builder
