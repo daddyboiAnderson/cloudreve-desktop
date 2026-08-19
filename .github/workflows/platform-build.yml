@@ -47,4 +47,37 @@ jobs:
 
       - name: Compile macOS File Provider extension
         if: runner.os == 'macOS'
+        env:
+          FP_CONFIGURATION: Release
         run: ./macos/scripts/build-extension.sh
+
+      - name: Build macOS application bundle
+        if: runner.os == 'macOS'
+        run: npx --yes @tauri-apps/cli@2.11.4 build --bundles app
+
+      - name: Embed File Provider extension
+        if: runner.os == 'macOS'
+        run: |
+          app="target/release/bundle/macos/Cloudreve.app"
+          mkdir -p "$app/Contents/PlugIns"
+          cp -R macos/build/CloudreveFileProvider.appex "$app/Contents/PlugIns/"
+          codesign --force --sign - --timestamp=none "$app"
+          ditto -c -k --keepParent "$app" Cloudreve-macOS.zip
+
+      - name: Upload macOS test application
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cloudreve-macOS
+          path: Cloudreve-macOS.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows test executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cloudreve-Windows
+          path: target/debug/cloudreve-desktop.exe
+          if-no-files-found: error
+          retention-days: 14
