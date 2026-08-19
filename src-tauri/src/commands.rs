@@ -98,6 +98,11 @@ pub async fn add_drive(
     state: State<'_, AppStateHandle>,
     config: AddDriveArgs,
 ) -> CommandResult<String> {
+    let site_url = tauri::Url::parse(&config.site_url)
+        .map_err(|e| format!("Invalid Cloudreve URL: {e}"))?;
+    if site_url.scheme() != "https" {
+        return Err("Cloudreve connections must use HTTPS".to_string());
+    }
     let app_state = state
         .get()
         .ok_or_else(|| "App not yet initialized".to_string())?;

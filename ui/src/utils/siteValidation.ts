@@ -119,6 +119,9 @@ export async function validateSiteVersion(siteUrl: string): Promise<string> {
   let response: Response;
   try {
     const url = new URL("/api/v4/site/ping", siteUrl);
+    if (url.protocol !== "https:") {
+      throw new Error("Cloudreve connections must use HTTPS");
+    }
     response = await fetch(url.toString());
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);

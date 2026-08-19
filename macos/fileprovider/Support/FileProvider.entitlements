@@ -15,7 +15,8 @@
 	-->
 	<key>com.apple.security.temporary-exception.files.home-relative-path.read-only</key>
 	<array>
-		<string>/.cloudreve/</string>
+		<string>/.cloudreve/drives.json</string>
+		<string>/.cloudreve/fp-events/</string>
 	</array>
 </dict>
 </plist>

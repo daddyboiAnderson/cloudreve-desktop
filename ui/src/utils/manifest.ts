@@ -15,8 +15,7 @@ interface Manifest {
  */
 export function isValidUrl(url: string): boolean {
   try {
-    new URL(url);
-    return true;
+    return new URL(url).protocol === "https:";
   } catch {
     return false;
   }

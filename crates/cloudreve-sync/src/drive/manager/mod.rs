@@ -11,6 +11,7 @@ use crate::inventory::InventoryDb;
 use crate::tasks::TaskProgress;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,7 @@ impl DriveManager {
             fs::create_dir_all(&config_dir)
                 .context("Failed to create .cloudreve config directory")?;
         }
+        Self::secure_config_dir(&config_dir)?;
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -66,6 +68,30 @@ impl DriveManager {
         self.config_dir.join("drives.json")
     }
 
+    #[cfg(unix)]
+    fn secure_config_dir(path: &std::path::Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .context("Failed to secure .cloudreve config directory")
+    }
+
+    #[cfg(not(unix))]
+    fn secure_config_dir(_path: &std::path::Path) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn secure_config_file(path: &std::path::Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .context("Failed to secure drive configuration")
+    }
+
+    #[cfg(not(unix))]
+    fn secure_config_file(_path: &std::path::Path) -> Result<()> {
+        Ok(())
+    }
+
     /// Load drive configurations from disk
     pub async fn load(&self) -> Result<()> {
         let config_file = self.get_config_file();
@@ -74,6 +100,8 @@ impl DriveManager {
             tracing::info!(target: "drive", "No existing drive config found, starting fresh");
             return Ok(());
         }
+
+        Self::secure_config_file(&config_file)?;
 
         tracing::debug!(target: "drive", path = %config_file.display(), "Loading drive configurations");
 
@@ -166,7 +194,19 @@ impl DriveManager {
 
         let content =
             serde_json::to_string_pretty(&new_state).context("Failed to serialize drive state")?;
-        fs::write(&config_file, content).context("Failed to write drive config file")?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&config_file)
+            .context("Failed to open drive config file")?;
+        Self::secure_config_file(&config_file)?;
+        file.write_all(content.as_bytes())
+            .context("Failed to write drive config file")?;
 
         tracing::info!(target: "drive", count = new_state.drives.len(), "Persisted drive(s) to config");
 
