@@ -465,6 +465,7 @@ final class CloudreveClient {
         let session_id: String
         let chunk_size: Int64?
         let upload_urls: [String]?
+        let encrypt_metadata: UploadEncryptMetadata?
     }
 
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
@@ -487,15 +488,18 @@ final class CloudreveClient {
             let policy_id: String
             let last_modified: Int64?
             let entity_type: String?
+            let encryption_supported: [String]
         }
         let credential: UploadCredentialPayload = try await call(
             "PUT", "/file/upload",
             body: SessionRequest(
                 uri: uri, size: size, policy_id: "",
                 last_modified: mtime,
-                entity_type: overwrite ? "version" : nil))
+                entity_type: overwrite ? "version" : nil,
+                encryption_supported: [UploadEncryptor.supportedAlgorithm]))
 
         let chunkSize = max(credential.chunk_size ?? 0, 1)
+        let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
         progress.totalUnitCount = size
 
         do {
@@ -503,12 +507,15 @@ final class CloudreveClient {
             defer { try? handle.close() }
 
             var index = 0
+            var byteOffset: UInt64 = 0
             while true {
                 if progress.isCancelled { throw CocoaError(.userCancelled) }
                 let data = try handle.read(upToCount: Int(chunkSize)) ?? Data()
                 if data.isEmpty && !(size == 0 && index == 0) { break }
-                try await uploadChunk(credential: credential, index: index, data: data)
+                let uploadData = try encryptor?.encrypt(data, at: byteOffset) ?? data
+                try await uploadChunk(credential: credential, index: index, data: uploadData)
                 progress.completedUnitCount += Int64(data.count)
+                byteOffset += UInt64(data.count)
                 index += 1
                 if data.isEmpty { break }  // zero-byte file: single empty chunk
             }

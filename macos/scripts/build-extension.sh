@@ -15,7 +15,7 @@ APPEX="$BUILD_DIR/CloudreveFileProvider.appex"
 
 IDENTITY="${FP_SIGN_IDENTITY:--}"
 CONFIG="${FP_CONFIGURATION:-Debug}"
-SDK="$(xcrun --sdk macosx --show-sdk-path)"
+SDK="${FP_SDK_PATH:-$(xcrun --sdk macosx --show-sdk-path)}"
 
 echo "==> Compiling extension ($CONFIG, sdk: $SDK)"
 rm -rf "$APPEX"

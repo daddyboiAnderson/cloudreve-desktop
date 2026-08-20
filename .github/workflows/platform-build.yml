@@ -42,6 +42,10 @@ jobs:
       - name: Compile desktop application
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
+      - name: Test macOS upload encryption
+        if: runner.os == 'macOS'
+        run: ./macos/scripts/test-upload-encryption.sh
+
       - name: Compile macOS File Provider extension
         if: runner.os == 'macOS'
         env:
