@@ -12,6 +12,16 @@
 	<string>cloudreve.desktop.dev.fileprovider</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
+	<key>CFBundleSymbolName</key>
+	<string>cloud.circle</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleSymbolName</key>
+			<string>cloud.circle</string>
+		</dict>
+	</dict>
 	<key>CFBundleName</key>
 	<string>CloudreveFileProvider</string>
 	<key>CFBundlePackageType</key>
@@ -23,7 +33,7 @@
 		<string>MacOSX</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSExtension</key>

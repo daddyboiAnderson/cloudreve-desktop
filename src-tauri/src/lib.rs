@@ -338,9 +338,16 @@ pub fn rebuild_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> anyhow::Resul
 fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let menu = build_tray_menu(app)?;
 
+    #[cfg(target_os = "macos")]
+    let tray_icon =
+        tauri::image::Image::from_bytes(include_bytes!("../icons/trayTemplate.png"))?;
+    #[cfg(not(target_os = "macos"))]
+    let tray_icon = app.default_window_icon().unwrap().clone();
+
     // Build tray icon
     let tray = TrayIconBuilder::new()
-        .icon(app.default_window_icon().unwrap().clone())
+        .icon(tray_icon)
+        .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
