@@ -129,6 +129,15 @@ pub struct DriveInfo {
     pub status: DriveInfoStatus,
     /// Capacity summary (None if not available)
     pub capacity: Option<CapacitySummary>,
+    /// Registration status of the native Finder location. None on non-macOS.
+    pub file_provider: Option<FileProviderStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileProviderStatus {
+    pub connected: bool,
+    /// Includes the native macOS error domain/code when available.
+    pub message: Option<String>,
 }
 
 /// Drive status for the settings UI

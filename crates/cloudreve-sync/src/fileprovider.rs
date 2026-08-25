@@ -21,7 +21,7 @@ use objc2_file_provider::NSFileProviderDomain;
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use tokio::sync::oneshot;
 
-use crate::DriveConfig;
+use crate::{DriveConfig, FileProviderStatus};
 
 /// Prefix for domain identifiers owned by this app, so we never touch
 /// domains registered by other providers (iCloud, Nextcloud, ...).
@@ -309,6 +309,110 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<()> {
         }
     }
     rx.await.map_err(|_| anyhow!("removeDomain callback dropped"))?
+}
+
+/// Remove a domain while asking macOS to preserve dirty local data.
+/// Returns the folder containing preserved data when macOS creates one.
+pub async fn remove_domain_preserving_dirty_data(
+    domain_id: &str,
+    display_name: &str,
+) -> Result<Option<String>> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let domain = make_domain(domain_id, display_name);
+        let tx = Mutex::new(Some(tx));
+        let block = RcBlock::new(move |url: *mut NSURL, error: *mut NSError| {
+            let result = if !error.is_null() {
+                Err(describe_error(error))
+            } else if url.is_null() {
+                Ok(None)
+            } else {
+                Ok(unsafe { (*url).path() }.map(|path| path.to_string()))
+            };
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        unsafe {
+            // NSFileProviderDomainRemovalModePreserveDirtyUserData = 1.
+            let _: () = msg_send![
+                class!(NSFileProviderManager),
+                removeDomain: &*domain,
+                mode: 1isize,
+                completionHandler: &*block
+            ];
+        }
+    }
+    rx.await
+        .map_err(|_| anyhow!("removeDomain preserving data callback dropped"))?
+}
+
+/// Lightweight status for Drive Settings. This deliberately checks only the
+/// stable domain registration and leaves enumeration and sync behavior alone.
+pub async fn domain_status(drive_id: &str, display_name: &str) -> FileProviderStatus {
+    let id = domain_identifier(drive_id);
+    match list_domains().await {
+        Ok(domains) if domains.iter().any(|(registered, _)| registered == &id) => {
+            match probe_domain(&id, display_name).await {
+                Ok(()) => FileProviderStatus {
+                    connected: true,
+                    message: None,
+                },
+                Err(error) => FileProviderStatus {
+                    connected: false,
+                    message: Some(format!(
+                        "Finder domain is registered but not responding: {error:#}"
+                    )),
+                },
+            }
+        }
+        Ok(_) => FileProviderStatus {
+            connected: false,
+            message: Some(format!(
+                "Finder domain is not registered ({id}). Reset Finder Integration to add it again."
+            )),
+        },
+        Err(error) => FileProviderStatus {
+            connected: false,
+            message: Some(format!("Could not inspect Finder integration: {error:#}")),
+        },
+    }
+}
+
+/// Signal the existing working-set enumerator and keep the native error code.
+/// This uses the same signal already used for remote changes and does not alter
+/// anchors, identities, or event processing.
+async fn probe_domain(domain_id: &str, display_name: &str) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let domain = make_domain(domain_id, display_name);
+        let identifier = NSString::from_str(WORKING_SET_CONTAINER);
+        let tx = Mutex::new(Some(tx));
+        let block = RcBlock::new(move |error: *mut NSError| {
+            let result = if error.is_null() {
+                Ok(())
+            } else {
+                Err(describe_error(error))
+            };
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        unsafe {
+            let manager: *mut AnyObject =
+                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
+            if manager.is_null() {
+                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
+            }
+            let _: () = msg_send![
+                &*manager,
+                signalEnumeratorForContainerItemIdentifier: &*identifier,
+                completionHandler: &*block
+            ];
+        }
+    }
+    rx.await
+        .map_err(|_| anyhow!("File Provider status callback dropped"))?
 }
 
 /// Reconcile registered File Provider domains with the configured drives:

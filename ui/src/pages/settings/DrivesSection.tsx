@@ -24,6 +24,7 @@ import {
   DeleteOutlineRounded,
   RefreshRounded,
   FilterListRounded,
+  SettingsBackupRestoreRounded,
 } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -50,6 +51,11 @@ interface DriveInfoResponse {
     used: number;
     label: string;
   };
+  file_provider?: DriveInfo["file_provider"];
+}
+
+interface FileProviderResetResponse {
+  preserved_data_path?: string;
 }
 
 export default function DrivesSection() {
@@ -61,6 +67,12 @@ export default function DrivesSection() {
   const [patternsText, setPatternsText] = useState("");
   const [saving, setSaving] = useState(false);
   const [patternsError, setPatternsError] = useState<string | null>(null);
+  const [resettingDriveId, setResettingDriveId] = useState<string | null>(null);
+  const [fileProviderNotice, setFileProviderNotice] = useState<{
+    driveId: string;
+    severity: "success" | "warning" | "error";
+    message: string;
+  } | null>(null);
 
   const fetchDrives = useCallback(async () => {
     if (isFetchingRef.current) return;
@@ -135,6 +147,38 @@ export default function DrivesSection() {
       await invoke("show_add_drive_window");
     } catch (error) {
       console.error("Failed to open add drive window:", error);
+    }
+  };
+
+  const handleResetFileProvider = async (drive: DriveInfo) => {
+    const confirmed = await ask(t("settings.fileProviderResetConfirm", { name: drive.name }), {
+      title: t("settings.fileProviderReset"),
+      kind: "warning",
+    });
+    if (!confirmed) return;
+
+    setResettingDriveId(drive.id);
+    setFileProviderNotice(null);
+    try {
+      const result = await invoke<FileProviderResetResponse>("reset_file_provider", {
+        driveId: drive.id,
+      });
+      setFileProviderNotice({
+        driveId: drive.id,
+        severity: result.preserved_data_path ? "warning" : "success",
+        message: result.preserved_data_path
+          ? t("settings.fileProviderResetPreserved", { path: result.preserved_data_path })
+          : t("settings.fileProviderResetSuccess"),
+      });
+      await fetchDrives();
+    } catch (error) {
+      setFileProviderNotice({
+        driveId: drive.id,
+        severity: "error",
+        message: String(error),
+      });
+    } finally {
+      setResettingDriveId(null);
     }
   };
 
@@ -389,6 +433,18 @@ export default function DrivesSection() {
                       </Box>
                     )}
 
+                    {drive.file_provider && !drive.file_provider.connected && (
+                      <Alert severity="warning" sx={{ mt: 1 }}>
+                        {drive.file_provider.message || t("settings.fileProviderUnknownError")}
+                      </Alert>
+                    )}
+
+                    {fileProviderNotice?.driveId === drive.id && (
+                      <Alert severity={fileProviderNotice.severity} sx={{ mt: 1 }}>
+                        {fileProviderNotice.message}
+                      </Alert>
+                    )}
+
                   </Box>
                 </Box>
 
@@ -398,6 +454,7 @@ export default function DrivesSection() {
                   sx={{
                     display: "flex",
                     alignItems: "center",
+                    flexWrap: "wrap",
                     gap: 1,
                   }}
                 >
@@ -418,6 +475,17 @@ export default function DrivesSection() {
                   >
                     {t("settings.ignorePatterns")}
                   </SecondaryButton>
+
+                  {drive.file_provider && (
+                    <SecondaryButton
+                      size="small"
+                      startIcon={<SettingsBackupRestoreRounded />}
+                      disabled={resettingDriveId === drive.id}
+                      onClick={() => handleResetFileProvider(drive)}
+                    >
+                      {t("settings.fileProviderReset")}
+                    </SecondaryButton>
+                  )}
 
                   <Box sx={{ flex: 1 }} />
 

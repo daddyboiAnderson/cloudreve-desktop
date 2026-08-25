@@ -10,6 +10,10 @@ export interface DriveInfo {
   remote_path: string
   status: DriveStatus;
   capacity?: CapacitySummary;
+  file_provider?: {
+    connected: boolean;
+    message?: string;
+  };
 }
 
 export type DriveStatus = "active" | "event_push_lost" | "credential_expired";

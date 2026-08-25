@@ -409,6 +409,53 @@ pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<
         .map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize)]
+pub struct FileProviderResetResult {
+    pub preserved_data_path: Option<String>,
+}
+
+/// Remove and re-add the same stable Finder domain used by main. No sync IDs,
+/// anchors, identity maps, or remote-event routing are changed.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn reset_file_provider(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<FileProviderResetResult> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let drive = app_state
+        .drive_manager
+        .list_drives()
+        .await
+        .into_iter()
+        .find(|drive| drive.id == drive_id)
+        .ok_or_else(|| format!("Drive not found: {drive_id}"))?;
+
+    let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+    let registered = cloudreve_sync::fileprovider::list_domains()
+        .await
+        .map_err(|error| format!("Could not inspect Finder integration: {error:#}"))?;
+
+    let preserved_data_path = if registered.iter().any(|(id, _)| id == &domain_id) {
+        cloudreve_sync::fileprovider::remove_domain_preserving_dirty_data(&domain_id, &drive.name)
+            .await
+            .map_err(|error| format!("Could not remove Finder integration: {error:#}"))?
+    } else {
+        None
+    };
+
+    cloudreve_sync::fileprovider::add_domain(&domain_id, &drive.name)
+        .await
+        .map_err(|error| format!("Could not add Finder integration: {error:#}"))?;
+
+    Ok(FileProviderResetResult {
+        preserved_data_path,
+    })
+}
+
 /// File icon response containing base64 encoded RGBA pixel data
 #[derive(serde::Serialize)]
 pub struct FileIconResponse {

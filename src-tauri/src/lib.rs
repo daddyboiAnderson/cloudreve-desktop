@@ -470,6 +470,8 @@ pub fn run() {
             commands::resolve_conflict,
             commands::resolve_all_conflicts,
             commands::get_drives_info,
+            #[cfg(target_os = "macos")]
+            commands::reset_file_provider,
             commands::get_file_icon,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,

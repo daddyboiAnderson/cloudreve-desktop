@@ -752,6 +752,14 @@ impl DriveManager {
                 user_id: config.user_id.clone(),
                 status,
                 capacity,
+                #[cfg(target_os = "macos")]
+                file_provider: if config.enabled {
+                    Some(crate::fileprovider::domain_status(&config.id, &config.name).await)
+                } else {
+                    None
+                },
+                #[cfg(not(target_os = "macos"))]
+                file_provider: None,
             });
         }
 
