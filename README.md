@@ -96,13 +96,19 @@ cd ..
 npx --yes @tauri-apps/cli@2.11.4 build --bundles app
 
 # Build and embed the native File Provider extension
-FP_CONFIGURATION=Release ./macos/scripts/embed-into-app.sh \
+FP_CONFIGURATION=Release FP_BUILD_NUMBER=4 ./macos/scripts/embed-into-app.sh \
   target/release/bundle/macos/Cloudreve.app
 ```
 
 The built application will be at `target/release/bundle/macos/Cloudreve.app`.
 
 The embed script builds the File Provider extension, places it inside the app bundle, ad-hoc signs the complete application, and registers the extension for local testing. A paid Apple Developer certificate is only required for notarized distribution builds.
+
+Increment `FP_BUILD_NUMBER` for every packaged update. The app and embedded
+File Provider receive the same build number so macOS can recognize the new
+extension. This does not change domain IDs, sync anchors, or event processing;
+use **Reset Finder Integration** only if macOS keeps a stale domain after an
+ad-hoc app replacement.
 
 ## Development Installation (Full Feature Testing)
 
