@@ -93,6 +93,24 @@ macOS development notes:
 - `pluginkit -a <appex>` is needed to register hand-built extensions; `fileproviderctl dump <domain>` shows sync engine state.
 - `log` is a zsh builtin — use `/usr/bin/log stream --predicate 'subsystem == "cloudreve.desktop.dev.fileprovider"'` for extension logs.
 
+#### macOS upgrade-safe build procedure
+
+Never distribute the raw bundle produced by `cargo tauri build`/`tauri build`: it does not contain the current File Provider extension. Build the Tauri app, then embed and re-sign the extension with one shared, monotonically increasing numeric build number:
+
+```bash
+npx --yes @tauri-apps/cli@2.11.4 build --bundles app
+FP_CONFIGURATION=Release FP_SHORT_VERSION=0.2.0 FP_BUILD_NUMBER=<new-number> \
+  FP_REGISTER_EXTENSION=0 ./macos/scripts/embed-into-app.sh \
+  target/release/bundle/macos/Cloudreve.app
+```
+
+- Increase `FP_BUILD_NUMBER` for every packaged macOS update, including test replacements. Do not reuse or decrease it for an upgrade build.
+- `embed-into-app.sh` stamps the same `CFBundleVersion` and `CFBundleShortVersionString` into the host app and embedded `.appex`, then re-signs the bundle. Keep those versions matched.
+- Use `FP_REGISTER_EXTENSION=0` when creating a package; register only when intentionally testing that exact local bundle.
+- Do not create a new File Provider domain identifier during an app upgrade or reset. Existing drives depend on the stable `cloudreve.drive.<drive UUID>` identifier for remote-event delivery.
+- If macOS retains stale registration after an ad-hoc replacement, use the app's **Reset Finder Integration** action; do not add automatic domain replacement or alter sync anchors/event processing as an upgrade workaround.
+- Before handing off a build, verify both plist build numbers and run `codesign --verify --deep --strict Cloudreve.app`.
+
 ### Tauri Layer (`src-tauri/`)
 
 - `lib.rs`: Application entry, initializes sync service, sets up system tray, spawns event bridge
