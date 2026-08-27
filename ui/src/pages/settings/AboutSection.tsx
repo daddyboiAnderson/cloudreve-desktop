@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Box, Typography, Link, Chip, Stack } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import GitHubIcon from "@mui/icons-material/GitHub";
 import BugReportIcon from "@mui/icons-material/BugReportRounded";
 import ForumIcon from "@mui/icons-material/ForumRounded";
@@ -17,6 +18,8 @@ function isPreviewVersion(version: string): boolean {
 export default function AboutSection() {
   const { t } = useTranslation();
   const [version, setVersion] = useState<string>("");
+  const macOSRelease = import.meta.env.VITE_MACOS_RELEASE;
+  const isMacOS = platformType() === "macos";
 
   useEffect(() => {
     getVersion().then(setVersion);
@@ -76,6 +79,11 @@ export default function AboutSection() {
               />
             )}
           </Stack>
+          {isMacOS && macOSRelease && (
+            <Typography variant="caption" color="text.secondary">
+              macOS release {macOSRelease}
+            </Typography>
+          )}
         </Box>
       </Stack>
 
