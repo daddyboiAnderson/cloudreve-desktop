@@ -15,6 +15,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
@@ -30,6 +31,7 @@ export default function Popup() {
   const [loading, setLoading] = useState(true);
   const isFetchingRef = useRef(false);
   const suppressBlurCloseUntilRef = useRef(0);
+  const isMacOS = platformType() === "macos";
 
   // Close the tray popup on ordinary focus loss, but keep it alive while a native
   // context menu is open. On Linux/Wayland and macOS, opening the browser/system
@@ -154,6 +156,10 @@ export default function Popup() {
         flexDirection: "column",
         bgcolor: "background.paper",
         overflow: "hidden",
+        borderRadius: isMacOS ? "12px" : 0,
+        border: isMacOS ? 1 : 0,
+        borderColor: "divider",
+        boxSizing: "border-box",
       }}
     >
       {/* Header */}

@@ -10,6 +10,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import CloudreveLogo from "../../common/CloudreveLogo";
 import DrivesSection from "./DrivesSection";
 import GeneralSection from "./GeneralSection";
@@ -23,6 +24,7 @@ type SettingsSection = "drives" | "general" | "about";
 export default function Settings() {
   const { t } = useTranslation();
   const [activeSection, setActiveSection] = useState<SettingsSection>("drives");
+  const isMacOS = platformType() === "macos";
 
   const sections = [
     { id: "drives" as const, icon: <HardDrive />, label: t("settings.drives") },
@@ -50,6 +52,10 @@ export default function Settings() {
         display: "flex",
         bgcolor: "background.paper",
         overflow: "hidden",
+        borderRadius: isMacOS ? "12px" : 0,
+        border: isMacOS ? 1 : 0,
+        borderColor: "divider",
+        boxSizing: "border-box",
       }}
     >
       {/* Left Navigation */}

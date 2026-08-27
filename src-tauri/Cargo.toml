@@ -23,7 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 log = "0.4"
-tauri = { version = "2.11.0", features = ["image-png", "protocol-asset", "tray-icon"] }
+tauri = { version = "2.11.0", features = ["image-png", "macos-private-api", "protocol-asset", "tray-icon"] }
 tauri-plugin-log = "2"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"

@@ -11,6 +11,7 @@
   },
   "app": {
     "enableGTKAppId": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",

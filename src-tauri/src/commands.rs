@@ -16,6 +16,8 @@ use tauri::{
 #[cfg(target_os = "macos")]
 use tauri::PhysicalPosition;
 #[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
 use core_graphics::{
     event::CGEvent,
     event_source::{CGEventSource, CGEventSourceStateID},
@@ -29,6 +31,28 @@ use windows::ApplicationModel::{StartupTask, StartupTaskState};
 
 /// Result type for Tauri commands
 type CommandResult<T> = Result<T, String>;
+
+#[cfg(target_os = "macos")]
+static MAIN_POPUP_FOCUS_LOST_AT_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn monotonic_popup_time_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+#[cfg(target_os = "macos")]
+fn record_main_popup_focus_loss() {
+    let now = monotonic_popup_time_ms();
+    if now >= SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS.load(Ordering::Relaxed) {
+        MAIN_POPUP_FOCUS_LOST_AT_MS.store(now, Ordering::Relaxed);
+    }
+}
 
 /// Check if a path is a root drive (e.g., "C:\", "D:\", "E:\")
 fn is_root_drive(path: &str) -> bool {
@@ -528,6 +552,37 @@ pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) 
     });
 }
 
+/// Toggle the tray popup at the point actually clicked.
+///
+/// On macOS, clicking a status item can make its popup lose focus before the
+/// tray mouse-up callback arrives. Treat that just-recorded focus loss as an
+/// already-visible popup, otherwise the callback would immediately reopen it.
+#[cfg(target_os = "macos")]
+pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) {
+    let now = monotonic_popup_time_ms();
+    let focus_lost_at = MAIN_POPUP_FOCUS_LOST_AT_MS.load(Ordering::Relaxed);
+    let recently_lost_focus =
+        focus_lost_at != 0 && now.saturating_sub(focus_lost_at) <= 300;
+    let is_visible = app
+        .get_webview_window("main_popup")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+
+    if is_visible || recently_lost_focus {
+        // Hiding the window can itself emit Focused(false). Ignore that event
+        // so a subsequent intentional click can reopen the popup immediately.
+        SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS.store(now + 500, Ordering::Relaxed);
+        MAIN_POPUP_FOCUS_LOST_AT_MS.store(0, Ordering::Relaxed);
+        if let Some(window) = app.get_webview_window("main_popup") {
+            let _ = window.hide();
+        }
+        crate::schedule_update_dock_visibility(app);
+        return;
+    }
+
+    show_main_window_at_click(app, click);
+}
+
 #[cfg(target_os = "macos")]
 fn hardware_cursor_position(app: &AppHandle) -> Option<PhysicalPosition<f64>> {
     // CGEvent reads the actual pointer location below AppKit's synthesized
@@ -708,6 +763,12 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     .skip_taskbar(true)
     .minimizable(false);
 
+    // The tray popup is undecorated, so AppKit does not provide its usual
+    // rounded window corners. Make only this macOS window transparent and let
+    // the popup UI paint and clip its native-looking rounded surface.
+    #[cfg(target_os = "macos")]
+    let builder = builder.transparent(true);
+
     let Some(builder) = apply_default_window_icon(builder, app, "main_popup") else {
         return;
     };
@@ -739,6 +800,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                     }
                     #[cfg(target_os = "macos")]
                     tauri::WindowEvent::Focused(false) => {
+                        record_main_popup_focus_loss();
                         let _ = window_for_events.hide();
                         // Schedule multiple Dock visibility checks because the
                         // window state reported by Tauri can lag behind AppKit.
@@ -852,7 +914,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
     #[cfg(windows)]
     let builder = builder.transparent(true);
 
-    // Platform-specific: title_bar_style and hidden_title are macOS-only
+    // Platform-specific: title_bar_style and hidden_title are macOS-only.
     #[cfg(target_os = "macos")]
     let builder = builder
         .title_bar_style(TitleBarStyle::Overlay)
@@ -930,11 +992,11 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     #[cfg(windows)]
     let builder = builder.transparent(true);
 
-    // Platform-specific: title_bar_style and hidden_title are macOS-only
+    // The settings UI provides its own drag region and close button. Keeping
+    // this as a transparent, undecorated window exposes the rounded web
+    // surface without AppKit painting a rectangular overlay titlebar.
     #[cfg(target_os = "macos")]
-    let builder = builder
-        .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true);
+    let builder = builder.transparent(true);
 
     let Some(builder) = apply_default_window_icon(builder, app, "settings") else {
         return;

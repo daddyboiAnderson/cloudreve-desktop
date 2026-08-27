@@ -2,12 +2,14 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ThemeProvider,
   CssBaseline,
+  GlobalStyles,
   Box,
   useMediaQuery,
 } from "@mui/material";
 import { Routes, Route, HashRouter } from "react-router-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Theme as TauriTheme } from "@tauri-apps/api/window";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import "@fontsource/roboto/300.css";
 import "@fontsource/roboto/400.css";
 import "@fontsource/roboto/500.css";
@@ -63,6 +65,10 @@ function useDarkMode(): boolean {
 
 function App() {
   const darkMode = useDarkMode();
+  const isRoundedMacOSWindow =
+    platformType() === "macos" &&
+    (window.location.hash.startsWith("#/popup") ||
+      window.location.hash.startsWith("#/settings"));
   const theme = useMemo(
     () => createAppTheme(darkMode ? "dark" : "light"),
     [darkMode]
@@ -72,9 +78,23 @@ function App() {
     <Suspense fallback={<LoadingFallback />}>
       <ThemeProvider theme={theme}>
         <CssBaseline enableColorScheme />
+        {isRoundedMacOSWindow && (
+          <GlobalStyles
+            styles={{
+              "html, body, #root": { backgroundColor: "transparent" },
+            }}
+          />
+        )}
         {/* Paint the resolved theme background so windows with a fixed native
             background color never show through. */}
-        <Box sx={{ minHeight: "100vh", bgcolor: "background.default" }}>
+        <Box
+          sx={{
+            minHeight: "100vh",
+            bgcolor: isRoundedMacOSWindow
+              ? "transparent"
+              : "background.default",
+          }}
+        >
           <HashRouter>
             <Routes>
               <Route path="/add-drive" element={<AddDrive />} />
