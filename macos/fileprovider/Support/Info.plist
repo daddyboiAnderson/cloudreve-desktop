@@ -8,18 +8,18 @@
 	<string>Cloudreve File Provider</string>
 	<key>CFBundleExecutable</key>
 	<string>CloudreveFileProvider</string>
+	<key>CFBundleIconFile</key>
+	<string>Cloudreve.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>cloudreve.desktop.dev.fileprovider</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
-	<key>CFBundleSymbolName</key>
-	<string>cloud.circle</string>
 	<key>CFBundleIcons</key>
 	<dict>
 		<key>CFBundlePrimaryIcon</key>
 		<dict>
 			<key>CFBundleSymbolName</key>
-			<string>cloud.circle</string>
+			<string>externaldrive.badge.icloud</string>
 		</dict>
 	</dict>
 	<key>CFBundleName</key>

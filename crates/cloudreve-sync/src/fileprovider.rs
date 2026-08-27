@@ -311,6 +311,71 @@ pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<()> {
     rx.await.map_err(|_| anyhow!("removeDomain callback dropped"))?
 }
 
+/// Tell macOS whether the host application is available for a registered
+/// domain. Disconnecting keeps downloaded files visible, but prevents Finder
+/// from asking the extension to enumerate or mutate remote content and shows
+/// the localized reason at the top of the domain.
+async fn set_domain_connected(
+    domain_id: &str,
+    display_name: &str,
+    connected: bool,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    {
+        let domain = make_domain(domain_id, display_name);
+        let tx = Mutex::new(Some(tx));
+        let block = RcBlock::new(move |error: *mut NSError| {
+            let result = if error.is_null() {
+                Ok(())
+            } else {
+                Err(describe_error(error))
+            };
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(result);
+            }
+        });
+        unsafe {
+            let manager: *mut AnyObject =
+                msg_send![class!(NSFileProviderManager), managerForDomain: &*domain];
+            if manager.is_null() {
+                return Err(anyhow!("no File Provider manager for domain {domain_id}"));
+            }
+            if connected {
+                let _: () = msg_send![&*manager, reconnectWithCompletionHandler: &*block];
+            } else {
+                let reason = NSString::from_str(
+                    "Cloudreve application has been closed. Reopen to reconnect.",
+                );
+                let _: () = msg_send![
+                    &*manager,
+                    disconnectWithReason: &*reason,
+                    options: 0usize,
+                    completionHandler: &*block
+                ];
+            }
+        }
+    }
+    rx.await
+        .map_err(|_| anyhow!("domain connection callback dropped"))?
+}
+
+/// Update all enabled domains without changing their identifiers, sync
+/// anchors, event logs, or local replicas.
+pub async fn set_domains_connected(drives: &[DriveConfig], connected: bool) {
+    for drive in drives.iter().filter(|drive| drive.enabled) {
+        let id = domain_identifier(&drive.id);
+        if let Err(error) = set_domain_connected(&id, &drive.name, connected).await {
+            tracing::warn!(
+                target: "fileprovider",
+                domain = %id,
+                connected,
+                error = %error,
+                "failed to update File Provider connection state"
+            );
+        }
+    }
+}
+
 /// Remove a domain while asking macOS to preserve dirty local data.
 /// Returns the folder containing preserved data when macOS creates one.
 pub async fn remove_domain_preserving_dirty_data(
@@ -459,4 +524,9 @@ pub async fn sync_domains_with_drives(drives: &[DriveConfig]) {
             tracing::warn!(target: "fileprovider", "failed to add FP domain {id}: {e:#}");
         }
     }
+
+    // A normal app quit leaves the registered domain in a persistent native
+    // disconnected state. Reconnect only after domain reconciliation and the
+    // app-owned event service have started again.
+    set_domains_connected(drives, true).await;
 }

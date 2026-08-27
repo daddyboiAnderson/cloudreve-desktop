@@ -16,7 +16,7 @@ use tokio::sync::OnceCell;
 
 use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 #[cfg(target_os = "macos")]
-use crate::commands::show_main_window_at_click;
+use crate::commands::toggle_main_window_at_click;
 mod commands;
 mod event_handler;
 
@@ -269,6 +269,15 @@ async fn shutdown() {
         // Broadcast disconnection event
         state.event_broadcaster.connection_status_changed(false);
 
+        // Keep the local replica registered, but tell Finder that the host app
+        // and its real-time event stream are unavailable. Finder displays the
+        // native reconnect message and stops sending work to the extension.
+        #[cfg(target_os = "macos")]
+        {
+            let drives = state.drive_manager.list_drives().await;
+            cloudreve_sync::fileprovider::set_domains_connected(&drives, false).await;
+        }
+
         // Shutdown drive manager
         tracing::info!(target: "main", "Shutting down drive manager...");
         state.drive_manager.shutdown().await;
@@ -376,7 +385,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             {
                 let app = tray.app_handle();
                 #[cfg(target_os = "macos")]
-                show_main_window_at_click(app, position);
+                toggle_main_window_at_click(app, position);
                 #[cfg(not(target_os = "macos"))]
                 show_main_window(app);
             }

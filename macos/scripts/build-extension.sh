@@ -33,6 +33,7 @@ export CLANG_MODULE_CACHE_PATH="$MODULE_CACHE"
 echo "==> Compiling extension ($CONFIG, sdk: $SDK)"
 rm -rf "$APPEX"
 mkdir -p "$APPEX/Contents/MacOS"
+mkdir -p "$APPEX/Contents/Resources"
 
 OPT_FLAGS=(-Onone)
 if [[ "$CONFIG" == "Release" ]]; then
@@ -53,6 +54,7 @@ swiftc -swift-version 5 \
 
 echo "==> Assembling bundle"
 cp "$SUPPORT_DIR/Info.plist" "$APPEX/Contents/Info.plist"
+cp "$ROOT/src-tauri/icons/icon.icns" "$APPEX/Contents/Resources/Cloudreve.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$APPEX/Contents/Info.plist"
 
