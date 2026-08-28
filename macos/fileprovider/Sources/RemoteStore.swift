@@ -238,6 +238,10 @@ final class RemoteStore {
             file.metadata?["etag"] ?? file.metadata?["hash"]
             ?? "\(file.updated_at ?? "")#\(file.size)"
         let version = versionBasis.data(using: .utf8) ?? Data()
+        // Finder caches provider thumbnails until contentVersion changes. Keep
+        // a schema marker here so installing the first thumbnail-capable build
+        // invalidates generic icons cached by older providers exactly once.
+        let thumbnailVersion = "\(versionBasis)#thumbnail-v1".data(using: .utf8) ?? version
 
         let item = FileProviderItem(
             identifier: identifier,
@@ -251,7 +255,7 @@ final class RemoteStore {
             capabilities: file.isFolder
                 ? Self.writableCapabilities.union(.allowsContentEnumerating)
                 : Self.writableCapabilities,
-            contentVersion: version,
+            contentVersion: file.isFolder ? version : thumbnailVersion,
             metadataVersion: version,
             creationDate: CloudreveClient.parseDate(file.created_at),
             contentModificationDate: CloudreveClient.parseDate(file.updated_at)

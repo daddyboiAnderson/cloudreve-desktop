@@ -6,7 +6,9 @@ import OSLog
 /// The system launches this extension on demand and talks to it over XPC.
 /// Domains are registered per drive by the main app; the domain identifier
 /// embeds the drive id ("cloudreve.drive.<uuid>").
-final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
+final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
+    NSFileProviderThumbnailing
+{
     private let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "extension")
 
@@ -68,6 +70,67 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     }
 
     // MARK: - Content
+
+    func fetchThumbnails(
+        for itemIdentifiers: [NSFileProviderItemIdentifier],
+        requestedSize size: CGSize,
+        perThumbnailCompletionHandler: @escaping (
+            NSFileProviderItemIdentifier, Data?, Error?
+        ) -> Void,
+        completionHandler: @escaping (Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+        logger.notice(
+            "Finder requested \(itemIdentifiers.count) thumbnail(s) at \(Int(size.width))x\(Int(size.height))"
+        )
+        guard let store else {
+            completionHandler(unavailableError)
+            return progress
+        }
+
+        let task = Task {
+            // File Provider allows only a few tens of seconds for a whole
+            // batch. Fetch concurrently in small chunks so a large Finder
+            // window does not serialize two network round-trips per item.
+            for batchStart in stride(from: 0, to: itemIdentifiers.count, by: 4) {
+                if Task.isCancelled || progress.isCancelled {
+                    completionHandler(CocoaError(.userCancelled))
+                    return
+                }
+                let batchEnd = min(batchStart + 4, itemIdentifiers.count)
+                await withTaskGroup(of: Void.self) { group in
+                    for identifier in itemIdentifiers[batchStart..<batchEnd] {
+                        group.addTask {
+                            do {
+                                let item = try await store.item(
+                                    for: identifier, displayName: self.domain.displayName)
+                                if item.contentType.conforms(to: .folder) {
+                                    perThumbnailCompletionHandler(identifier, nil, nil)
+                                } else {
+                                    let data = try await store.client.thumbnail(
+                                        uri: store.uri(for: identifier))
+                                    perThumbnailCompletionHandler(identifier, data, nil)
+                                }
+                            } catch {
+                                // A missing/unsupported thumbnail is an
+                                // item-level failure; it must not prevent Finder
+                                // from displaying the rest of the batch.
+                                self.logger.notice(
+                                    "thumbnail unavailable for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                                )
+                                perThumbnailCompletionHandler(
+                                    identifier, nil, FileProviderEnumerator.mapError(error))
+                            }
+                            progress.completedUnitCount += 1
+                        }
+                    }
+                }
+            }
+            completionHandler(nil)
+        }
+        progress.cancellationHandler = { task.cancel() }
+        return progress
+    }
 
     func fetchContents(
         for itemIdentifier: NSFileProviderItemIdentifier,

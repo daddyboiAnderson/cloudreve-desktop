@@ -99,6 +99,12 @@ struct FileURLPayload: Decodable {
     }
 }
 
+struct FileThumbPayload: Decodable {
+    let url: String
+    let expires: String?
+    let obfuscated: Bool
+}
+
 struct ApiEnvelope<T: Decodable>: Decodable {
     let code: Int
     let msg: String?
@@ -418,6 +424,104 @@ final class CloudreveClient {
         try await call(
             "GET", "/file/info", body: nil as String?,
             query: [URLQueryItem(name: "uri", value: uri)])
+    }
+
+    /// Fetches the server-generated thumbnail without materializing the file.
+    func thumbnail(uri: String) async throws -> Data {
+        var payload: FileThumbPayload?
+        var lastError: Error = CloudreveError.badResponse("thumbnail was not generated")
+        // Cloudreve can enqueue generation and initially answer 40077. Retry
+        // briefly inside File Provider's deadline; if it still is not ready,
+        // propagate an error so Finder retries later instead of caching a
+        // permanent "no thumbnail" result.
+        for delaySeconds: UInt64 in [0, 1, 2, 4] {
+            if delaySeconds > 0 {
+                try await Task.sleep(nanoseconds: delaySeconds * 1_000_000_000)
+            }
+            do {
+                payload = try await call(
+                    "GET", "/file/thumb", body: nil as String?,
+                    query: [URLQueryItem(name: "uri", value: uri)])
+                break
+            } catch CloudreveError.api(let code, let message) where code == 40077 {
+                lastError = CloudreveError.api(code: code, message: message)
+            } catch {
+                throw error
+            }
+        }
+        guard let payload else { throw lastError }
+        let value = payload.obfuscated ? try Self.decodeTimeFlowString(payload.url) : payload.url
+        guard let url = URL(string: value, relativeTo: baseURL)?.absoluteURL else {
+            throw CloudreveError.badResponse("invalid thumbnail URL")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CloudreveError.badResponse("thumbnail response is not HTTP")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw CloudreveError.http(status: http.statusCode)
+        }
+        // Finder thumbnails should be small. Refuse unexpectedly large bodies
+        // so a bad endpoint cannot exhaust the extension process.
+        let maximumThumbnailBytes = 32 * 1024 * 1024
+        guard data.count <= maximumThumbnailBytes else {
+            throw CloudreveError.badResponse("thumbnail exceeds 32 MiB")
+        }
+        return data
+    }
+
+    /// Cloudreve may scramble signed thumbnail URLs using the current time.
+    /// This intentionally mirrors the Rust API client's time handling.
+    private static func decodeTimeFlowString(_ value: String) throws -> String {
+        let nowSeconds = Int64(Date().timeIntervalSince1970)
+        for candidate in [nowSeconds, nowSeconds - 1000, nowSeconds + 1000] {
+            if let decoded = decodeTimeFlowString(value, timeValue: candidate) {
+                return decoded
+            }
+        }
+        throw CloudreveError.badResponse("invalid obfuscated thumbnail URL")
+    }
+
+    private static func decodeTimeFlowString(_ value: String, timeValue: Int64) -> String? {
+        let decodedTime = timeValue / 1000
+        guard !value.isEmpty else { return "" }
+
+        var time = decodedTime
+        var digits: [Int] = []
+        while time > 0 {
+            digits.append(Int(time % 10))
+            time /= 10
+        }
+        guard !digits.isEmpty else { return nil }
+
+        var result = Array(value)
+        var secret = result
+        var add = secret.count.isMultiple(of: 2)
+        var digitIndex = (secret.count - 1) % digits.count
+
+        for position in 0..<secret.count {
+            let resultIndex = result.count - 1 - position
+            var newIndex = resultIndex
+            if add {
+                newIndex += digits[digitIndex] * digitIndex
+            } else {
+                newIndex = 2 * digitIndex * digits[digitIndex] - newIndex
+            }
+            newIndex = abs(newIndex) % secret.count
+            result[resultIndex] = secret[newIndex]
+            secret.swapAt(resultIndex, newIndex)
+            secret.removeLast()
+            add.toggle()
+            digitIndex = digitIndex == 0 ? digits.count - 1 : digitIndex - 1
+        }
+
+        let decoded = String(result)
+        let prefix = "\(decodedTime)|"
+        guard decoded.hasPrefix(prefix) else { return nil }
+        return String(decoded.dropFirst(prefix.count))
     }
 
     // MARK: Mutations
