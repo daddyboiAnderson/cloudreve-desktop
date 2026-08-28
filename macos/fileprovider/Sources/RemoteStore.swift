@@ -32,7 +32,7 @@ final class RemoteStore {
     /// The extension can't run a long-lived SSE listener itself (XPC services
     /// get suspended when idle), so the app writes events here and signals the
     /// working set; we replay from the file in enumerateChanges.
-    struct FpEvent: Decodable {
+    struct FpEvent: Codable {
         let ts: Int64  // unix epoch milliseconds
         let type: String  // create | modify | rename | delete
         let from: String  // path relative to drive root, leading slash
@@ -110,10 +110,6 @@ final class RemoteStore {
 
     // MARK: - "Keep Downloaded" pin state
 
-    /// Folders whose enumeration has already been kicked via
-    /// requestDownloadForItem in this process (see kickPinnedSubtrees).
-    private var enumerationKicked: Set<String> = []
-
     func isPinned(_ identifier: NSFileProviderItemIdentifier) -> Bool {
         cacheLock.lock()
         defer { cacheLock.unlock() }
@@ -140,49 +136,85 @@ final class RemoteStore {
         return false
     }
 
-    /// For every pinned folder among `items` (or below a pinned folder),
-    /// ask the system to materialize the directory, which makes it enumerate
-    /// the folder one level down. Combined with the explicit eager policy
-    /// served for descendants, this cascades: each enumeration registers the
-    /// next level of placeholders and kicks the level below, until a pinned
-    /// subtree is fully materialized — without the user browsing into it.
-    /// No-ops for folders already kicked in this process.
-    func kickPinnedSubtrees(_ items: [FileProviderItem]) {
-        let folders = items.filter {
-            $0.contentType.conforms(to: .folder) && $0.effectivelyPinned
+    /// Append synthetic "modify" events for the given item URIs to the shared
+    /// event log. enumerateChanges replays them like remote changes, which
+    /// pushes the items into the system's mirror. This is how a freshly
+    /// pinned folder's subtree becomes known to the system:
+    /// requestDownloadForItem only works for items the system already knows,
+    /// and it cannot enumerate folders that were never browsed.
+    func recordSyntheticModifyEvents(uris: [String]) {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let encoder = JSONEncoder()
+        let lines = uris.compactMap { uri -> String? in
+            let uri = Self.canonicalURI(uri)
+            guard uri.hasPrefix(rootPath) else { return nil }
+            var path = String(uri.dropFirst(rootPath.count))
+            if !path.hasPrefix("/") { path = "/" + path }
+            let event = FpEvent(ts: now, type: "modify", from: path, to: nil)
+            guard let data = try? encoder.encode(event) else { return nil }
+            return String(decoding: data, as: UTF8.self)
         }
-        guard !folders.isEmpty, let manager = NSFileProviderManager(for: domain)
-        else { return }
-        for folder in folders {
-            cacheLock.lock()
-            let already = enumerationKicked.contains(folder.itemIdentifier.rawValue)
-            if !already { enumerationKicked.insert(folder.itemIdentifier.rawValue) }
-            cacheLock.unlock()
-            guard !already else { continue }
-            Task {
-                try? await manager.requestDownloadForItem(
-                    withIdentifier: folder.itemIdentifier)
+        guard !lines.isEmpty else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: eventsFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            // Append-only: the main app writes remote events to the same log,
+            // so never rewrite the file.
+            let payload = Data((lines.joined(separator: "\n") + "\n").utf8)
+            if let handle = try? FileHandle(forWritingTo: eventsFileURL) {
+                defer { try? handle.close() }
+                let end = handle.seekToEndOfFile()
+                if end > 0 {
+                    handle.seek(toFileOffset: end - 1)
+                    if handle.readData(ofLength: 1) != Data("\n".utf8) {
+                        handle.seekToEndOfFile()
+                        handle.write(Data("\n".utf8))
+                    }
+                }
+                handle.seekToEndOfFile()
+                handle.write(payload)
+            } else {
+                try payload.write(to: eventsFileURL)
             }
+        } catch {
+            logger.error(
+                "failed to record synthetic events: \(error.localizedDescription, privacy: .public)")
         }
     }
 
-    /// Kick materialization for every pinned item (called once at extension
-    /// start, so pins made while the extension was suspended still take
-    /// effect).
-    func kickPinnedItems() {
+    /// Request a download, retrying briefly: the system answers noSuchItem
+    /// for items it hasn't ingested yet (e.g. just delivered via
+    /// enumerateChanges), so an immediate single attempt can spuriously fail.
+    func requestDownloadWhenKnown(
+        _ identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager? = nil
+    ) {
+        guard let manager = manager ?? NSFileProviderManager(for: domain) else { return }
+        Task {
+            for attempt in 0..<5 {
+                if Task.isCancelled { return }
+                do {
+                    try await manager.requestDownloadForItem(withIdentifier: identifier)
+                    return
+                } catch {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
+                }
+            }
+            self.logger.error(
+                "download request failed for \(identifier.rawValue, privacy: .public)")
+        }
+    }
+
+    /// Resume materializing pinned items (called once at extension start, so
+    /// pins made while the extension was suspended still take effect).
+    func requestDownloadsForPinnedItems() {
         cacheLock.lock()
         let pinned = pinnedIdentifiers
         cacheLock.unlock()
-        guard !pinned.isEmpty, let manager = NSFileProviderManager(for: domain)
-        else { return }
+        guard !pinned.isEmpty else { return }
         for identifier in pinned {
-            cacheLock.lock()
-            enumerationKicked.insert(identifier)
-            cacheLock.unlock()
-            Task {
-                try? await manager.requestDownloadForItem(
-                    withIdentifier: NSFileProviderItemIdentifier(identifier))
-            }
+            requestDownloadWhenKnown(NSFileProviderItemIdentifier(identifier))
         }
     }
 
@@ -194,8 +226,6 @@ final class RemoteStore {
             pinnedIdentifiers.insert(identifier.rawValue)
         } else {
             pinnedIdentifiers.remove(identifier.rawValue)
-            // Allow a later re-pin to kick off the enumeration cascade again.
-            enumerationKicked.removeAll()
         }
         if let cached = cache[identifier.rawValue] {
             cache[identifier.rawValue] = cached.withPinned(pinned)

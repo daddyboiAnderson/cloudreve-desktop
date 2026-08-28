@@ -28,7 +28,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
             )
             // Resume materializing items pinned in earlier sessions.
-            self.store?.kickPinnedItems()
+            self.store?.requestDownloadsForPinnedItems()
         } else {
             self.store = nil
             logger.error(
@@ -425,39 +425,37 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         } else {
             try await manager.requestModification(
                 of: [.lastUsedDate], forItemWithIdentifier: identifier, options: [])
-            if pin {
-                // Triggers a system enumeration of the folder, registering
-                // its children as placeholders one level down; the eager
-                // policy served for them then downloads them, and the
-                // enumeration hook cascades into deeper levels.
-                try? await manager.requestDownloadForItem(
-                    withIdentifier: identifier)
-            }
         }
         logger.notice(
             "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
         )
-        // Eagerly materialize the existing subtree of a newly pinned folder
-        // instead of waiting for the user to browse into it. New or updated
-        // items appearing later are covered by the inherited eager policy.
+        // Materialize the existing subtree of a newly pinned folder. The
+        // system only tracks (and downloads) items it knows, and folders it
+        // has never enumerated are unknown to it — so push the whole subtree
+        // into its mirror as synthetic change events delivered through the
+        // working-set enumeration, then request the downloads explicitly.
         if pin && isFolder {
-            await downloadSubtree(
-                of: identifier, store: store, manager: manager)
+            let descendants = await listSubtree(of: identifier, store: store)
+            store.recordSyntheticModifyEvents(
+                uris: descendants.map { store.uri(for: $0.itemIdentifier) })
+            try? await manager.signalEnumerator(for: .workingSet)
+            for descendant in descendants
+            where !descendant.contentType.conforms(to: .folder) {
+                store.requestDownloadWhenKnown(
+                    descendant.itemIdentifier, manager: manager)
+            }
         }
     }
 
-    /// Breadth-first walk of the remote tree below `identifier`, asking the
-    /// system to download every item. Failures are expected for items the
-    /// system hasn't enumerated yet (it answers with noSuchItem); those get
-    /// the inherited eager policy when they are first enumerated.
-    private func downloadSubtree(
+    /// Breadth-first remote listing of everything below `identifier`.
+    private func listSubtree(
         of identifier: NSFileProviderItemIdentifier,
-        store: RemoteStore,
-        manager: NSFileProviderManager
-    ) async {
+        store: RemoteStore
+    ) async -> [FileProviderItem] {
+        var result: [FileProviderItem] = []
         var queue = [identifier]
         while !queue.isEmpty {
-            if Task.isCancelled { return }
+            if Task.isCancelled { return result }
             let current = queue.removeFirst()
             var page: String? = nil
             repeat {
@@ -466,21 +464,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         of: current, page: page)
                     page = nextPage
                     for child in items {
-                        if Task.isCancelled { return }
-                        try? await manager.requestDownloadForItem(
-                            withIdentifier: child.itemIdentifier)
+                        result.append(child)
                         if child.contentType.conforms(to: .folder) {
                             queue.append(child.itemIdentifier)
                         }
                     }
                 } catch {
                     logger.error(
-                        "downloadSubtree listing of \(current.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                        "listSubtree listing of \(current.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                     )
                     page = nil
                 }
             } while page != nil
         }
+        return result
     }
 
     private static func parentURI(of uri: String) -> String {

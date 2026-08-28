@@ -30,11 +30,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             Task {
                 do {
                     let (rootItems, _) = try await store.children(of: .rootContainer, page: nil)
-                    let items = rootItems + store.cachedItems()
-                    observer.didEnumerate(items)
-                    // Materialize pinned subtrees one level at a time (see
-                    // RemoteStore.kickPinnedSubtrees).
-                    store.kickPinnedSubtrees(items)
+                    observer.didEnumerate(rootItems + store.cachedItems())
                     observer.finishEnumerating(upTo: nil)
                 } catch {
                     logger.error(
@@ -67,7 +63,6 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let (items, nextPage) = try await store.children(
                     of: containerIdentifier, page: pageToken)
                 observer.didEnumerate(items)
-                store.kickPinnedSubtrees(items)
                 if let nextPage,
                     let data = nextPage.data(using: .utf8)
                 {
@@ -122,7 +117,16 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             // (rapid create+delete), report a deletion instead.
             do {
                 let file = try await store.client.fileInfo(uri: fromURI)
-                observer.didUpdate([store.makeItem(file)])
+                let item = store.makeItem(file)
+                observer.didUpdate([item])
+                // Items below a "Keep Downloaded" folder are materialized
+                // explicitly: the system only auto-downloads eager-policy
+                // items it already tracks, and this change may be the first
+                // time it hears about the item (e.g. synthetic pin events or
+                // uploads from the web UI/other devices).
+                if item.effectivelyPinned && !item.contentType.conforms(to: .folder) {
+                    store.requestDownloadWhenKnown(item.itemIdentifier)
+                }
             } catch CloudreveError.noSuchItem {
                 observer.didDeleteItems(withIdentifiers: [
                     NSFileProviderItemIdentifier(fromURI)
