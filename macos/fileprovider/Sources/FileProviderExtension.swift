@@ -28,7 +28,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
             )
             // Resume materializing items pinned in earlier sessions.
-            self.store?.requestDownloadsForPinnedItems()
+            if let store = self.store {
+                Task { await store.requestDownloadsForPinnedItems() }
+            }
         } else {
             self.store = nil
             logger.error(
@@ -430,19 +432,34 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
         )
         // Materialize the existing subtree of a newly pinned folder. The
-        // system only tracks (and downloads) items it knows, and folders it
-        // has never enumerated are unknown to it — so push the whole subtree
-        // into its mirror as synthetic change events delivered through the
-        // working-set enumeration, then request the downloads explicitly.
+        // system only downloads items it knows, and it never learns about
+        // folder contents it hasn't enumerated — so record the subtree and
+        // signal the working set: the change enumeration then delivers every
+        // descendant with the eager content policy, which makes the system
+        // schedule the downloads itself.
         if pin && isFolder {
             let descendants = await listSubtree(of: identifier, store: store)
-            store.recordSyntheticModifyEvents(
+            store.recordPendingPinned(
                 uris: descendants.map { store.uri(for: $0.itemIdentifier) })
-            try? await manager.signalEnumerator(for: .workingSet)
-            for descendant in descendants
-            where !descendant.contentType.conforms(to: .folder) {
-                store.requestDownloadWhenKnown(
-                    descendant.itemIdentifier, manager: manager)
+            do {
+                try await manager.signalEnumerator(for: .workingSet)
+            } catch {
+                logger.error(
+                    "signalEnumerator failed: \(error.localizedDescription, privacy: .public)")
+            }
+            // Belt and braces: once the system has had a moment to ingest the
+            // delivered items, explicitly request the file downloads too.
+            // Awaited so the requests (and their retries) finish before this
+            // action completes and the XPC service suspends.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await withTaskGroup(of: Void.self) { group in
+                for descendant in descendants
+                where !descendant.contentType.conforms(to: .folder) {
+                    group.addTask {
+                        await store.requestDownloadWhenKnown(
+                            descendant.itemIdentifier, manager: manager)
+                    }
+                }
             }
         }
     }

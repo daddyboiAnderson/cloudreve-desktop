@@ -93,6 +93,32 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 for change in changes {
                     try await apply(change: change, to: observer)
                 }
+                // Deliver pending pinned-subtree items (recorded when a folder
+                // was pinned via "Keep Downloaded"). They arrive with the
+                // eager content policy, so the system schedules downloads for
+                // the dataless ones on its own.
+                if containerIdentifier == .workingSet {
+                    let pending = store.takePendingPinned()
+                    if !pending.isEmpty {
+                        var items: [NSFileProviderItem] = []
+                        for uri in pending {
+                            if Task.isCancelled { break }
+                            do {
+                                let file = try await store.client.fileInfo(uri: uri)
+                                items.append(store.makeItem(file))
+                            } catch {
+                                logger.error(
+                                    "pinned item \(uri, privacy: .public) unavailable: \(error.localizedDescription, privacy: .public)"
+                                )
+                            }
+                        }
+                        if !items.isEmpty {
+                            logger.notice(
+                                "delivering \(items.count) pinned item(s) to the working set")
+                            observer.didUpdate(items)
+                        }
+                    }
+                }
                 observer.finishEnumeratingChanges(upTo: newAnchor, moreComing: false)
             } catch let error as NSFileProviderError where error.code == .syncAnchorExpired {
                 logger.info(
@@ -117,16 +143,10 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             // (rapid create+delete), report a deletion instead.
             do {
                 let file = try await store.client.fileInfo(uri: fromURI)
-                let item = store.makeItem(file)
-                observer.didUpdate([item])
-                // Items below a "Keep Downloaded" folder are materialized
-                // explicitly: the system only auto-downloads eager-policy
-                // items it already tracks, and this change may be the first
-                // time it hears about the item (e.g. synthetic pin events or
-                // uploads from the web UI/other devices).
-                if item.effectivelyPinned && !item.contentType.conforms(to: .folder) {
-                    store.requestDownloadWhenKnown(item.itemIdentifier)
-                }
+                // Items below a pinned folder are served with the explicit
+                // eager content policy, so the system downloads new uploads
+                // from the web UI/other devices as soon as they arrive here.
+                observer.didUpdate([store.makeItem(file)])
             } catch CloudreveError.noSuchItem {
                 observer.didDeleteItems(withIdentifiers: [
                     NSFileProviderItemIdentifier(fromURI)

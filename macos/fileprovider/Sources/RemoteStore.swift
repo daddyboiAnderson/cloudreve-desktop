@@ -136,85 +136,85 @@ final class RemoteStore {
         return false
     }
 
-    /// Append synthetic "modify" events for the given item URIs to the shared
-    /// event log. enumerateChanges replays them like remote changes, which
-    /// pushes the items into the system's mirror. This is how a freshly
-    /// pinned folder's subtree becomes known to the system:
-    /// requestDownloadForItem only works for items the system already knows,
-    /// and it cannot enumerate folders that were never browsed.
-    func recordSyntheticModifyEvents(uris: [String]) {
-        let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let encoder = JSONEncoder()
-        let lines = uris.compactMap { uri -> String? in
-            let uri = Self.canonicalURI(uri)
-            guard uri.hasPrefix(rootPath) else { return nil }
-            var path = String(uri.dropFirst(rootPath.count))
-            if !path.hasPrefix("/") { path = "/" + path }
-            let event = FpEvent(ts: now, type: "modify", from: path, to: nil)
-            guard let data = try? encoder.encode(event) else { return nil }
-            return String(decoding: data, as: UTF8.self)
-        }
-        guard !lines.isEmpty else { return }
+    /// URIs of pinned-folder descendants that still need to be pushed into
+    /// the system's mirror, persisted in the extension's own state directory
+    /// (the shared fp-events log is read-only for the sandboxed extension).
+    /// Consumed by the next working-set change enumeration.
+    private var pendingPinnedFileURL: URL {
+        stateDirectoryURL.appendingPathComponent("pending-pinned-\(drive.id).json")
+    }
+
+    /// Record subtree items of a freshly pinned folder so the next
+    /// working-set enumeration delivers them as updates. The system only
+    /// downloads items it knows, and it never learns about folder contents
+    /// that were never enumerated — this is how it finds out.
+    func recordPendingPinned(uris: [String]) {
+        cacheLock.lock()
+        var pending = readPendingPinned()
+        pending.formUnion(uris)
+        cacheLock.unlock()
         do {
             try FileManager.default.createDirectory(
-                at: eventsFileURL.deletingLastPathComponent(),
+                at: pendingPinnedFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true)
-            // Append-only: the main app writes remote events to the same log,
-            // so never rewrite the file.
-            let payload = Data((lines.joined(separator: "\n") + "\n").utf8)
-            if let handle = try? FileHandle(forWritingTo: eventsFileURL) {
-                defer { try? handle.close() }
-                let end = handle.seekToEndOfFile()
-                if end > 0 {
-                    handle.seek(toFileOffset: end - 1)
-                    if handle.readData(ofLength: 1) != Data("\n".utf8) {
-                        handle.seekToEndOfFile()
-                        handle.write(Data("\n".utf8))
-                    }
-                }
-                handle.seekToEndOfFile()
-                handle.write(payload)
-            } else {
-                try payload.write(to: eventsFileURL)
-            }
+            try JSONEncoder().encode(pending.sorted()).write(
+                to: pendingPinnedFileURL, options: .atomic)
         } catch {
             logger.error(
-                "failed to record synthetic events: \(error.localizedDescription, privacy: .public)")
+                "failed to persist pending pinned items: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func readPendingPinned() -> Set<String> {
+        guard let data = try? Data(contentsOf: pendingPinnedFileURL),
+            let saved = try? JSONDecoder().decode([String].self, from: data)
+        else { return [] }
+        return Set(saved)
+    }
+
+    /// Pending pinned-subtree URIs, clearing the list. The caller delivers
+    /// the items; if delivery fails the items are simply re-recorded on the
+    /// next pin.
+    func takePendingPinned() -> [String] {
+        cacheLock.lock()
+        let pending = readPendingPinned()
+        cacheLock.unlock()
+        try? FileManager.default.removeItem(at: pendingPinnedFileURL)
+        return pending.sorted()
     }
 
     /// Request a download, retrying briefly: the system answers noSuchItem
     /// for items it hasn't ingested yet (e.g. just delivered via
     /// enumerateChanges), so an immediate single attempt can spuriously fail.
+    /// Awaited by callers — fire-and-forget Tasks would die when the XPC
+    /// service suspends after completing the in-flight request.
     func requestDownloadWhenKnown(
         _ identifier: NSFileProviderItemIdentifier,
         manager: NSFileProviderManager? = nil
-    ) {
+    ) async {
         guard let manager = manager ?? NSFileProviderManager(for: domain) else { return }
-        Task {
-            for attempt in 0..<5 {
-                if Task.isCancelled { return }
-                do {
-                    try await manager.requestDownloadForItem(withIdentifier: identifier)
-                    return
-                } catch {
-                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
-                }
+        for attempt in 0..<5 {
+            if Task.isCancelled { return }
+            do {
+                try await manager.requestDownloadForItem(withIdentifier: identifier)
+                return
+            } catch {
+                try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
             }
-            self.logger.error(
-                "download request failed for \(identifier.rawValue, privacy: .public)")
         }
+        logger.error(
+            "download request failed for \(identifier.rawValue, privacy: .public)")
     }
 
     /// Resume materializing pinned items (called once at extension start, so
     /// pins made while the extension was suspended still take effect).
-    func requestDownloadsForPinnedItems() {
+    func requestDownloadsForPinnedItems() async {
         cacheLock.lock()
         let pinned = pinnedIdentifiers
         cacheLock.unlock()
         guard !pinned.isEmpty else { return }
         for identifier in pinned {
-            requestDownloadWhenKnown(NSFileProviderItemIdentifier(identifier))
+            await requestDownloadWhenKnown(NSFileProviderItemIdentifier(identifier))
         }
     }
 
