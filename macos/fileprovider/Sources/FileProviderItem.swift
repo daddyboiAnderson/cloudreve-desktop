@@ -21,6 +21,15 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// than relying on the system to apply inheritance) makes the system
     /// download freshly enumerated children of pinned folders right away.
     let effectivelyPinned: Bool
+    /// metadataVersion without the pin marker, kept so withPinned can re-derive
+    /// the final version for either pin state.
+    let baseMetadataVersion: Data
+
+    /// Appended to metadataVersion while an item is effectively pinned. The
+    /// framework ignores delivered items whose version matches its cached
+    /// snapshot — without the marker, a policy change on an otherwise
+    /// unmodified item would never reach the system.
+    private static let pinnedVersionMarker = Data("#kd".utf8)
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -44,13 +53,18 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         self.documentSize = documentSize.map { NSNumber(value: $0) }
         self.childItemCount = childItemCount.map { NSNumber(value: $0) }
         self.capabilities = capabilities
-        self.itemVersion = NSFileProviderItemVersion(
-            contentVersion: contentVersion,
-            metadataVersion: metadataVersion)
-        self.creationDate = creationDate
-        self.contentModificationDate = contentModificationDate
         self.pinned = pinned
         self.effectivelyPinned = effectivelyPinned ?? pinned
+        self.baseMetadataVersion = metadataVersion
+        let effectiveMetadataVersion =
+            self.effectivelyPinned
+            ? metadataVersion + Self.pinnedVersionMarker
+            : metadataVersion
+        self.itemVersion = NSFileProviderItemVersion(
+            contentVersion: contentVersion,
+            metadataVersion: effectiveMetadataVersion)
+        self.creationDate = creationDate
+        self.contentModificationDate = contentModificationDate
         super.init()
     }
 
@@ -85,7 +99,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
             childItemCount: childItemCount?.intValue,
             capabilities: capabilities,
             contentVersion: itemVersion.contentVersion,
-            metadataVersion: itemVersion.metadataVersion,
+            metadataVersion: baseMetadataVersion,
             creationDate: creationDate,
             contentModificationDate: contentModificationDate,
             pinned: pinned,
