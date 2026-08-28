@@ -30,7 +30,11 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             Task {
                 do {
                     let (rootItems, _) = try await store.children(of: .rootContainer, page: nil)
-                    observer.didEnumerate(rootItems + store.cachedItems())
+                    let items = rootItems + store.cachedItems()
+                    observer.didEnumerate(items)
+                    // Materialize pinned subtrees one level at a time (see
+                    // RemoteStore.kickPinnedSubtrees).
+                    store.kickPinnedSubtrees(items)
                     observer.finishEnumerating(upTo: nil)
                 } catch {
                     logger.error(
@@ -63,6 +67,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let (items, nextPage) = try await store.children(
                     of: containerIdentifier, page: pageToken)
                 observer.didEnumerate(items)
+                store.kickPinnedSubtrees(items)
                 if let nextPage,
                     let data = nextPage.data(using: .utf8)
                 {

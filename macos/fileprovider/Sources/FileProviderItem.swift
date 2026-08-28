@@ -13,9 +13,14 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     let itemVersion: NSFileProviderItemVersion
     let creationDate: Date?
     let contentModificationDate: Date?
-    /// "Keep Downloaded" state: drives the content policy below and the
+    /// "Keep Downloaded" state set explicitly on this item: drives the
     /// custom context menu actions (via the userInfo activation rules).
     let pinned: Bool
+    /// Effective state including inheritance from a pinned ancestor folder:
+    /// drives the content policy. Serving the eager policy explicitly (rather
+    /// than relying on the system to apply inheritance) makes the system
+    /// download freshly enumerated children of pinned folders right away.
+    let effectivelyPinned: Bool
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -29,7 +34,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         metadataVersion: Data,
         creationDate: Date?,
         contentModificationDate: Date?,
-        pinned: Bool
+        pinned: Bool,
+        effectivelyPinned: Bool? = nil
     ) {
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parentIdentifier
@@ -44,6 +50,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         self.creationDate = creationDate
         self.contentModificationDate = contentModificationDate
         self.pinned = pinned
+        self.effectivelyPinned = effectivelyPinned ?? pinned
         super.init()
     }
 
@@ -54,7 +61,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     /// appear below a pinned folder — this is what auto-downloads files
     /// uploaded from the web UI or other devices.
     var contentPolicy: NSFileProviderContentPolicy {
-        pinned ? .downloadEagerlyAndKeepDownloaded : .inherited
+        effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .inherited
     }
 
     /// Keys consumed by the NSExtensionFileProviderActions activation rules
@@ -81,7 +88,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
             metadataVersion: itemVersion.metadataVersion,
             creationDate: creationDate,
             contentModificationDate: contentModificationDate,
-            pinned: pinned
+            pinned: pinned,
+            effectivelyPinned: pinned
         )
     }
 }

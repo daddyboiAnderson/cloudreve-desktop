@@ -110,10 +110,80 @@ final class RemoteStore {
 
     // MARK: - "Keep Downloaded" pin state
 
+    /// Folders whose enumeration has already been kicked via
+    /// requestDownloadForItem in this process (see kickPinnedSubtrees).
+    private var enumerationKicked: Set<String> = []
+
     func isPinned(_ identifier: NSFileProviderItemIdentifier) -> Bool {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return pinnedIdentifiers.contains(identifier.rawValue)
+    }
+
+    /// True when the item itself is pinned or sits below a pinned folder.
+    /// Pinned entries are identifiers (usually URIs); ancestors are matched
+    /// by URI prefix, mapping through the identity table first so renamed
+    /// folders still match.
+    func isEffectivelyPinned(
+        _ identifier: NSFileProviderItemIdentifier, uri: String
+    ) -> Bool {
+        let uri = Self.canonicalURI(uri)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if pinnedIdentifiers.contains(identifier.rawValue) { return true }
+        for pinned in pinnedIdentifiers {
+            let pinnedURI =
+                uriByIdentifier[pinned].map(Self.canonicalURI) ?? pinned
+            let prefix = pinnedURI.hasSuffix("/") ? pinnedURI : pinnedURI + "/"
+            if uri.hasPrefix(prefix) { return true }
+        }
+        return false
+    }
+
+    /// For every pinned folder among `items` (or below a pinned folder),
+    /// ask the system to materialize the directory, which makes it enumerate
+    /// the folder one level down. Combined with the explicit eager policy
+    /// served for descendants, this cascades: each enumeration registers the
+    /// next level of placeholders and kicks the level below, until a pinned
+    /// subtree is fully materialized — without the user browsing into it.
+    /// No-ops for folders already kicked in this process.
+    func kickPinnedSubtrees(_ items: [FileProviderItem]) {
+        let folders = items.filter {
+            $0.contentType.conforms(to: .folder) && $0.effectivelyPinned
+        }
+        guard !folders.isEmpty, let manager = NSFileProviderManager(for: domain)
+        else { return }
+        for folder in folders {
+            cacheLock.lock()
+            let already = enumerationKicked.contains(folder.itemIdentifier.rawValue)
+            if !already { enumerationKicked.insert(folder.itemIdentifier.rawValue) }
+            cacheLock.unlock()
+            guard !already else { continue }
+            Task {
+                try? await manager.requestDownloadForItem(
+                    withIdentifier: folder.itemIdentifier)
+            }
+        }
+    }
+
+    /// Kick materialization for every pinned item (called once at extension
+    /// start, so pins made while the extension was suspended still take
+    /// effect).
+    func kickPinnedItems() {
+        cacheLock.lock()
+        let pinned = pinnedIdentifiers
+        cacheLock.unlock()
+        guard !pinned.isEmpty, let manager = NSFileProviderManager(for: domain)
+        else { return }
+        for identifier in pinned {
+            cacheLock.lock()
+            enumerationKicked.insert(identifier)
+            cacheLock.unlock()
+            Task {
+                try? await manager.requestDownloadForItem(
+                    withIdentifier: NSFileProviderItemIdentifier(identifier))
+            }
+        }
     }
 
     /// Toggle the pin state, persist it, and update the cached item so the
@@ -124,6 +194,8 @@ final class RemoteStore {
             pinnedIdentifiers.insert(identifier.rawValue)
         } else {
             pinnedIdentifiers.remove(identifier.rawValue)
+            // Allow a later re-pin to kick off the enumeration cascade again.
+            enumerationKicked.removeAll()
         }
         if let cached = cache[identifier.rawValue] {
             cache[identifier.rawValue] = cached.withPinned(pinned)
@@ -310,7 +382,8 @@ final class RemoteStore {
             metadataVersion: version,
             creationDate: CloudreveClient.parseDate(file.created_at),
             contentModificationDate: CloudreveClient.parseDate(file.updated_at),
-            pinned: isPinned(identifier)
+            pinned: isPinned(identifier),
+            effectivelyPinned: isEffectivelyPinned(identifier, uri: filePath)
         )
         cacheLock.lock()
         cache[identifier.rawValue] = item

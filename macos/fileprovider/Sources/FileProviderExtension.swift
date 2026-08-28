@@ -27,6 +27,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             logger.notice(
                 "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
             )
+            // Resume materializing items pinned in earlier sessions.
+            self.store?.kickPinnedItems()
         } else {
             self.store = nil
             logger.error(
@@ -423,6 +425,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         } else {
             try await manager.requestModification(
                 of: [.lastUsedDate], forItemWithIdentifier: identifier, options: [])
+            if pin {
+                // Triggers a system enumeration of the folder, registering
+                // its children as placeholders one level down; the eager
+                // policy served for them then downloads them, and the
+                // enumeration hook cascades into deeper levels.
+                try? await manager.requestDownloadForItem(
+                    withIdentifier: identifier)
+            }
         }
         logger.notice(
             "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
