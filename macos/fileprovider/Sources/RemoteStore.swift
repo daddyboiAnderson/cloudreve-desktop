@@ -20,6 +20,10 @@ final class RemoteStore {
     /// rename, but NSFileProvider item identifiers must not.
     private var uriByIdentifier: [String: String] = [:]
     private var identifierByURI: [String: String] = [:]
+    /// Identifiers pinned via "Keep Downloaded". Persisted per drive so the
+    /// policy survives extension restarts; consulted by makeItem/rootItem
+    /// when deriving each item's `contentPolicy`.
+    private var pinnedIdentifiers: Set<String> = []
     private let cacheLock = NSLock()
 
     // MARK: - Change feed (shared event log)
@@ -52,14 +56,27 @@ final class RemoteStore {
             identifierByURI = Dictionary(
                 uniqueKeysWithValues: saved.map { ($0.value, $0.key) })
         }
+        if let data = try? Data(contentsOf: pinnedFileURL),
+            let saved = try? JSONDecoder().decode([String].self, from: data)
+        {
+            pinnedIdentifiers = Set(saved)
+        }
     }
 
-    private var identityFileURL: URL {
+    private var stateDirectoryURL: URL {
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
         return base
             .appendingPathComponent("CloudreveFileProvider", isDirectory: true)
+    }
+
+    private var pinnedFileURL: URL {
+        stateDirectoryURL.appendingPathComponent("pinned-\(drive.id).json")
+    }
+
+    private var identityFileURL: URL {
+        stateDirectoryURL
             .appendingPathComponent("identities-\(drive.id).json")
     }
 
@@ -88,6 +105,40 @@ final class RemoteStore {
             try JSONEncoder().encode(snapshot).write(to: identityFileURL, options: .atomic)
         } catch {
             logger.error("failed to persist item identities: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    // MARK: - "Keep Downloaded" pin state
+
+    func isPinned(_ identifier: NSFileProviderItemIdentifier) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return pinnedIdentifiers.contains(identifier.rawValue)
+    }
+
+    /// Toggle the pin state, persist it, and update the cached item so the
+    /// next lookup/enumeration already reports the new `contentPolicy`.
+    func setPinned(_ pinned: Bool, for identifier: NSFileProviderItemIdentifier) {
+        cacheLock.lock()
+        if pinned {
+            pinnedIdentifiers.insert(identifier.rawValue)
+        } else {
+            pinnedIdentifiers.remove(identifier.rawValue)
+        }
+        if let cached = cache[identifier.rawValue] {
+            cache[identifier.rawValue] = cached.withPinned(pinned)
+        }
+        let snapshot = pinnedIdentifiers.sorted()
+        cacheLock.unlock()
+
+        do {
+            try FileManager.default.createDirectory(
+                at: pinnedFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try JSONEncoder().encode(snapshot).write(to: pinnedFileURL, options: .atomic)
+        } catch {
+            logger.error(
+                "failed to persist pinned items: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -258,7 +309,8 @@ final class RemoteStore {
             contentVersion: file.isFolder ? version : thumbnailVersion,
             metadataVersion: version,
             creationDate: CloudreveClient.parseDate(file.created_at),
-            contentModificationDate: CloudreveClient.parseDate(file.updated_at)
+            contentModificationDate: CloudreveClient.parseDate(file.updated_at),
+            pinned: isPinned(identifier)
         )
         cacheLock.lock()
         cache[identifier.rawValue] = item
@@ -285,7 +337,8 @@ final class RemoteStore {
             contentVersion: Data("root".utf8),
             metadataVersion: Data("root".utf8),
             creationDate: nil,
-            contentModificationDate: nil
+            contentModificationDate: nil,
+            pinned: isPinned(.rootContainer)
         )
     }
 

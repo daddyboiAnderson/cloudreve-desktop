@@ -7,7 +7,7 @@ import OSLog
 /// Domains are registered per drive by the main app; the domain identifier
 /// embeds the drive id ("cloudreve.drive.<uuid>").
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
-    NSFileProviderThumbnailing
+    NSFileProviderThumbnailing, NSFileProviderCustomAction
 {
     private let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "extension")
@@ -206,7 +206,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 contentVersion: Data("local".utf8),
                 metadataVersion: Data("local".utf8),
                 creationDate: nil,
-                contentModificationDate: nil
+                contentModificationDate: nil,
+                pinned: false
             )
             completionHandler(item, [], false, nil)
             return progress
@@ -337,6 +338,139 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         }
         return Progress()
+    }
+
+    // MARK: - Custom actions ("Keep Downloaded")
+
+    private static let keepDownloadedAction =
+        "cloudreve.desktop.dev.fileprovider.KeepDownloaded"
+    private static let removeKeepDownloadedAction =
+        "cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded"
+
+    /// Handles the "Keep Downloaded" / "Remove Keep Downloaded" context menu
+    /// entries declared in Info.plist. Toggling updates the persisted pin
+    /// state and nudges the system to re-read the item so it applies the new
+    /// `contentPolicy`; pinning also materializes existing content eagerly.
+    /// Afterwards the inherited `.downloadEagerlyAndKeepDownloaded` policy
+    /// makes the system download new remote items under pinned folders on
+    /// its own (fed by the working-set change enumeration).
+    func performAction(
+        identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
+        onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
+        completionHandler: @escaping (Error?) -> Void
+    ) -> Progress {
+        let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+        let pin: Bool
+        switch actionIdentifier.rawValue {
+        case Self.keepDownloadedAction: pin = true
+        case Self.removeKeepDownloadedAction: pin = false
+        default:
+            completionHandler(
+                NSError(
+                    domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Unknown action \(actionIdentifier.rawValue)"
+                    ]))
+            return progress
+        }
+        guard let store, let manager = NSFileProviderManager(for: domain) else {
+            completionHandler(unavailableError)
+            return progress
+        }
+
+        let task = Task {
+            for identifier in itemIdentifiers {
+                if Task.isCancelled || progress.isCancelled {
+                    completionHandler(CocoaError(.userCancelled))
+                    return
+                }
+                do {
+                    try await setPinned(
+                        pin, for: identifier, store: store, manager: manager)
+                } catch {
+                    logger.error(
+                        "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+                progress.completedUnitCount += 1
+            }
+            completionHandler(nil)
+        }
+        progress.cancellationHandler = { task.cancel() }
+        return progress
+    }
+
+    /// Persist the pin state and make the system pick it up:
+    /// - files to pin: `requestDownloadForItem` materializes them now and the
+    ///   `fetchContents` reply carries the item with the new policy;
+    /// - everything else: `requestModification(of: [.lastUsedDate])`
+    ///   schedules a `modifyItem` call whose completion returns the item with
+    ///   the new policy (the field itself is a no-op remotely).
+    private func setPinned(
+        _ pin: Bool,
+        for identifier: NSFileProviderItemIdentifier,
+        store: RemoteStore,
+        manager: NSFileProviderManager
+    ) async throws {
+        let item = try await store.item(
+            for: identifier, displayName: domain.displayName)
+        store.setPinned(pin, for: identifier)
+        let isFolder =
+            identifier == .rootContainer || item.contentType.conforms(to: .folder)
+        if pin && !isFolder {
+            try await manager.requestDownloadForItem(withIdentifier: identifier)
+        } else {
+            try await manager.requestModification(
+                of: [.lastUsedDate], forItemWithIdentifier: identifier, options: [])
+        }
+        logger.notice(
+            "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
+        )
+        // Eagerly materialize the existing subtree of a newly pinned folder
+        // instead of waiting for the user to browse into it. New or updated
+        // items appearing later are covered by the inherited eager policy.
+        if pin && isFolder {
+            await downloadSubtree(
+                of: identifier, store: store, manager: manager)
+        }
+    }
+
+    /// Breadth-first walk of the remote tree below `identifier`, asking the
+    /// system to download every item. Failures are expected for items the
+    /// system hasn't enumerated yet (it answers with noSuchItem); those get
+    /// the inherited eager policy when they are first enumerated.
+    private func downloadSubtree(
+        of identifier: NSFileProviderItemIdentifier,
+        store: RemoteStore,
+        manager: NSFileProviderManager
+    ) async {
+        var queue = [identifier]
+        while !queue.isEmpty {
+            if Task.isCancelled { return }
+            let current = queue.removeFirst()
+            var page: String? = nil
+            repeat {
+                do {
+                    let (items, nextPage) = try await store.children(
+                        of: current, page: page)
+                    page = nextPage
+                    for child in items {
+                        if Task.isCancelled { return }
+                        try? await manager.requestDownloadForItem(
+                            withIdentifier: child.itemIdentifier)
+                        if child.contentType.conforms(to: .folder) {
+                            queue.append(child.itemIdentifier)
+                        }
+                    }
+                } catch {
+                    logger.error(
+                        "downloadSubtree listing of \(current.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                    page = nil
+                }
+            } while page != nil
+        }
     }
 
     private static func parentURI(of uri: String) -> String {

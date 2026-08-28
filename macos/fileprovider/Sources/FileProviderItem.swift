@@ -13,6 +13,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     let itemVersion: NSFileProviderItemVersion
     let creationDate: Date?
     let contentModificationDate: Date?
+    /// "Keep Downloaded" state: drives the content policy below and the
+    /// custom context menu actions (via the userInfo activation rules).
+    let pinned: Bool
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -25,7 +28,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         contentVersion: Data,
         metadataVersion: Data,
         creationDate: Date?,
-        contentModificationDate: Date?
+        contentModificationDate: Date?,
+        pinned: Bool
     ) {
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parentIdentifier
@@ -39,6 +43,45 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
             metadataVersion: metadataVersion)
         self.creationDate = creationDate
         self.contentModificationDate = contentModificationDate
+        self.pinned = pinned
         super.init()
+    }
+
+    /// Declarative download/eviction policy (macOS 13+).
+    /// `.downloadEagerlyAndKeepDownloaded` = "Keep Downloaded": the system
+    /// downloads the item eagerly, keeps downloading remote updates, never
+    /// evicts it, and schedules downloads for inherited-policy items that
+    /// appear below a pinned folder — this is what auto-downloads files
+    /// uploaded from the web UI or other devices.
+    var contentPolicy: NSFileProviderContentPolicy {
+        pinned ? .downloadEagerlyAndKeepDownloaded : .inherited
+    }
+
+    /// Keys consumed by the NSExtensionFileProviderActions activation rules
+    /// in Info.plist so exactly one of the pin/unpin menu entries is shown.
+    var userInfo: [AnyHashable: Any]? {
+        [
+            "displayKeepDownloaded": NSNumber(value: !pinned),
+            "displayRemoveKeepDownloaded": NSNumber(value: pinned),
+        ]
+    }
+
+    /// Copy with a different pin state, so a toggled cached item reports the
+    /// new policy before the next server round-trip.
+    func withPinned(_ pinned: Bool) -> FileProviderItem {
+        FileProviderItem(
+            identifier: itemIdentifier,
+            parentIdentifier: parentItemIdentifier,
+            filename: filename,
+            contentType: contentType,
+            documentSize: documentSize?.intValue,
+            childItemCount: childItemCount?.intValue,
+            capabilities: capabilities,
+            contentVersion: itemVersion.contentVersion,
+            metadataVersion: itemVersion.metadataVersion,
+            creationDate: creationDate,
+            contentModificationDate: contentModificationDate,
+            pinned: pinned
+        )
     }
 }
