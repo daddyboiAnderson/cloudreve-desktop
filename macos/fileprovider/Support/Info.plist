@@ -40,6 +40,19 @@
 	<dict>
 		<key>NSExtensionFileProviderSupportsEnumeration</key>
 		<true/>
+		<key>NSFileProviderDecorations</key>
+		<array>
+			<dict>
+				<key>Identifier</key>
+				<string>cloudreve.desktop.dev.fileprovider.keep-downloaded-v2</string>
+				<key>BadgeImageType</key>
+				<string>cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2</string>
+				<key>Category</key>
+				<string>Badge</string>
+				<key>Label</key>
+				<string>Keep Downloaded</string>
+			</dict>
+		</array>
 		<key>NSExtensionFileProviderActions</key>
 		<array>
 			<dict>

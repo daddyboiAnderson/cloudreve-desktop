@@ -55,6 +55,8 @@ swiftc -swift-version 5 \
 echo "==> Assembling bundle"
 cp "$SUPPORT_DIR/Info.plist" "$APPEX/Contents/Info.plist"
 cp "$ROOT/src-tauri/icons/icon.icns" "$APPEX/Contents/Resources/Cloudreve.icns"
+bash "$ROOT/macos/scripts/build-keep-downloaded-badge.sh" \
+    "$APPEX/Contents/Resources"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$APPEX/Contents/Info.plist"
 

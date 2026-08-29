@@ -1,7 +1,7 @@
 import FileProvider
 import OSLog
 
-/// Enumerates a container (root or a folder) from the Cloudreve API.
+/// Enumerates Cloudreve containers and replays remote changes.
 final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "enumerator")
@@ -22,15 +22,12 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
-        // The working set is what the system re-enumerates when we signal
-        // after remote changes. Returning the root's live children plus every
-        // item we've served this session lets the system diff against its
-        // mirror and discover new/changed files.
+        // Working-set enumeration includes cached items and pinned subtrees.
         if containerIdentifier == .workingSet {
             Task {
                 do {
-                    let (rootItems, _) = try await store.children(of: .rootContainer, page: nil)
-                    observer.didEnumerate(rootItems + store.cachedItems())
+                    let items = try await store.workingSetItems()
+                    observer.didEnumerate(items)
                     observer.finishEnumerating(upTo: nil)
                 } catch {
                     logger.error(
@@ -42,7 +39,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return
         }
 
-        // The trash container is system-managed and has no remote counterpart.
+        // Trash is handled by the remote provider.
         guard containerIdentifier != .trashContainer else {
             observer.didEnumerate([])
             observer.finishEnumerating(upTo: nil)
@@ -88,34 +85,50 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         )
         Task {
             do {
+                // Force a full working-set refresh after a policy change.
+                if containerIdentifier == .workingSet,
+                    store.consumePolicyRescanIfNeeded()
+                {
+                    throw NSFileProviderError(.syncAnchorExpired)
+                }
                 let (changes, newAnchor) = try store.changes(
                     since: anchor.rawValue, for: containerIdentifier)
                 for change in changes {
                     try await apply(change: change, to: observer)
                 }
-                // Deliver pending pinned-subtree items (recorded when a folder
-                // was pinned via "Keep Downloaded"). They arrive with the
-                // eager content policy, so the system schedules downloads for
-                // the dataless ones on its own.
+                // Deliver queued Keep Downloaded policy changes.
                 if containerIdentifier == .workingSet {
-                    let pending = store.takePendingPinned()
+                    let pending = store.takePendingItemUpdates()
                     if !pending.isEmpty {
                         var items: [NSFileProviderItem] = []
-                        for uri in pending {
-                            if Task.isCancelled { break }
+                        var retry: [String] = []
+                        for (index, uri) in pending.enumerated() {
+                            if Task.isCancelled {
+                                retry.append(contentsOf: pending[index...])
+                                break
+                            }
                             do {
                                 let file = try await store.client.fileInfo(uri: uri)
                                 items.append(store.makeItem(file))
+                            } catch CloudreveError.noSuchItem {
+                                // The remote delete superseded this update.
                             } catch {
+                                retry.append(uri)
                                 logger.error(
-                                    "pinned item \(uri, privacy: .public) unavailable: \(error.localizedDescription, privacy: .public)"
+                                    "policy update item \(uri, privacy: .public) unavailable: \(error.localizedDescription, privacy: .public)"
                                 )
                             }
                         }
-                        if !items.isEmpty {
+                        if Task.isCancelled {
+                            // Retain every dequeued item on cancellation.
+                            retry = pending
+                        } else if !items.isEmpty {
                             logger.notice(
-                                "delivering \(items.count) pinned item(s) to the working set")
+                                "delivering \(items.count) policy update item(s) to the working set")
                             observer.didUpdate(items)
+                        }
+                        if !retry.isEmpty {
+                            store.recordPendingItemUpdates(uris: retry)
                         }
                     }
                 }
@@ -139,13 +152,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         let fromURI = store.uri(forEventPath: change.from)
         switch change.type {
         case "create", "modify":
-            // Fetch fresh metadata; if the item vanished in the meantime
-            // (rapid create+delete), report a deletion instead.
+            // Refresh metadata; a disappeared item becomes a delete.
             do {
                 let file = try await store.client.fileInfo(uri: fromURI)
-                // Items below a pinned folder are served with the explicit
-                // eager content policy, so the system downloads new uploads
-                // from the web UI/other devices as soon as they arrive here.
                 observer.didUpdate([store.makeItem(file)])
             } catch CloudreveError.noSuchItem {
                 observer.didDeleteItems(withIdentifiers: [
@@ -162,9 +171,6 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let toURI = store.uri(forEventPath: to)
                 do {
                     let file = try await store.client.fileInfo(uri: toURI)
-                    // A rename changes the filename/path, never the item's
-                    // identity. Updating the same identifier lets Finder move
-                    // the existing placeholder instead of creating a duplicate.
                     observer.didUpdate([
                         store.makeItem(file, preservingIdentifier: identifier)
                     ])

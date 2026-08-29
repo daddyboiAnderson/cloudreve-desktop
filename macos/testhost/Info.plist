@@ -22,5 +22,20 @@
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.icon-decoration.badge</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Cloudreve Keep Downloaded badge</string>
+			<key>UTTypeIconFile</key>
+			<string>KeepDownloaded.icns</string>
+			<key>UTTypeIdentifier</key>
+			<string>cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2</string>
+		</dict>
+	</array>
 </dict>
 </plist>

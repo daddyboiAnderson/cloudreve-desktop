@@ -34,6 +34,40 @@ mkdir -p "$APP/Contents/PlugIns"
 rm -rf "$APP/Contents/PlugIns/CloudreveFileProvider.appex"
 cp -R "$ROOT/macos/build/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
 
+# Export the badge UTI from the host app so Launch Services can resolve it.
+# The extension keeps its own copy for standalone builds.
+BADGE_RESOURCE="$APP/Contents/PlugIns/CloudreveFileProvider.appex/Contents/Resources/KeepDownloaded.icns"
+if [[ ! -f "$BADGE_RESOURCE" ]]; then
+    echo "error: Keep Downloaded badge resource was not built" >&2
+    exit 1
+fi
+cp "$BADGE_RESOURCE" "$APP/Contents/Resources/KeepDownloaded.icns"
+
+BADGE_UTI="cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2"
+if /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
+    "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+    if ! /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
+        "$APP/Contents/Info.plist" | grep -Fq "$BADGE_UTI"; then
+        echo "error: app Info.plist already has UTI declarations; cannot add $BADGE_UTI safely" >&2
+        exit 1
+    fi
+else
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations array" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0 dict" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIdentifier string $BADGE_UTI" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeDescription string Cloudreve Keep Downloaded badge" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo array" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo:0 string com.apple.icon-decoration.badge" \
+        "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIconFile string KeepDownloaded.icns" \
+        "$APP/Contents/Info.plist"
+fi
+
 echo "==> Setting app and extension version to $SHORT_VERSION ($BUILD_NUMBER)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$APP/Contents/Info.plist"

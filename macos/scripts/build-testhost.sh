@@ -14,7 +14,7 @@ SDK="$(xcrun --sdk macosx --show-sdk-path)"
 
 echo "==> Compiling TestHost"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/PlugIns"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/PlugIns" "$APP/Contents/Resources"
 swiftc -swift-version 5 \
     -target arm64-apple-macos13.0 \
     -sdk "$SDK" \
@@ -25,6 +25,8 @@ cp "$ROOT/macos/testhost/Info.plist" "$APP/Contents/Info.plist"
 
 echo "==> Embedding extension"
 cp -R "$BUILD_DIR/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
+cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/KeepDownloaded.icns" \
+    "$APP/Contents/Resources/KeepDownloaded.icns"
 
 echo "==> Signing app bundle"
 codesign --force --sign - --timestamp=none "$APP"

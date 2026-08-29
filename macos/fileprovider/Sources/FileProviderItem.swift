@@ -1,8 +1,8 @@
 import FileProvider
 import UniformTypeIdentifiers
 
-/// NSFileProviderItem backed by remote Cloudreve metadata.
-final class FileProviderItem: NSObject, NSFileProviderItem {
+/// File Provider item backed by Cloudreve metadata.
+final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDecorating {
     let itemIdentifier: NSFileProviderItemIdentifier
     let parentItemIdentifier: NSFileProviderItemIdentifier
     let filename: String
@@ -13,23 +13,18 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     let itemVersion: NSFileProviderItemVersion
     let creationDate: Date?
     let contentModificationDate: Date?
-    /// "Keep Downloaded" state set explicitly on this item: drives the
-    /// custom context menu actions (via the userInfo activation rules).
+    /// Explicit "Keep Downloaded" state.
     let pinned: Bool
-    /// Effective state including inheritance from a pinned ancestor folder:
-    /// drives the content policy. Serving the eager policy explicitly (rather
-    /// than relying on the system to apply inheritance) makes the system
-    /// download freshly enumerated children of pinned folders right away.
+    /// Effective state, including inheritance from a pinned folder.
     let effectivelyPinned: Bool
-    /// metadataVersion without the pin marker, kept so withPinned can re-derive
-    /// the final version for either pin state.
+    /// Unmarked metadata version used when rebuilding the item.
     let baseMetadataVersion: Data
 
-    /// Appended to metadataVersion while an item is effectively pinned. The
-    /// framework ignores delivered items whose version matches its cached
-    /// snapshot — without the marker, a policy change on an otherwise
-    /// unmodified item would never reach the system.
+    /// Forces File Provider to notice a policy-only metadata change.
     private static let pinnedVersionMarker = Data("#kd".utf8)
+    static let keepDownloadedDecoration =
+        NSFileProviderItemDecorationIdentifier(
+            "cloudreve.desktop.dev.fileprovider.keep-downloaded-v2")
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -52,9 +47,17 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         self.contentType = contentType
         self.documentSize = documentSize.map { NSNumber(value: $0) }
         self.childItemCount = childItemCount.map { NSNumber(value: $0) }
-        self.capabilities = capabilities
         self.pinned = pinned
-        self.effectivelyPinned = effectivelyPinned ?? pinned
+        let resolvedEffectivelyPinned = effectivelyPinned ?? pinned
+        self.effectivelyPinned = resolvedEffectivelyPinned
+        // Eviction requires the capability; pinned items must not advertise it.
+        if identifier == .rootContainer {
+            self.capabilities = capabilities
+        } else if resolvedEffectivelyPinned {
+            self.capabilities = capabilities.subtracting(.allowsEvicting)
+        } else {
+            self.capabilities = capabilities.union(.allowsEvicting)
+        }
         self.baseMetadataVersion = metadataVersion
         let effectiveMetadataVersion =
             self.effectivelyPinned
@@ -68,18 +71,12 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         super.init()
     }
 
-    /// Declarative download/eviction policy (macOS 13+).
-    /// `.downloadEagerlyAndKeepDownloaded` = "Keep Downloaded": the system
-    /// downloads the item eagerly, keeps downloading remote updates, never
-    /// evicts it, and schedules downloads for inherited-policy items that
-    /// appear below a pinned folder — this is what auto-downloads files
-    /// uploaded from the web UI or other devices.
+    /// Download and eviction policy shown to File Provider.
     var contentPolicy: NSFileProviderContentPolicy {
         effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .inherited
     }
 
-    /// Keys consumed by the NSExtensionFileProviderActions activation rules
-    /// in Info.plist so exactly one of the pin/unpin menu entries is shown.
+    /// Activation-rule values for the custom actions.
     var userInfo: [AnyHashable: Any]? {
         [
             "displayKeepDownloaded": NSNumber(value: !pinned),
@@ -87,9 +84,13 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
         ]
     }
 
-    /// Copy with a different pin state, so a toggled cached item reports the
-    /// new policy before the next server round-trip.
-    func withPinned(_ pinned: Bool) -> FileProviderItem {
+    /// Finder badge for effective Keep Downloaded state.
+    var decorations: [NSFileProviderItemDecorationIdentifier]? {
+        effectivelyPinned ? [Self.keepDownloadedDecoration] : nil
+    }
+
+    /// Copy with updated explicit and effective pin state.
+    func withPinned(_ pinned: Bool, effectivelyPinned: Bool? = nil) -> FileProviderItem {
         FileProviderItem(
             identifier: itemIdentifier,
             parentIdentifier: parentItemIdentifier,
@@ -103,7 +104,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
             creationDate: creationDate,
             contentModificationDate: contentModificationDate,
             pinned: pinned,
-            effectivelyPinned: pinned
+            effectivelyPinned: effectivelyPinned ?? pinned
         )
     }
 }

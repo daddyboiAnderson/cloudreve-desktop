@@ -2,8 +2,7 @@ import FileProvider
 import OSLog
 import UniformTypeIdentifiers
 
-/// Maps a File Provider domain to its drive and serves items from the
-/// Cloudreve API. One instance per domain, owned by FileProviderExtension.
+/// Maps a File Provider domain to a Cloudreve drive.
 final class RemoteStore {
     private let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "store")
@@ -12,26 +11,21 @@ final class RemoteStore {
     let client: CloudreveClient
     private let domain: NSFileProviderDomain
 
-    /// itemIdentifier.rawValue -> item, filled during enumeration/info calls.
-    /// The system asks for previously enumerated items by identifier; the cache
-    /// answers those without extra API round-trips.
+    /// itemIdentifier.rawValue -> item.
     private var cache: [String: FileProviderItem] = [:]
-    /// Stable Finder identity -> current Cloudreve URI. Paths can change on
-    /// rename, but NSFileProvider item identifiers must not.
+    /// Stable Finder identity -> current Cloudreve URI.
     private var uriByIdentifier: [String: String] = [:]
     private var identifierByURI: [String: String] = [:]
-    /// Identifiers pinned via "Keep Downloaded". Persisted per drive so the
-    /// policy survives extension restarts; consulted by makeItem/rootItem
-    /// when deriving each item's `contentPolicy`.
+    /// Explicitly pinned identifiers, persisted per drive.
     private var pinnedIdentifiers: Set<String> = []
+    /// Version marker used to force a working-set refresh after policy changes.
+    private static let policyMetadataVersion = "keep-downloaded-policy-v3"
+    private var policyRescanPending = false
     private let cacheLock = NSLock()
 
     // MARK: - Change feed (shared event log)
 
-    /// One remote event, as recorded by the main app (JSON lines).
-    /// The extension can't run a long-lived SSE listener itself (XPC services
-    /// get suspended when idle), so the app writes events here and signals the
-    /// working set; we replay from the file in enumerateChanges.
+    /// Remote event recorded by the main app as JSON lines.
     struct FpEvent: Codable {
         let ts: Int64  // unix epoch milliseconds
         let type: String  // create | modify | rename | delete
@@ -52,14 +46,35 @@ final class RemoteStore {
         if let data = try? Data(contentsOf: identityFileURL),
             let saved = try? JSONDecoder().decode([String: String].self, from: data)
         {
-            uriByIdentifier = saved
-            identifierByURI = Dictionary(
-                uniqueKeysWithValues: saved.map { ($0.value, $0.key) })
+            uriByIdentifier = saved.mapValues(Self.canonicalURI)
+            // Keep one stable identity per canonical URI.
+            identifierByURI = saved.reduce(into: [:]) { result, entry in
+                let identifier = entry.key
+                let uri = Self.canonicalURI(entry.value)
+                if let existing = result[uri], existing != identifier {
+                    logger.error(
+                        "duplicate item identity for \(uri, privacy: .public): keeping \(existing, privacy: .public), ignoring \(identifier, privacy: .public)"
+                    )
+                    return
+                }
+                result[uri] = identifier
+            }
         }
         if let data = try? Data(contentsOf: pinnedFileURL),
             let saved = try? JSONDecoder().decode([String].self, from: data)
         {
             pinnedIdentifiers = Set(saved)
+        }
+        let currentPolicyVersion = Data(Self.policyMetadataVersion.utf8)
+        let hasCurrentPolicyVersion =
+            (try? Data(contentsOf: policyMetadataVersionURL)) == currentPolicyVersion
+        let hasRescanMarker = FileManager.default.fileExists(atPath: policyRescanMarkerURL.path)
+        policyRescanPending = hasRescanMarker || !hasCurrentPolicyVersion
+        if policyRescanPending {
+            persistPolicyRescanMarker()
+            logger.notice(
+                "Keep Downloaded metadata refresh scheduled for drive \(drive.id, privacy: .public)"
+            )
         }
     }
 
@@ -80,6 +95,56 @@ final class RemoteStore {
             .appendingPathComponent("identities-\(drive.id).json")
     }
 
+    private var policyMetadataVersionURL: URL {
+        stateDirectoryURL
+            .appendingPathComponent("policy-metadata-version-\(drive.id).txt")
+    }
+
+    private var policyRescanMarkerURL: URL {
+        stateDirectoryURL
+            .appendingPathComponent("policy-rescan-\(drive.id).marker")
+    }
+
+    private func persistPolicyRescanMarker() {
+        do {
+            try FileManager.default.createDirectory(
+                at: policyRescanMarkerURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try Data(Self.policyMetadataVersion.utf8).write(
+                to: policyRescanMarkerURL, options: .atomic)
+        } catch {
+            logger.error(
+                "failed to persist policy rescan marker: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    /// Consume the one-shot working-set refresh request.
+    func consumePolicyRescanIfNeeded() -> Bool {
+        cacheLock.lock()
+        guard policyRescanPending else {
+            cacheLock.unlock()
+            return false
+        }
+        policyRescanPending = false
+        cacheLock.unlock()
+
+        try? FileManager.default.removeItem(at: policyRescanMarkerURL)
+        do {
+            try FileManager.default.createDirectory(
+                at: policyMetadataVersionURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            try Data(Self.policyMetadataVersion.utf8).write(
+                to: policyMetadataVersionURL, options: .atomic)
+        } catch {
+            logger.error(
+                "failed to persist policy metadata version: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+        logger.notice("expiring working-set anchor for Keep Downloaded metadata refresh")
+        return true
+    }
+
     func identifier(forURI uri: String) -> NSFileProviderItemIdentifier {
         let uri = Self.canonicalURI(uri)
         cacheLock.lock()
@@ -91,7 +156,9 @@ final class RemoteStore {
         let uri = Self.canonicalURI(uri)
         cacheLock.lock()
         if let previousURI = uriByIdentifier[identifier.rawValue] {
-            identifierByURI.removeValue(forKey: previousURI)
+            if identifierByURI[previousURI] == identifier.rawValue {
+                identifierByURI.removeValue(forKey: previousURI)
+            }
         }
         uriByIdentifier[identifier.rawValue] = uri
         identifierByURI[uri] = identifier.rawValue
@@ -116,110 +183,306 @@ final class RemoteStore {
         return pinnedIdentifiers.contains(identifier.rawValue)
     }
 
-    /// True when the item itself is pinned or sits below a pinned folder.
-    /// Pinned entries are identifiers (usually URIs); ancestors are matched
-    /// by URI prefix, mapping through the identity table first so renamed
-    /// folders still match.
-    func isEffectivelyPinned(
+    private func pinnedIdentifiersSnapshot() -> Set<String> {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return pinnedIdentifiers
+    }
+
+    private func cachedItem(
+        for identifier: NSFileProviderItemIdentifier
+    ) -> FileProviderItem? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return cache[identifier.rawValue]
+    }
+
+    private func isEffectivelyPinnedLocked(
         _ identifier: NSFileProviderItemIdentifier, uri: String
     ) -> Bool {
         let uri = Self.canonicalURI(uri)
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-        if pinnedIdentifiers.contains(identifier.rawValue) { return true }
+        if pinnedIdentifiers.contains(identifier.rawValue) {
+            return true
+        }
+
+        // A pinned root covers the whole drive.
+        let rootIdentifier = NSFileProviderItemIdentifier.rootContainer.rawValue
+        if pinnedIdentifiers.contains(rootIdentifier) {
+            let root = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            return uri == rootPath || uri.hasPrefix(root)
+        }
+
         for pinned in pinnedIdentifiers {
-            let pinnedURI =
-                uriByIdentifier[pinned].map(Self.canonicalURI) ?? pinned
+            let pinnedURI: String
+            if pinned == rootIdentifier {
+                pinnedURI = rootPath
+            } else {
+                pinnedURI = uriByIdentifier[pinned].map(Self.canonicalURI)
+                    ?? Self.canonicalURI(pinned)
+            }
             let prefix = pinnedURI.hasSuffix("/") ? pinnedURI : pinnedURI + "/"
             if uri.hasPrefix(prefix) { return true }
         }
         return false
     }
 
-    /// URIs of pinned-folder descendants that still need to be pushed into
-    /// the system's mirror, persisted in the extension's own state directory
-    /// (the shared fp-events log is read-only for the sandboxed extension).
-    /// Consumed by the next working-set change enumeration.
-    private var pendingPinnedFileURL: URL {
+    /// Whether an item is explicitly or implicitly pinned.
+    func isEffectivelyPinned(
+        _ identifier: NSFileProviderItemIdentifier, uri: String
+    ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return isEffectivelyPinnedLocked(identifier, uri: uri)
+    }
+
+    /// Pending policy updates for working-set enumeration.
+    private var pendingPolicyUpdatesFileURL: URL {
         stateDirectoryURL.appendingPathComponent("pending-pinned-\(drive.id).json")
     }
 
-    /// Record subtree items of a freshly pinned folder so the next
-    /// working-set enumeration delivers them as updates. The system only
-    /// downloads items it knows, and it never learns about folder contents
-    /// that were never enumerated — this is how it finds out.
-    func recordPendingPinned(uris: [String]) {
+    /// Queue items whose content policy changed.
+    func recordPendingItemUpdates(uris: [String]) {
         cacheLock.lock()
-        var pending = readPendingPinned()
+        var pending = readPendingPolicyUpdates()
         pending.formUnion(uris)
+        policyRescanPending = true
         cacheLock.unlock()
         do {
             try FileManager.default.createDirectory(
-                at: pendingPinnedFileURL.deletingLastPathComponent(),
+                at: pendingPolicyUpdatesFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true)
             try JSONEncoder().encode(pending.sorted()).write(
-                to: pendingPinnedFileURL, options: .atomic)
+                to: pendingPolicyUpdatesFileURL, options: .atomic)
         } catch {
             logger.error(
-                "failed to persist pending pinned items: \(error.localizedDescription, privacy: .public)")
+                "failed to persist pending item updates: \(error.localizedDescription, privacy: .public)")
         }
+        persistPolicyRescanMarker()
     }
 
-    private func readPendingPinned() -> Set<String> {
-        guard let data = try? Data(contentsOf: pendingPinnedFileURL),
+    private func readPendingPolicyUpdates() -> Set<String> {
+        guard let data = try? Data(contentsOf: pendingPolicyUpdatesFileURL),
             let saved = try? JSONDecoder().decode([String].self, from: data)
         else { return [] }
         return Set(saved)
     }
 
-    /// Pending pinned-subtree URIs, clearing the list. The caller delivers
-    /// the items; if delivery fails the items are simply re-recorded on the
-    /// next pin.
-    func takePendingPinned() -> [String] {
+    private func pendingItemUpdatesSnapshot() -> Set<String> {
         cacheLock.lock()
-        let pending = readPendingPinned()
+        defer { cacheLock.unlock() }
+        return readPendingPolicyUpdates()
+    }
+
+    /// Take queued policy updates, clearing the persisted list.
+    func takePendingItemUpdates() -> [String] {
+        cacheLock.lock()
+        let pending = readPendingPolicyUpdates()
         cacheLock.unlock()
-        try? FileManager.default.removeItem(at: pendingPinnedFileURL)
+        try? FileManager.default.removeItem(at: pendingPolicyUpdatesFileURL)
         return pending.sorted()
     }
 
-    /// Request a download, retrying briefly: the system answers noSuchItem
-    /// for items it hasn't ingested yet (e.g. just delivered via
-    /// enumerateChanges), so an immediate single attempt can spuriously fail.
-    /// Awaited by callers — fire-and-forget Tasks would die when the XPC
-    /// service suspends after completing the in-flight request.
+    /// Request a download, retrying while the item is ingested.
     func requestDownloadWhenKnown(
         _ identifier: NSFileProviderItemIdentifier,
         manager: NSFileProviderManager? = nil
-    ) async {
-        guard let manager = manager ?? NSFileProviderManager(for: domain) else { return }
+    ) async -> Bool {
+        guard let manager = manager ?? NSFileProviderManager(for: domain) else {
+            logger.error(
+                "cannot request download for \(identifier.rawValue, privacy: .public): no File Provider manager"
+            )
+            return false
+        }
+        var lastError: Error?
         for attempt in 0..<5 {
-            if Task.isCancelled { return }
+            if Task.isCancelled { return false }
             do {
                 try await manager.requestDownloadForItem(withIdentifier: identifier)
-                return
+                logger.notice(
+                    "download request accepted for \(identifier.rawValue, privacy: .public) on attempt \(attempt + 1)"
+                )
+                return true
             } catch {
+                lastError = error
+                logger.error(
+                    "download request attempt \(attempt + 1) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
                 try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
             }
         }
         logger.error(
-            "download request failed for \(identifier.rawValue, privacy: .public)")
+            "download request failed for \(identifier.rawValue, privacy: .public) after 5 attempts: \(lastError?.localizedDescription ?? "unknown error", privacy: .public)"
+        )
+        return false
     }
 
-    /// Resume materializing pinned items (called once at extension start, so
-    /// pins made while the extension was suspended still take effect).
+    /// Evict local content, retrying while the new policy is ingested.
+    func evictWhenAllowed(
+        _ identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager? = nil
+    ) async -> Bool {
+        guard let manager = manager ?? NSFileProviderManager(for: domain) else {
+            logger.error(
+                "cannot evict \(identifier.rawValue, privacy: .public): no File Provider manager"
+            )
+            return false
+        }
+        var lastError: Error?
+        for attempt in 1...6 {
+            if Task.isCancelled { return false }
+            do {
+                try await manager.evictItem(identifier: identifier)
+                logger.notice(
+                    "eviction accepted for \(identifier.rawValue, privacy: .public) on attempt \(attempt)"
+                )
+                return true
+            } catch {
+                lastError = error
+                logger.error(
+                    "eviction attempt \(attempt) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                if attempt < 6 {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 500_000_000)
+                }
+            }
+        }
+        logger.error(
+            "eviction failed for \(identifier.rawValue, privacy: .public) after 6 attempts: \(lastError?.localizedDescription ?? "unknown error", privacy: .public)"
+        )
+        return false
+    }
+
+    /// Resume downloads for persisted pins.
     func requestDownloadsForPinnedItems() async {
-        cacheLock.lock()
-        let pinned = pinnedIdentifiers
-        cacheLock.unlock()
+        let pinned = pinnedIdentifiersSnapshot()
         guard !pinned.isEmpty else { return }
-        for identifier in pinned {
-            await requestDownloadWhenKnown(NSFileProviderItemIdentifier(identifier))
+        do {
+            let items = try await workingSetItems()
+            let files = items.filter {
+                !$0.contentType.conforms(to: .folder)
+                    && isEffectivelyPinned($0.itemIdentifier, uri: uri(for: $0.itemIdentifier))
+            }
+            for start in stride(from: 0, to: files.count, by: 8) {
+                if Task.isCancelled { return }
+                let end = min(start + 8, files.count)
+                await withTaskGroup(of: Void.self) { group in
+                    for file in files[start..<end] {
+                        group.addTask {
+                            guard self.isEffectivelyPinned(
+                                file.itemIdentifier,
+                                uri: self.uri(for: file.itemIdentifier)
+                            ) else { return }
+                            _ = await self.requestDownloadWhenKnown(file.itemIdentifier)
+                        }
+                    }
+                }
+            }
+        } catch {
+            logger.error(
+                "failed to resume pinned downloads: \(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 
-    /// Toggle the pin state, persist it, and update the cached item so the
-    /// next lookup/enumeration already reports the new `contentPolicy`.
+    /// Return the current working set, including pinned subtrees.
+    func workingSetItems() async throws -> [FileProviderItem] {
+        var itemsByIdentifier: [String: FileProviderItem] = [:]
+        var foldersToWalk: [NSFileProviderItemIdentifier] = []
+        var queuedFolders: Set<String> = []
+
+        func add(_ item: FileProviderItem) {
+            itemsByIdentifier[item.itemIdentifier.rawValue] = item
+        }
+
+        func queueFolder(_ identifier: NSFileProviderItemIdentifier) {
+            if queuedFolders.insert(identifier.rawValue).inserted {
+                foldersToWalk.append(identifier)
+            }
+        }
+
+        for item in cachedItems() {
+            add(item)
+        }
+
+        // Keep top-level items current.
+        let rootItems = try await allChildren(of: .rootContainer)
+        for item in rootItems {
+            add(item)
+        }
+
+        let pinned = pinnedIdentifiersSnapshot()
+        for rawIdentifier in pinned {
+            let identifier = NSFileProviderItemIdentifier(rawIdentifier)
+            if identifier == .rootContainer {
+                queueFolder(identifier)
+                continue
+            }
+            do {
+                let pinnedItem = try await item(
+                    for: identifier, displayName: domain.displayName)
+                add(pinnedItem)
+                if pinnedItem.contentType.conforms(to: .folder) {
+                    queueFolder(identifier)
+                }
+            } catch CloudreveError.noSuchItem {
+                logger.notice(
+                    "pinned item \(rawIdentifier, privacy: .public) no longer exists"
+                )
+            }
+        }
+
+        // Include queued transitions even after an item is unpinned.
+        for uri in pendingItemUpdatesSnapshot() {
+            do {
+                let file = try await client.fileInfo(uri: uri)
+                let pendingItem = makeItem(file)
+                add(pendingItem)
+                if pendingItem.contentType.conforms(to: .folder) {
+                    queueFolder(pendingItem.itemIdentifier)
+                }
+            } catch CloudreveError.noSuchItem {
+                // The remote delete superseded the update.
+            }
+        }
+
+        while !foldersToWalk.isEmpty {
+            if Task.isCancelled { break }
+            let folder = foldersToWalk.removeFirst()
+            do {
+                let children = try await allChildren(of: folder)
+                for child in children {
+                    add(child)
+                    if child.contentType.conforms(to: .folder) {
+                        queueFolder(child.itemIdentifier)
+                    }
+                }
+            } catch CloudreveError.noSuchItem {
+                logger.notice(
+                    "working-set folder \(folder.rawValue, privacy: .public) no longer exists"
+                )
+            } catch {
+                logger.error(
+                    "working-set folder \(folder.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+        return Array(itemsByIdentifier.values)
+    }
+
+    private func allChildren(
+        of identifier: NSFileProviderItemIdentifier
+    ) async throws -> [FileProviderItem] {
+        var result: [FileProviderItem] = []
+        var page: String? = nil
+        repeat {
+            let (items, nextPage) = try await children(of: identifier, page: page)
+            result.append(contentsOf: items)
+            page = nextPage
+        } while page != nil
+        return result
+    }
+
+    /// Toggle and persist pin state, then refresh cached policies.
     func setPinned(_ pinned: Bool, for identifier: NSFileProviderItemIdentifier) {
         cacheLock.lock()
         if pinned {
@@ -227,8 +490,22 @@ final class RemoteStore {
         } else {
             pinnedIdentifiers.remove(identifier.rawValue)
         }
-        if let cached = cache[identifier.rawValue] {
-            cache[identifier.rawValue] = cached.withPinned(pinned)
+
+        // Refresh descendants already cached by File Provider.
+        for (rawIdentifier, cached) in cache {
+            let cachedIdentifier = NSFileProviderItemIdentifier(rawIdentifier)
+            let cachedURI = cachedIdentifier == .rootContainer
+                ? rootPath
+                : (uriByIdentifier[rawIdentifier] ?? Self.uri(fromPath: rawIdentifier))
+            let explicitlyPinned = pinnedIdentifiers.contains(rawIdentifier)
+            let effectivelyPinned = isEffectivelyPinnedLocked(
+                cachedIdentifier, uri: cachedURI)
+            if cached.pinned != explicitlyPinned
+                || cached.effectivelyPinned != effectivelyPinned
+            {
+                cache[rawIdentifier] = cached.withPinned(
+                    explicitlyPinned, effectivelyPinned: effectivelyPinned)
+            }
         }
         let snapshot = pinnedIdentifiers.sorted()
         cacheLock.unlock()
@@ -256,16 +533,13 @@ final class RemoteStore {
 
     // MARK: Anchors and change replay
 
-    /// Anchor format: "evt-<millis>" — the timestamp of the last event known
-    /// to have been delivered to the system.
+    /// Anchor for the last delivered event: "evt-<millis>".
     func currentSyncAnchor() -> NSFileProviderSyncAnchor {
         let lastTs = readEvents().last?.ts ?? 0
         return NSFileProviderSyncAnchor(Data("evt-\(lastTs)".utf8))
     }
 
-    /// Events recorded after the anchor. Throws `.syncAnchorExpired` for
-    /// foreign anchors (e.g. from older builds); the system then does a full
-    /// re-scan — documented as expensive but always correct.
+    /// Return events after an anchor, or expire an unknown anchor.
     func changes(since anchorData: Data, for container: NSFileProviderItemIdentifier)
         throws -> ([FpEvent], NSFileProviderSyncAnchor)
     {
@@ -275,9 +549,7 @@ final class RemoteStore {
             throw NSFileProviderError(.syncAnchorExpired)
         }
         let events = readEvents()
-        // A rescan marker means the app lost its event stream and can't
-        // vouch for the log's completeness past this anchor — force a full
-        // rescan instead of replaying.
+        // A rescan marker invalidates all later anchors.
         if events.contains(where: { $0.type == "rescan" && $0.ts > since }) {
             throw NSFileProviderError(.syncAnchorExpired)
         }
@@ -287,7 +559,7 @@ final class RemoteStore {
         return (filtered, newAnchor)
     }
 
-    /// Full URI for an event path (paths are relative to the drive root URI).
+    /// Convert an event path to a canonical URI.
     func uri(forEventPath path: String) -> String {
         Self.canonicalURI(drive.remote_path + (path.hasPrefix("/") ? path : "/" + path))
     }
@@ -297,8 +569,7 @@ final class RemoteStore {
     ) -> Bool {
         let fromURI = uri(forEventPath: change.from)
         let toURI = change.to.map { uri(forEventPath: $0) }
-        // The working set gets every change; a container gets changes to
-        // itself or to a direct child.
+        // Working set gets every change; containers get direct-child changes.
         if container == .workingSet { return true }
         if fromURI == container.rawValue || toURI == container.rawValue { return true }
         let parentOf = { (uri: String) -> NSFileProviderItemIdentifier in
@@ -314,7 +585,7 @@ final class RemoteStore {
         return parentOf(fromURI) == container || (toURI.map { parentOf($0) } == container)
     }
 
-    /// The API URI for a container identifier.
+    /// Return the API URI for an item identifier.
     func uri(for identifier: NSFileProviderItemIdentifier) -> String {
         if identifier == .rootContainer {
             return drive.remote_path
@@ -325,13 +596,12 @@ final class RemoteStore {
         return mapped ?? Self.uri(fromPath: identifier.rawValue)
     }
 
-    /// Files that exist locally but are never uploaded (Finder metadata).
+    /// Finder metadata files that stay local-only.
     static func isIgnored(filename: String) -> Bool {
         filename == ".DS_Store" || filename.hasPrefix("._")
     }
 
-    /// Item identifiers are full logical paths as returned by the API.
-    /// The API accepts URIs in the form "cloudreve://my<path>".
+    /// Convert a logical path to a Cloudreve URI.
     static func uri(fromPath path: String) -> String {
         let uri =
             path.hasPrefix("cloudreve://")
@@ -340,15 +610,12 @@ final class RemoteStore {
         return canonicalURI(uri)
     }
 
-    /// Cloudreve's REST responses may percent-encode paths while SSE events
-    /// contain literal characters. Finder identities must use one canonical
-    /// representation or the same file appears as multiple placeholders.
+    /// Normalize percent-encoded Cloudreve paths.
     static func canonicalURI(_ uri: String) -> String {
         uri.removingPercentEncoding ?? uri
     }
 
-    /// Logical path of the drive root. The API returns `RemoteFile.path` as a
-    /// full URI ("cloudreve://my/h/file.txt"), matching `remote_path` format.
+    /// Canonical URI of the drive root.
     private var rootPath: String {
         Self.canonicalURI(drive.remote_path)
     }
@@ -358,16 +625,14 @@ final class RemoteStore {
         if p.hasSuffix("/") { p.removeLast() }
         guard let idx = p.lastIndex(of: "/") else { return rootPath }
         let parent = String(p[..<idx])
-        // "cloudreve://my" is above the drive root; treat as root.
+        // Never return a path above the drive root.
         return parent.isEmpty || parent == "cloudreve:" || parent == "cloudreve://my"
             ? rootPath : parent
     }
 
     // MARK: - Item construction
 
-    /// Capabilities for writable items (both files and folders). Trashing is
-    /// intentionally omitted: the domain has no local trash, so deletions map
-    /// straight to deleteItem → server-side trash.
+    /// Writable capabilities; trash is handled by the server.
     private static let writableCapabilities: NSFileProviderItemCapabilities = [
         .allowsReading, .allowsWriting, .allowsRenaming, .allowsReparenting,
         .allowsDeleting,
@@ -385,15 +650,12 @@ final class RemoteStore {
             ? .rootContainer
             : self.identifier(forURI: parentPath)
 
-        // Prefer a content hash from metadata for change detection;
-        // fall back to modification time + size.
+        // Prefer a remote content hash for change detection.
         let versionBasis =
             file.metadata?["etag"] ?? file.metadata?["hash"]
             ?? "\(file.updated_at ?? "")#\(file.size)"
         let version = versionBasis.data(using: .utf8) ?? Data()
-        // Finder caches provider thumbnails until contentVersion changes. Keep
-        // a schema marker here so installing the first thumbnail-capable build
-        // invalidates generic icons cached by older providers exactly once.
+        // Invalidate Finder's old thumbnail cache once.
         let thumbnailVersion = "\(versionBasis)#thumbnail-v1".data(using: .utf8) ?? version
 
         let item = FileProviderItem(
@@ -422,14 +684,15 @@ final class RemoteStore {
         return item
     }
 
-    /// All items served this session (for working-set enumeration).
+    /// Items served during this session.
     func cachedItems() -> [FileProviderItem] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return Array(cache.values)
     }
 
-    func rootItem(displayName: String) -> FileProviderItem {        FileProviderItem(
+    func rootItem(displayName: String) -> FileProviderItem {
+        FileProviderItem(
             identifier: .rootContainer,
             parentIdentifier: .rootContainer,
             filename: displayName,
@@ -456,12 +719,10 @@ final class RemoteStore {
         if identifier == .trashContainer {
             throw NSFileProviderError(.noSuchItem)
         }
-        cacheLock.lock()
-        let cached = cache[identifier.rawValue]
-        cacheLock.unlock()
+        let cached = cachedItem(for: identifier)
         if let cached { return cached }
 
-        // Not seen during enumeration: ask the server (e.g. after extension restart).
+        // Resolve items not present in the session cache.
         let file = try await client.fileInfo(uri: Self.uri(fromPath: identifier.rawValue))
         return makeItem(file)
     }

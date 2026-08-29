@@ -1,11 +1,7 @@
 import FileProvider
 import OSLog
 
-/// Replicated file provider backed by the Cloudreve API.
-///
-/// The system launches this extension on demand and talks to it over XPC.
-/// Domains are registered per drive by the main app; the domain identifier
-/// embeds the drive id ("cloudreve.drive.<uuid>").
+/// Replicated File Provider backed by the Cloudreve API.
 final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
     NSFileProviderThumbnailing, NSFileProviderCustomAction
 {
@@ -27,7 +23,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             logger.notice(
                 "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
             )
-            // Resume materializing items pinned in earlier sessions.
+            // Resume downloads for persisted pins.
             if let store = self.store {
                 Task { await store.requestDownloadsForPinnedItems() }
             }
@@ -93,9 +89,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
 
         let task = Task {
-            // File Provider allows only a few tens of seconds for a whole
-            // batch. Fetch concurrently in small chunks so a large Finder
-            // window does not serialize two network round-trips per item.
+            // Fetch thumbnails in small concurrent batches.
             for batchStart in stride(from: 0, to: itemIdentifiers.count, by: 4) {
                 if Task.isCancelled || progress.isCancelled {
                     completionHandler(CocoaError(.userCancelled))
@@ -116,9 +110,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                                     perThumbnailCompletionHandler(identifier, data, nil)
                                 }
                             } catch {
-                                // A missing/unsupported thumbnail is an
-                                // item-level failure; it must not prevent Finder
-                                // from displaying the rest of the batch.
                                 self.logger.notice(
                                     "thumbnail unavailable for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                                 )
@@ -147,11 +138,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             completionHandler(nil, nil, unavailableError)
             return progress
         }
-        Task {
+        let task = Task {
             do {
-                // Refresh the item so the system records the served version.
+                // Refresh metadata before serving content.
                 let item = try await store.item(
                     for: itemIdentifier, displayName: domain.displayName)
+                if request.isSystemRequest,
+                    !store.isEffectivelyPinned(
+                        itemIdentifier, uri: store.uri(for: itemIdentifier))
+                {
+                    logger.notice(
+                        "cancelled stale system download for \(itemIdentifier.rawValue, privacy: .public)"
+                    )
+                    completionHandler(nil, nil, CocoaError(.userCancelled))
+                    return
+                }
                 let downloadURL = try await store.client.downloadURL(
                     for: store.uri(for: itemIdentifier))
                 let tmp = FileManager.default.temporaryDirectory
@@ -159,6 +160,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let size = item.documentSize?.int64Value ?? 0
                 try await store.client.download(
                     downloadURL, to: tmp, itemSize: size, progress: progress)
+                if request.isSystemRequest,
+                    !store.isEffectivelyPinned(
+                        itemIdentifier, uri: store.uri(for: itemIdentifier))
+                {
+                    try? FileManager.default.removeItem(at: tmp)
+                    logger.notice(
+                        "discarded stale system download for \(itemIdentifier.rawValue, privacy: .public)"
+                    )
+                    completionHandler(nil, nil, CocoaError(.userCancelled))
+                    return
+                }
                 logger.notice(
                     "served contents of \(item.filename, privacy: .public) (\(size) bytes)")
                 completionHandler(tmp, item, nil)
@@ -169,6 +181,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 completionHandler(nil, nil, FileProviderEnumerator.mapError(error))
             }
         }
+        progress.cancellationHandler = { task.cancel() }
         return progress
     }
 
@@ -189,8 +202,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             return progress
         }
 
-        // Ignored files (Finder metadata): keep them local-only by reporting
-        // success without uploading.
+        // Finder metadata stays local-only.
         guard !RemoteStore.isIgnored(filename: itemTemplate.filename) else {
             let item = FileProviderItem(
                 identifier: NSFileProviderItemIdentifier(
@@ -227,7 +239,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 if isFolder {
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: true)
                 } else if let contentURL = url {
-                    // New file with content: upload, then read back the created entry.
+                    // Upload files with supplied content.
                     try await store.client.uploadFile(
                         at: uri, from: contentURL, overwrite: false, progress: progress)
                     file = try await store.client.fileInfo(uri: uri)
@@ -235,7 +247,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: false)
                 }
                 logger.notice("created \(uri, privacy: .public)")
-                // Filename and parent are set server-side by construction.
                 completionHandler(store.makeItem(file), [], false, nil)
             } catch {
                 logger.error(
@@ -263,7 +274,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             return progress
         }
 
-        // Ignored files (Finder metadata): report success without uploading.
+        // Finder metadata stays local-only.
         guard !RemoteStore.isIgnored(filename: item.filename) else {
             completionHandler(item, [], false, nil)
             return progress
@@ -274,21 +285,19 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 var uri = store.uri(for: item.itemIdentifier)
                 var pending = changedFields
 
-                // 1. New content: upload as a new version of the file.
+                // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
                     try await store.client.uploadFile(
                         at: uri, from: newContents, overwrite: true, progress: progress)
                     pending.remove(.contents)
                 }
 
-                // 2. Rename.
                 if changedFields.contains(.filename) {
                     _ = try await store.client.renameFile(uri: uri, to: item.filename)
                     uri = Self.parentURI(of: uri) + "/" + item.filename
                     pending.remove(.filename)
                 }
 
-                // 3. Move to a new parent.
                 if changedFields.contains(.parentItemIdentifier) {
                     let dst = store.uri(for: item.parentItemIdentifier)
                     try await store.client.moveFile(uri: uri, toDirectory: dst)
@@ -323,7 +332,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             completionHandler(unavailableError)
             return Progress()
         }
-        // Ignored files are local-only; deleting them is a no-op remotely.
+        // Finder metadata is local-only.
         let filename = identifier.rawValue.components(separatedBy: "/").last ?? ""
         guard !RemoteStore.isIgnored(filename: filename) else {
             completionHandler(nil)
@@ -351,13 +360,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
     private static let removeKeepDownloadedAction =
         "cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded"
 
-    /// Handles the "Keep Downloaded" / "Remove Keep Downloaded" context menu
-    /// entries declared in Info.plist. Toggling updates the persisted pin
-    /// state and nudges the system to re-read the item so it applies the new
-    /// `contentPolicy`; pinning also materializes existing content eagerly.
-    /// Afterwards the inherited `.downloadEagerlyAndKeepDownloaded` policy
-    /// makes the system download new remote items under pinned folders on
-    /// its own (fed by the working-set change enumeration).
+    /// Handles the Keep Downloaded custom actions.
     func performAction(
         identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
         onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
@@ -384,6 +387,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
 
         let task = Task {
+            var firstError: Error?
             for identifier in itemIdentifiers {
                 if Task.isCancelled || progress.isCancelled {
                     completionHandler(CocoaError(.userCancelled))
@@ -396,21 +400,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     logger.error(
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                     )
+                    firstError = firstError ?? error
                 }
                 progress.completedUnitCount += 1
             }
-            completionHandler(nil)
+            completionHandler(firstError)
         }
         progress.cancellationHandler = { task.cancel() }
         return progress
     }
 
-    /// Persist the pin state and make the system pick it up:
-    /// - files to pin: `requestDownloadForItem` materializes them now and the
-    ///   `fetchContents` reply carries the item with the new policy;
-    /// - everything else: `requestModification(of: [.lastUsedDate])`
-    ///   schedules a `modifyItem` call whose completion returns the item with
-    ///   the new policy (the field itself is a no-op remotely).
+    /// Persist the pin, refresh working-set metadata, and materialize or evict content.
     private func setPinned(
         _ pin: Bool,
         for identifier: NSFileProviderItemIdentifier,
@@ -422,49 +422,110 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         store.setPinned(pin, for: identifier)
         let isFolder =
             identifier == .rootContainer || item.contentType.conforms(to: .folder)
+
+        var descendants: [FileProviderItem] = []
+        if isFolder {
+            descendants = await listSubtree(of: identifier, store: store)
+        }
+
+        // Queue the selected item and folder descendants for re-enumeration.
+        var updates = descendants.map { store.uri(for: $0.itemIdentifier) }
+        if identifier != .rootContainer {
+            updates.append(store.uri(for: identifier))
+        }
+        store.recordPendingItemUpdates(uris: updates)
+        do {
+            try await manager.signalEnumerator(for: .workingSet)
+        } catch {
+            logger.error(
+                "signalEnumerator failed: \(error.localizedDescription, privacy: .public)")
+        }
+
         if pin && !isFolder {
-            try await manager.requestDownloadForItem(withIdentifier: identifier)
-        } else {
-            try await manager.requestModification(
-                of: [.lastUsedDate], forItemWithIdentifier: identifier, options: [])
+            // Use the same path as Finder's Download Now action.
+            if store.isEffectivelyPinned(identifier, uri: store.uri(for: identifier)) {
+                _ = await store.requestDownloadWhenKnown(identifier, manager: manager)
+            }
+        } else if pin && isFolder {
+            // File Provider does not recursively materialize directories.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            let files = descendants.filter {
+                !$0.contentType.conforms(to: .folder)
+            }
+            for start in stride(from: 0, to: files.count, by: 8) {
+                if Task.isCancelled { return }
+                let end = min(start + 8, files.count)
+                await withTaskGroup(of: Void.self) { group in
+                    for descendant in files[start..<end] {
+                        group.addTask {
+                            guard store.isEffectivelyPinned(
+                                descendant.itemIdentifier,
+                                uri: store.uri(for: descendant.itemIdentifier)
+                            ) else { return }
+                            _ = await store.requestDownloadWhenKnown(
+                                descendant.itemIdentifier, manager: manager)
+                        }
+                    }
+                }
+            }
+        } else if !pin {
+            // Inherited policy permits eviction but does not remove existing content.
+            try? await Task.sleep(nanoseconds: 500_000_000)
+
+            let files: [NSFileProviderItemIdentifier]
+            if isFolder {
+                // File Provider does not reliably evict provider folders recursively.
+                files = descendants.compactMap { descendant in
+                    guard !descendant.contentType.conforms(to: .folder) else {
+                        return nil
+                    }
+                    let descendantURI = store.uri(for: descendant.itemIdentifier)
+                    return store.isEffectivelyPinned(
+                        descendant.itemIdentifier, uri: descendantURI)
+                        ? nil : descendant.itemIdentifier
+                }
+            } else {
+                let selectedURI = store.uri(for: identifier)
+                files = store.isEffectivelyPinned(identifier, uri: selectedURI)
+                    ? [] : [identifier]
+            }
+
+            var failedEvictions: [NSFileProviderItemIdentifier] = []
+            for start in stride(from: 0, to: files.count, by: 8) {
+                if Task.isCancelled { return }
+                let end = min(start + 8, files.count)
+                await withTaskGroup(of: (NSFileProviderItemIdentifier, Bool).self) { group in
+                    for fileIdentifier in files[start..<end] {
+                        group.addTask {
+                            let success = await store.evictWhenAllowed(
+                                fileIdentifier, manager: manager)
+                            return (fileIdentifier, success)
+                        }
+                    }
+                    for await (fileIdentifier, success) in group {
+                        if !success {
+                            failedEvictions.append(fileIdentifier)
+                        }
+                    }
+                }
+            }
+            if !failedEvictions.isEmpty {
+                let identifiers = failedEvictions.prefix(3).map(\.rawValue).joined(separator: ", ")
+                throw NSError(
+                    domain: "CloudreveFileProvider",
+                    code: NSFileWriteUnknownError,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Could not remove downloaded content for: \(identifiers.isEmpty ? identifier.rawValue : identifiers)"
+                    ])
+            }
         }
         logger.notice(
             "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
         )
-        // Materialize the existing subtree of a newly pinned folder. The
-        // system only downloads items it knows, and it never learns about
-        // folder contents it hasn't enumerated — so record the subtree and
-        // signal the working set: the change enumeration then delivers every
-        // descendant with the eager content policy, which makes the system
-        // schedule the downloads itself.
-        if pin && isFolder {
-            let descendants = await listSubtree(of: identifier, store: store)
-            store.recordPendingPinned(
-                uris: descendants.map { store.uri(for: $0.itemIdentifier) })
-            do {
-                try await manager.signalEnumerator(for: .workingSet)
-            } catch {
-                logger.error(
-                    "signalEnumerator failed: \(error.localizedDescription, privacy: .public)")
-            }
-            // Belt and braces: once the system has had a moment to ingest the
-            // delivered items, explicitly request the file downloads too.
-            // Awaited so the requests (and their retries) finish before this
-            // action completes and the XPC service suspends.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            await withTaskGroup(of: Void.self) { group in
-                for descendant in descendants
-                where !descendant.contentType.conforms(to: .folder) {
-                    group.addTask {
-                        await store.requestDownloadWhenKnown(
-                            descendant.itemIdentifier, manager: manager)
-                    }
-                }
-            }
-        }
     }
 
-    /// Breadth-first remote listing of everything below `identifier`.
+    /// List every remote descendant of an item.
     private func listSubtree(
         of identifier: NSFileProviderItemIdentifier,
         store: RemoteStore
@@ -513,9 +574,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         guard let store else {
             throw NSFileProviderError(.notAuthenticated)
         }
-        // No local trash: declaring it unsupported makes the system call
-        // deleteItem immediately when the user "moves to trash", and our
-        // deleteItem soft-deletes into the *server* trash.
+        // Route trash operations to the server.
         if containerItemIdentifier == .trashContainer {
             throw NSError(
                 domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError,
