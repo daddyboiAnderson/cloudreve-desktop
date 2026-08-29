@@ -767,7 +767,11 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     // rounded window corners. Make only this macOS window transparent and let
     // the popup UI paint and clip its native-looking rounded surface.
     #[cfg(target_os = "macos")]
-    let builder = builder.transparent(true);
+    let builder = builder
+        .transparent(true)
+        // Tray popups must be available from every macOS Space. Without this,
+        // AppKit keeps the hidden, reused window on the Space where it started.
+        .visible_on_all_workspaces(true);
 
     let Some(builder) = apply_default_window_icon(builder, app, "main_popup") else {
         return;
