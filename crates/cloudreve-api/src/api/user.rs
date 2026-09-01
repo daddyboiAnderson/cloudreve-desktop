@@ -15,6 +15,9 @@ pub trait UserApi {
     
     /// Get current user information
     async fn get_user_me(&self) -> ApiResult<User>;
+
+    /// Get a user by id for share-recipient details.
+    async fn get_user_info(&self, user_id: &str) -> ApiResult<User>;
     
     /// Get user capacity information
     async fn get_user_capacity(&self) -> ApiResult<Capacity>;
@@ -39,6 +42,9 @@ pub trait UserApi {
 
     /// Get user storage policies
     async fn get_user_storage_policies(&self) -> ApiResult<Vec<StoragePolicy>>;
+
+    /// Search users who can receive a share link.
+    async fn search_users(&self, keyword: &str) -> ApiResult<Vec<UserSearchResult>>;
 }
 
 #[async_trait]
@@ -73,6 +79,14 @@ impl UserApi for Client {
     async fn get_user_me(&self) -> ApiResult<User> {
         self.get("/user/me", RequestOptions::new()).await
     }
+
+    async fn get_user_info(&self, user_id: &str) -> ApiResult<User> {
+        self.get(
+            &format!("/user/info/{}", urlencoding::encode(user_id)),
+            RequestOptions::new(),
+        )
+        .await
+    }
     
     async fn get_user_capacity(&self) -> ApiResult<Capacity> {
         self.get("/user/capacity", RequestOptions::new()).await
@@ -80,6 +94,15 @@ impl UserApi for Client {
 
     async fn get_user_storage_policies(&self) -> ApiResult<Vec<StoragePolicy>> {
         self.get("/user/setting/policies", RequestOptions::new()).await
+    }
+
+    async fn search_users(&self, keyword: &str) -> ApiResult<Vec<UserSearchResult>> {
+        let query = urlencoding::encode(keyword);
+        self.get(
+            &format!("/user/search?keyword={query}"),
+            RequestOptions::new(),
+        )
+        .await
     }
     
     async fn get_user_settings(&self) -> ApiResult<UserSettings> {
@@ -139,4 +162,3 @@ impl UserApi for Client {
         ).await
     }
 }
-

@@ -6,7 +6,8 @@
     "main",
     "add-drive",
     "main_popup",
-    "settings"
+    "settings",
+    "share"
   ],
   "permissions": [
     "core:default",

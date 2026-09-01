@@ -18,6 +18,7 @@ import "./i18n";
 import { createAppTheme } from "./theme";
 import AddDrive from "./pages/AddDrive";
 import Popup from "./pages/popup";
+import Share from "./pages/share";
 import Settings from "./pages/settings";
 
 function LoadingFallback() {
@@ -68,6 +69,7 @@ function App() {
   const isRoundedMacOSWindow =
     platformType() === "macos" &&
     (window.location.hash.startsWith("#/popup") ||
+      window.location.hash.startsWith("#/share") ||
       window.location.hash.startsWith("#/settings"));
   const theme = useMemo(
     () => createAppTheme(darkMode ? "dark" : "light"),
@@ -81,7 +83,11 @@ function App() {
         {isRoundedMacOSWindow && (
           <GlobalStyles
             styles={{
-              "html, body, #root": { backgroundColor: "transparent" },
+              "html, body, #root": {
+                backgroundColor: "transparent",
+                borderRadius: "14px",
+                overflow: "hidden",
+              },
             }}
           />
         )}
@@ -90,6 +96,9 @@ function App() {
         <Box
           sx={{
             minHeight: "100vh",
+            height: isRoundedMacOSWindow ? "100%" : undefined,
+            borderRadius: isRoundedMacOSWindow ? "14px" : undefined,
+            overflow: isRoundedMacOSWindow ? "hidden" : undefined,
             bgcolor: isRoundedMacOSWindow
               ? "transparent"
               : "background.default",
@@ -100,6 +109,7 @@ function App() {
               <Route path="/add-drive" element={<AddDrive />} />
               <Route path="/reauthorize/:driveId/:siteUrl/:driveName" element={<AddDrive mode="reauthorize" />} />
               <Route path="/popup" element={<Popup />} />
+              <Route path="/share" element={<Share />} />
               <Route path="/settings" element={<Settings />} />
             </Routes>
           </HashRouter>

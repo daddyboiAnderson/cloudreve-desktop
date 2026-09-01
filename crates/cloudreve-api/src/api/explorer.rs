@@ -664,6 +664,12 @@ pub struct FileEventSubscription {
     buffer: String,
 }
 
+/// Maximum time to wait for any data (events or keep-alives) before
+/// considering the stream dead. The server sends keep-alives far more
+/// often, so a silent stream means a zombie connection (proxy/NAT drop
+/// without a FIN) that would otherwise hang `chunk()` forever.
+const SSE_LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 impl FileEventSubscription {
     /// Create a new subscription from a response
     fn new(response: reqwest::Response) -> Self {
@@ -683,12 +689,12 @@ impl FileEventSubscription {
             }
 
             // Need more data from the stream
-            match self.response.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(SSE_LIVENESS_TIMEOUT, self.response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     let text = String::from_utf8_lossy(&chunk);
                     self.buffer.push_str(&text);
                 }
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     // Stream ended
                     // Try to parse any remaining data
                     if !self.buffer.is_empty() {
@@ -698,8 +704,14 @@ impl FileEventSubscription {
                     }
                     return Ok(None);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     return Err(crate::error::ApiError::SseStreamError(e.to_string()));
+                }
+                Err(_) => {
+                    return Err(crate::error::ApiError::SseStreamError(format!(
+                        "no data received for {}s, assuming dead connection",
+                        SSE_LIVENESS_TIMEOUT.as_secs()
+                    )));
                 }
             }
         }

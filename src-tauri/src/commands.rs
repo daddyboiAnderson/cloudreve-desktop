@@ -1,26 +1,36 @@
 use crate::AppStateHandle;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Duration, Utc};
+use cloudreve_api::api::{ExplorerApi, GroupApi, ShareApi, UserApi};
+use cloudreve_api::models::explorer::{file_type, GetFileInfoService, Share};
+use cloudreve_api::models::share::{ListShareResponse, ListShareService, ShareLinkRequest};
+use cloudreve_api::models::uri::CrUri;
+use cloudreve_api::models::user::{Group, UserSearchResult};
 use cloudreve_sync::drive::commands::ConflictAction;
 use cloudreve_sync::{
     config::LogLevel, ConfigManager, Credentials, DriveConfig, DriveInfo, StatusSummary,
 };
-#[cfg(windows)]
-use tauri::utils::{config::WindowEffectsConfig, WindowEffect};
-#[cfg(target_os = "macos")]
-use tauri::TitleBarStyle;
-use tauri::{
-    webview::{WebviewWindow, WebviewWindowBuilder},
-    AppHandle, Manager, State, WebviewUrl,
-};
-#[cfg(target_os = "macos")]
-use tauri::PhysicalPosition;
-#[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use core_graphics::{
     event::CGEvent,
     event_source::{CGEventSource, CGEventSourceStateID},
+};
+#[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
+#[cfg(target_os = "macos")]
+use objc2_app_kit::NSApp as ns_app;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+#[cfg(windows)]
+use tauri::utils::{config::WindowEffectsConfig, WindowEffect};
+#[cfg(target_os = "macos")]
+use tauri::PhysicalPosition;
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
+use tauri::{
+    webview::{WebviewWindow, WebviewWindowBuilder},
+    AppHandle, Emitter, Manager, State, WebviewUrl,
 };
 #[cfg(windows)]
 use tauri_plugin_frame::WebviewWindowExt;
@@ -102,6 +112,334 @@ pub async fn list_drives(state: State<'_, AppStateHandle>) -> CommandResult<Vec<
     Ok(app_state.drive_manager.list_drives().await)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShareTarget {
+    pub drive_id: String,
+    pub drive_name: String,
+    pub instance_url: String,
+    pub uri: String,
+    pub name: String,
+    pub is_folder: bool,
+    pub shares: Vec<Share>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShareGroupContext {
+    pub groups: Vec<Group>,
+    pub current_group_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShareWindowTarget {
+    pub drive_id: String,
+    pub uri: String,
+}
+
+async fn get_share_mount(
+    state: &State<'_, AppStateHandle>,
+    drive_id: &str,
+) -> CommandResult<(Arc<cloudreve_sync::drive::mounts::Mount>, DriveConfig)> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let mount = app_state
+        .drive_manager
+        .get_drive(drive_id)
+        .await
+        .ok_or_else(|| format!("Drive not found: {drive_id}"))?;
+    let config = mount.get_config().await;
+    Ok((mount, config))
+}
+
+fn validate_share_uri(
+    uri: &str,
+    remote_path: &str,
+    current_user_id: &str,
+) -> CommandResult<String> {
+    let target = CrUri::new(uri).map_err(|error| format!("Invalid Cloudreve URI: {error}"))?;
+    let root = CrUri::new(remote_path)
+        .map_err(|error| format!("Invalid configured drive URI: {error}"))?;
+
+    if target.is_search()
+        || target.fs() != root.fs()
+        || !share_identity_matches(&target.id(), &root.id(), current_user_id)
+        || target
+            .elements()
+            .iter()
+            .any(|element| element == "." || element == "..")
+    {
+        return Err("The selected item is outside this drive".to_string());
+    }
+
+    let root_path = root.path().trim_end_matches('/').to_string();
+    let target_path = target.path().trim_end_matches('/').to_string();
+    if !root_path.is_empty()
+        && target_path != root_path
+        && !target_path.starts_with(&format!("{root_path}/"))
+    {
+        return Err("The selected item is outside this drive".to_string());
+    }
+
+    Ok(target.to_string())
+}
+
+fn share_identity_matches(target_id: &str, root_id: &str, current_user_id: &str) -> bool {
+    target_id == root_id
+        || (target_id.is_empty() && root_id == current_user_id)
+        || (root_id.is_empty() && target_id == current_user_id)
+}
+
+fn share_request_for_drive(
+    mut request: ShareLinkRequest,
+    remote_path: &str,
+    current_user_id: &str,
+) -> CommandResult<ShareLinkRequest> {
+    request.uri = validate_share_uri(&request.uri, remote_path, current_user_id)?;
+    Ok(request)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_share_metadata_refresh(drive_id: &str, drive_name: &str, source_uris: &[String]) {
+    cloudreve_sync::fileprovider::signal_metadata_refresh(drive_id, drive_name, source_uris);
+}
+
+/// Resolve a Finder item and load its existing share links.
+#[tauri::command]
+pub async fn get_share_target(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    uri: String,
+) -> CommandResult<ShareTarget> {
+    let (mount, config) = get_share_mount(&state, &drive_id).await?;
+    let uri = validate_share_uri(&uri, &config.remote_path, &config.user_id)?;
+    let file = mount
+        .cr_client
+        .get_file_info(&GetFileInfoService {
+            uri: Some(uri.clone()),
+            id: None,
+            extended: Some(true),
+            folder_summary: None,
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let file_path = file.path.clone();
+    let mut shares = file
+        .extended_info
+        .and_then(|info| info.shares)
+        .unwrap_or_default();
+
+    if shares.is_empty() {
+        if let Ok(response) = mount
+            .cr_client
+            .list_share_links(&ListShareService {
+                page_size: 100,
+                order_by: None,
+                order_direction: None,
+                next_page_token: None,
+            })
+            .await
+        {
+            shares = response
+                .shares
+                .into_iter()
+                .filter(|share| share.source_uri.as_deref() == Some(file_path.as_str()))
+                .collect();
+        }
+    }
+
+    // The extended file response is the authoritative share state for this
+    // item. Refresh its Finder decoration when the Share window is opened.
+    #[cfg(target_os = "macos")]
+    signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&file_path));
+
+    Ok(ShareTarget {
+        drive_id,
+        drive_name: config.name,
+        instance_url: config.instance_url,
+        uri: file_path,
+        name: file.name,
+        is_folder: file.file_type == file_type::FOLDER,
+        shares,
+    })
+}
+
+/// Load groups and the signed-in user's current group for the share picker.
+#[tauri::command]
+pub async fn get_share_groups(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+) -> CommandResult<ShareGroupContext> {
+    let (mount, _) = get_share_mount(&state, &drive_id).await?;
+    let groups = mount
+        .cr_client
+        .list_groups()
+        .await
+        .map_err(|error| error.to_string())?;
+    let current_group_id = mount
+        .cr_client
+        .get_user_me()
+        .await
+        .map_err(|error| error.to_string())?
+        .group
+        .map(|group| group.id);
+
+    Ok(ShareGroupContext {
+        groups,
+        current_group_id,
+    })
+}
+
+/// Create a share link for a Finder item.
+#[tauri::command]
+pub async fn create_share_link(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    request: ShareLinkRequest,
+) -> CommandResult<String> {
+    let (mount, config) = get_share_mount(&state, &drive_id).await?;
+    let request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
+    #[cfg(target_os = "macos")]
+    let source_uri = request.uri.clone();
+    let url = mount
+        .cr_client
+        .create_share_link(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&source_uri));
+    Ok(url)
+}
+
+/// Update an existing share link.
+#[tauri::command]
+pub async fn edit_share_link(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    share_id: String,
+    request: ShareLinkRequest,
+) -> CommandResult<String> {
+    let (mount, config) = get_share_mount(&state, &drive_id).await?;
+    let request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
+    #[cfg(target_os = "macos")]
+    let source_uri = request.uri.clone();
+    let url = mount
+        .cr_client
+        .edit_share_link(&share_id, &request)
+        .await
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&source_uri));
+    Ok(url)
+}
+
+/// Load the full settings for an existing share link.
+#[tauri::command]
+pub async fn get_share_link_info(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    share_id: String,
+) -> CommandResult<Share> {
+    let (mount, _) = get_share_mount(&state, &drive_id).await?;
+    mount
+        .cr_client
+        .get_share_link_info(&share_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// List share links owned by a drive's Cloudreve account.
+#[tauri::command]
+pub async fn list_share_links(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    page_size: Option<i32>,
+    next_page_token: Option<String>,
+) -> CommandResult<ListShareResponse> {
+    let (mount, _) = get_share_mount(&state, &drive_id).await?;
+    mount
+        .cr_client
+        .list_share_links(&ListShareService {
+            page_size: page_size.unwrap_or(100).clamp(10, 100),
+            order_by: None,
+            order_direction: None,
+            next_page_token,
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Delete an existing share link.
+#[tauri::command]
+pub async fn delete_share_link(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    share_id: String,
+) -> CommandResult<()> {
+    let (mount, config) = get_share_mount(&state, &drive_id).await?;
+    #[cfg(target_os = "macos")]
+    let source_uri = mount
+        .cr_client
+        .get_share_link_info(&share_id)
+        .await
+        .ok()
+        .and_then(|share| share.source_uri);
+    mount
+        .cr_client
+        .delete_share_link(&share_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let source_uris = source_uri.into_iter().collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    signal_share_metadata_refresh(&drive_id, &config.name, &source_uris);
+    Ok(())
+}
+
+/// Search users available as explicit share recipients.
+#[tauri::command]
+pub async fn search_share_users(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    keyword: String,
+) -> CommandResult<Vec<UserSearchResult>> {
+    let (mount, _) = get_share_mount(&state, &drive_id).await?;
+    if keyword.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    mount
+        .cr_client
+        .search_users(keyword.trim())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Resolve the full identity of users already assigned to a share link.
+#[tauri::command]
+pub async fn get_share_users(
+    state: State<'_, AppStateHandle>,
+    drive_id: String,
+    user_ids: Vec<String>,
+) -> CommandResult<Vec<UserSearchResult>> {
+    let (mount, _) = get_share_mount(&state, &drive_id).await?;
+    let mut users = Vec::new();
+
+    for user_id in user_ids.into_iter().filter(|id| !id.trim().is_empty()) {
+        let Ok(user) = mount.cr_client.get_user_info(&user_id).await else {
+            continue;
+        };
+        users.push(UserSearchResult {
+            id: user.id,
+            nickname: user.nickname,
+            email: user.email,
+            avatar: user.avatar,
+            group: user.group,
+        });
+    }
+
+    Ok(users)
+}
+
 #[derive(serde::Deserialize)]
 pub struct AddDriveArgs {
     pub site_url: String,
@@ -116,14 +454,26 @@ pub struct AddDriveArgs {
     pub drive_id: Option<String>,
 }
 
+/// The same Cloudreve account/root gets the same native domain identity when
+/// it is removed and added again. Display names and local paths are mutable.
+fn stable_drive_id(instance_url: &str, user_id: &str, remote_path: &str) -> String {
+    let key = format!(
+        "{}\n{}\n{}",
+        instance_url.trim_end_matches('/').to_ascii_lowercase(),
+        user_id,
+        remote_path.trim_end_matches('/')
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
+}
+
 /// Add a new drive configuration
 #[tauri::command]
 pub async fn add_drive(
     state: State<'_, AppStateHandle>,
     config: AddDriveArgs,
 ) -> CommandResult<String> {
-    let site_url = tauri::Url::parse(&config.site_url)
-        .map_err(|e| format!("Invalid Cloudreve URL: {e}"))?;
+    let site_url =
+        tauri::Url::parse(&config.site_url).map_err(|e| format!("Invalid Cloudreve URL: {e}"))?;
     if site_url.scheme() != "https" {
         return Err("Cloudreve connections must use HTTPS".to_string());
     }
@@ -173,8 +523,8 @@ pub async fn add_drive(
         return Ok(drive_id);
     }
 
-    // Generate a new UUID for a new drive
-    let drive_id = Uuid::new_v4().to_string();
+    // Keep the File Provider domain stable when this account/root is re-added.
+    let drive_id = stable_drive_id(&config.site_url, &config.user_id, &config.remote_path);
 
     let drive_config = DriveConfig {
         id: drive_id,
@@ -433,20 +783,13 @@ pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<
         .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "macos")]
-#[derive(serde::Serialize)]
-pub struct FileProviderResetResult {
-    pub preserved_data_path: Option<String>,
-}
-
-/// Remove and re-add the same stable Finder domain used by main. No sync IDs,
-/// anchors, identity maps, or remote-event routing are changed.
+/// Remove and re-add the Finder domain with fresh extension-local state.
 #[cfg(target_os = "macos")]
 #[tauri::command]
 pub async fn reset_file_provider(
     state: State<'_, AppStateHandle>,
     drive_id: String,
-) -> CommandResult<FileProviderResetResult> {
+) -> CommandResult<()> {
     let app_state = state
         .get()
         .ok_or_else(|| "App not yet initialized".to_string())?;
@@ -459,25 +802,23 @@ pub async fn reset_file_provider(
         .ok_or_else(|| format!("Drive not found: {drive_id}"))?;
 
     let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+    cloudreve_sync::fileprovider::request_local_state_reset(&drive.id)
+        .map_err(|error| format!("Could not prepare Finder reset: {error:#}"))?;
     let registered = cloudreve_sync::fileprovider::list_domains()
         .await
         .map_err(|error| format!("Could not inspect Finder integration: {error:#}"))?;
 
-    let preserved_data_path = if registered.iter().any(|(id, _)| id == &domain_id) {
-        cloudreve_sync::fileprovider::remove_domain_preserving_dirty_data(&domain_id, &drive.name)
+    if registered.iter().any(|(id, _)| id == &domain_id) {
+        cloudreve_sync::fileprovider::remove_domain(&domain_id, &drive.name)
             .await
-            .map_err(|error| format!("Could not remove Finder integration: {error:#}"))?
-    } else {
-        None
-    };
+            .map_err(|error| format!("Could not remove Finder integration: {error:#}"))?;
+    }
 
     cloudreve_sync::fileprovider::add_domain(&domain_id, &drive.name)
         .await
         .map_err(|error| format!("Could not add Finder integration: {error:#}"))?;
 
-    Ok(FileProviderResetResult {
-        preserved_data_path,
-    })
+    Ok(())
 }
 
 /// File icon response containing base64 encoded RGBA pixel data
@@ -509,10 +850,11 @@ pub async fn get_file_icon(
 ) -> CommandResult<FileIconResponse> {
     let icon_size = size.unwrap_or(32);
 
-    let result = tokio::task::spawn_blocking(move || file_icon_provider::get_file_icon(&path, icon_size))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))?
-        .map_err(|e| format!("Failed to get file icon: {:?}", e))?;
+    let result =
+        tokio::task::spawn_blocking(move || file_icon_provider::get_file_icon(&path, icon_size))
+            .await
+            .map_err(|e| format!("Task join error: {}", e))?
+            .map_err(|e| format!("Failed to get file icon: {:?}", e))?;
 
     Ok(file_icon_to_response(result))
 }
@@ -561,8 +903,7 @@ pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) 
 pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) {
     let now = monotonic_popup_time_ms();
     let focus_lost_at = MAIN_POPUP_FOCUS_LOST_AT_MS.load(Ordering::Relaxed);
-    let recently_lost_focus =
-        focus_lost_at != 0 && now.saturating_sub(focus_lost_at) <= 300;
+    let recently_lost_focus = focus_lost_at != 0 && now.saturating_sub(focus_lost_at) <= 300;
     let is_visible = app
         .get_webview_window("main_popup")
         .and_then(|window| window.is_visible().ok())
@@ -591,7 +932,10 @@ fn hardware_cursor_position(app: &AppHandle) -> Option<PhysicalPosition<f64>> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
     let location = CGEvent::new(source).ok()?.location();
     let scale = app.primary_monitor().ok().flatten()?.scale_factor();
-    Some(PhysicalPosition::new(location.x * scale, location.y * scale))
+    Some(PhysicalPosition::new(
+        location.x * scale,
+        location.y * scale,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -712,6 +1056,22 @@ fn apply_default_window_icon<'a>(
             );
             None
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_app(app: &AppHandle) {
+    if let Err(error) = app.run_on_main_thread(|| {
+        let Some(mtm) = MainThreadMarker::new() else {
+            tracing::warn!(target: "share", "Share window activation was requested off the main thread");
+            return;
+        };
+
+        let app = ns_app(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }) {
+        tracing::warn!(target: "share", error = %error, "Failed to activate the app for the Share window");
     }
 }
 
@@ -845,6 +1205,117 @@ pub async fn show_file_in_explorer(path: String) -> CommandResult<()> {
 #[tauri::command]
 pub async fn show_add_drive_window(app: AppHandle) -> CommandResult<()> {
     show_add_drive_window_impl(&app);
+    Ok(())
+}
+
+/// Route Cloudreve deep links to the appropriate native window.
+pub fn handle_deep_link(app: &AppHandle, raw_url: &str) {
+    if let Ok(url) = tauri::Url::parse(raw_url) {
+        let is_share = url.scheme() == "cloudreve"
+            && (url.host_str() == Some("share") || url.path().trim_matches('/') == "share");
+        if is_share {
+            let drive_id = url
+                .query_pairs()
+                .find(|(key, _)| key == "drive_id")
+                .map(|(_, value)| value.into_owned());
+            let uri = url
+                .query_pairs()
+                .find(|(key, _)| key == "uri")
+                .map(|(_, value)| value.into_owned());
+
+            if let (Some(drive_id), Some(uri)) = (drive_id, uri) {
+                show_share_window_impl(app, &drive_id, &uri);
+                return;
+            }
+
+            tracing::warn!(target: "share", "Ignoring share deep link without drive_id or uri");
+            return;
+        }
+    }
+
+    let _ = app.emit("deeplink", raw_url.to_string());
+    show_add_drive_window_impl(app);
+}
+
+/// Show or create the Share window for a Finder item.
+pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
+    let target = ShareWindowTarget {
+        drive_id: drive_id.to_string(),
+        uri: uri.to_string(),
+    };
+
+    if let Some(window) = app.get_webview_window("share") {
+        #[cfg(target_os = "macos")]
+        let _ = app.show();
+        let _ = window.show();
+        let _ = window.unminimize();
+        #[cfg(target_os = "macos")]
+        {
+            crate::update_dock_visibility(app);
+            activate_app(app);
+        }
+        let _ = window.set_focus();
+        let _ = window.emit("share-target", &target);
+        return;
+    }
+
+    let url_path = format!(
+        "index.html/#/share?drive_id={}&uri={}",
+        urlencoding::encode(drive_id),
+        urlencoding::encode(uri)
+    );
+    let builder = WebviewWindowBuilder::new(
+        app,
+        "share",
+        WebviewUrl::App(get_url_with_lang(&url_path).into()),
+    )
+    .title("Share")
+    .inner_size(540.0, 540.0)
+    .min_inner_size(480.0, 480.0)
+    .resizable(false)
+    .visible(false)
+    .decorations(false)
+    .skip_taskbar(true)
+    .minimizable(false);
+
+    #[cfg(any(target_os = "macos", windows))]
+    let builder = builder.transparent(true);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    let Some(builder) = apply_default_window_icon(builder, app, "share") else {
+        return;
+    };
+
+    match builder.build() {
+        Ok(window) => {
+            #[cfg(target_os = "macos")]
+            update_dock_on_window_close(&window);
+
+            move_window_safely(&window, Position::Center, "share");
+            #[cfg(target_os = "macos")]
+            let _ = app.show();
+            let _ = window.show();
+            #[cfg(target_os = "macos")]
+            {
+                crate::update_dock_visibility(app);
+                activate_app(app);
+            }
+            let _ = window.set_focus();
+        }
+        Err(error) => {
+            tracing::error!(target: "share", error = %error, "Failed to create Share window");
+        }
+    }
+}
+
+/// Command used by the UI and useful for opening Share from another app.
+#[tauri::command]
+pub async fn show_share_window(app: AppHandle, drive_id: String, uri: String) -> CommandResult<()> {
+    show_share_window_impl(&app, &drive_id, &uri);
     Ok(())
 }
 

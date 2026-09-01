@@ -32,6 +32,19 @@ pub struct User {
     pub share_links_in_profile: Option<ShareLinksInProfileLevel>,
 }
 
+/// Minimal user returned by the share-recipient search endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserSearchResult {
+    pub id: String,
+    pub nickname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<Group>,
+}
+
 /// User group
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {

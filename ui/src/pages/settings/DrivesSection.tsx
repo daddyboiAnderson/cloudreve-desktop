@@ -54,10 +54,6 @@ interface DriveInfoResponse {
   file_provider?: DriveInfo["file_provider"];
 }
 
-interface FileProviderResetResponse {
-  preserved_data_path?: string;
-}
-
 export default function DrivesSection() {
   const { t } = useTranslation();
   const [drives, setDrives] = useState<DriveInfo[]>([]);
@@ -160,15 +156,13 @@ export default function DrivesSection() {
     setResettingDriveId(drive.id);
     setFileProviderNotice(null);
     try {
-      const result = await invoke<FileProviderResetResponse>("reset_file_provider", {
+      await invoke("reset_file_provider", {
         driveId: drive.id,
       });
       setFileProviderNotice({
         driveId: drive.id,
-        severity: result.preserved_data_path ? "warning" : "success",
-        message: result.preserved_data_path
-          ? t("settings.fileProviderResetPreserved", { path: result.preserved_data_path })
-          : t("settings.fileProviderResetSuccess"),
+        severity: "success",
+        message: t("settings.fileProviderResetSuccess"),
       });
       await fetchDrives();
     } catch (error) {

@@ -3,20 +3,25 @@ use cloudreve_sync::{
     shellext::shell_service::ServiceHandle, ConfigManager, DriveManager, EventBroadcaster,
     LogConfig, LogGuard,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tauri::{
     async_runtime::spawn,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager, RunEvent,
+    AppHandle, Listener, Manager, RunEvent,
 };
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_deep_link::DeepLinkExt;
 use tokio::sync::OnceCell;
 
-use crate::commands::{show_add_drive_window_impl, show_main_window, show_settings_window_impl};
 #[cfg(target_os = "macos")]
 use crate::commands::toggle_main_window_at_click;
+use crate::commands::{
+    handle_deep_link, show_add_drive_window_impl, show_main_window, show_settings_window_impl,
+};
 mod commands;
 mod event_handler;
 
@@ -83,6 +88,19 @@ fn init_i18n() {
     set_locale(normalize_locale(&locale).as_str());
 }
 
+fn defer_deep_link(app: &AppHandle, raw_url: &str) {
+    let app = app.clone();
+    let raw_url = raw_url.to_string();
+    std::thread::spawn(move || {
+        let handler_app = app.clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            handle_deep_link(&handler_app, &raw_url);
+        }) {
+            tracing::error!(target: "main", error = %error, "Failed to schedule deep-link handling");
+        }
+    });
+}
+
 /// Get the current effective locale (from config or system)
 pub fn get_effective_locale() -> String {
     use sys_locale::get_locale;
@@ -107,6 +125,7 @@ pub struct AppState {
 
 /// Global cell to store the app state once initialization is complete
 static APP_STATE: OnceCell<AppState> = OnceCell::const_new();
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the sync service (DriveManager, shell services, etc.)
 async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
@@ -263,6 +282,10 @@ fn spawn_event_bridge(app_handle: AppHandle, event_broadcaster: &EventBroadcaste
 
 /// Perform graceful shutdown
 async fn shutdown() {
+    if SHUTDOWN_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
     tracing::info!(target: "main", "Initiating shutdown...");
 
     if let Some(state) = APP_STATE.get() {
@@ -319,9 +342,7 @@ fn tray_menu_entries() -> [(&'static str, String); 4] {
 }
 
 /// Build the localized tray context menu with the current locale.
-fn build_tray_menu<R: tauri::Runtime>(
-    manager: &impl Manager<R>,
-) -> anyhow::Result<Menu<R>> {
+fn build_tray_menu<R: tauri::Runtime>(manager: &impl Manager<R>) -> anyhow::Result<Menu<R>> {
     let entries = tray_menu_entries();
     let menu_items: Vec<MenuItem<R>> = entries
         .iter()
@@ -348,8 +369,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let menu = build_tray_menu(app)?;
 
     #[cfg(target_os = "macos")]
-    let tray_icon =
-        tauri::image::Image::from_bytes(include_bytes!("../icons/trayTemplate.png"))?;
+    let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/trayTemplate.png"))?;
     #[cfg(not(target_os = "macos"))]
     let tray_icon = app.default_window_icon().unwrap().clone();
 
@@ -370,7 +390,13 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
                 show_settings_window_impl(app);
             }
             "quit" => {
-                app.exit(0);
+                let app = app.clone();
+                spawn(async move {
+                    // Finish disconnecting File Provider domains before the host
+                    // exits so the next launch loads the replaced extension.
+                    shutdown().await;
+                    app.exit(0);
+                });
             }
             _ => {}
         })
@@ -414,8 +440,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             tracing::info!("a new app instance was opened with {argv:?} and the deep link event was already triggered");
             if argv.len() > 1 {
-                let _ = app.emit("deeplink", argv[1].clone());
-                show_add_drive_window_impl(app);
+                defer_deep_link(app, &argv[1]);
             }
             // when defining deep link schemes at runtime, you must also check `argv` here
         }))
@@ -448,8 +473,7 @@ pub fn run() {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                     if let Some(url) = urls.first() {
                         tracing::info!(target: "main", "Received deep-link URL: {}", url);
-                        let _ = app_handle.emit("deeplink", url.clone());
-                        show_add_drive_window_impl(&app_handle);
+                        defer_deep_link(&app_handle, url);
                     }
                 }
             });
@@ -491,6 +515,16 @@ pub fn run() {
             commands::get_file_icon,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,
+            commands::show_share_window,
+            commands::get_share_target,
+            commands::get_share_groups,
+            commands::create_share_link,
+            commands::edit_share_link,
+            commands::get_share_link_info,
+            commands::list_share_links,
+            commands::delete_share_link,
+            commands::search_share_users,
+            commands::get_share_users,
             commands::show_reauthorize_window,
             commands::show_settings_window,
             commands::get_auto_start_enabled,

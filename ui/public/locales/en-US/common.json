@@ -99,9 +99,9 @@
     "ignorePatternsError": "Invalid patterns: {{message}}",
     "fileProviderReset": "Reset Finder Integration",
     "fileProviderUnknownError": "Finder integration is not registered correctly.",
-    "fileProviderResetSuccess": "Finder integration was removed and added again.",
-    "fileProviderResetPreserved": "Finder integration was reset. Unsynced local data was preserved at {{path}}.",
-    "fileProviderResetConfirm": "Reset Finder integration for \"{{name}}\"? The Finder location will briefly disappear and return. Downloaded placeholders may need to be downloaded again. macOS will preserve unsynced local data.",
+    "fileProviderResetSuccess": "Finder integration and its local state were removed and added again. Cloud files were not changed.",
+    "fileProviderResetPreserved": "Finder integration was reset.",
+    "fileProviderResetConfirm": "Reset Finder integration for \"{{name}}\"? Its local Finder state and downloaded copies will be removed, then the location will be added again. Files stored in Cloudreve will not be changed.",
     "save": "Save",
     "cancel": "Cancel",
     "driveStatus": {
