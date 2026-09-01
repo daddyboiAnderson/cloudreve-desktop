@@ -60,6 +60,17 @@ cargo tauri build              # Production build
 - `scripts/build-extension.sh`: builds the appex with raw `swiftc` (no Xcode project), ad-hoc signs it
 - `scripts/embed-into-app.sh`: embeds the appex into a built `Cloudreve.app`, re-signs, refreshes LS/pluginkit — run after every `cargo tauri build --bundles app`
 
+#### macOS synchronization and share-state rules
+
+- Cloudreve file IDs are the canonical identity. `NSFileProviderItemIdentifier` values and persisted metadata maps must be keyed by the stable remote ID, never by a filename or path. URIs are lookup locations and may change after rename or move; update the ID-to-URI map while preserving the item identifier.
+- The host app owns one SSE subscription per drive. It uses a fresh client ID for every subscription attempt, writes verified remote events to the drive's JSONL feed, and signals the working-set container. The File Provider extension replays that feed; it must not open its own long-lived SSE connection or crawl the whole drive for each event.
+- Create/modify events are verified with `/file/info` before being queued. An invalid event path, a reconnect, or a missed-event gap records a rescan marker. Full reconciliation is reserved for those cases and must deliver explicit updates/deletions rather than relying on omitted working-set items disappearing.
+- Finder folder enumeration is demand-driven. Record containers when Finder presents them and refresh only the root plus recently presented containers (bounded and persisted) when a working-set signal arrives. Do not add periodic full-drive polling or recursively enumerate unopened subfolders.
+- Share state comes from the extended file metadata (`shared` and ownership flags), not from filenames or stale share-link UI state. The share create/edit/delete commands signal a targeted metadata refresh; remote share events use the same metadata refresh path. `makeItem` must include the share flags in `itemVersion.metadataVersion` so Finder redraws the decoration.
+- When a share event has no usable source URI, use the metadata-name fallback only for already presented items. Do not guess an item's identity from a duplicate name across folders. A later directory listing or `/file/info` response is authoritative.
+- Remote deletes must evict the corresponding cached item and call `didDeleteItems`. During a rescan, delete an absent item only when its parent was freshly listed or proven gone; leave unverified cached items alone until their container is opened.
+- `signalEnumerator` is reliable only for the replicated working-set container. Keep the app's event log and signal flow intact; per-container signals are not a substitute for working-set invalidation.
+
 Rust-side domain lifecycle: `crates/cloudreve-sync/src/fileprovider.rs` (one domain per drive, `NSFileProviderManager` via hand-rolled `msg_send!` since `objc2-file-provider` lacks Manager bindings; domain registration is called from `src-tauri` on startup and on add/remove drive).
 
 #### Cloudreve API reference (up-to-date docs)
