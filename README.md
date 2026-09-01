@@ -28,6 +28,7 @@ A desktop client for [Cloudreve](https://github.com/cloudreve/Cloudreve) cloud s
 - Create, rename, move, and delete files directly in Finder
 - Multiple Cloudreve drives under Finder's Locations section
 - Lightweight menu bar application
+- Share items directly in Finder
 
 ## Prerequisites
 
