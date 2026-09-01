@@ -8,6 +8,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
     private let containerIdentifier: NSFileProviderItemIdentifier
     private let store: RemoteStore
+    private let refreshLock = NSLock()
+    private var needsPresentedContainerRefresh = true
 
     init(containerIdentifier: NSFileProviderItemIdentifier, store: RemoteStore) {
         self.containerIdentifier = containerIdentifier
@@ -46,6 +48,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return
         }
 
+        store.recordPresentedContainer(containerIdentifier)
+
         let pageToken: String?
         if page.rawValue == NSFileProviderPage.initialPageSortedByName as Data
             || page.rawValue == NSFileProviderPage.initialPageSortedByDate as Data
@@ -57,6 +61,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
         Task {
             do {
+                _ = consumePresentedContainerRefresh()
                 let (items, nextPage) = try await store.children(
                     of: containerIdentifier, page: pageToken)
                 observer.didEnumerate(items)
@@ -85,19 +90,72 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         )
         Task {
             do {
+                if containerIdentifier != .workingSet,
+                    containerIdentifier != .trashContainer,
+                    consumePresentedContainerRefresh()
+                {
+                    let items = try await store.currentChildren(of: containerIdentifier)
+                    if !items.isEmpty {
+                        logger.notice(
+                            "refreshing \(items.count) presented item(s) in \(self.containerIdentifier.rawValue, privacy: .public)"
+                        )
+                        observer.didUpdate(items)
+                    }
+                }
                 // Force a full working-set refresh after a policy change.
                 if containerIdentifier == .workingSet,
                     store.consumePolicyRescanIfNeeded()
                 {
                     throw NSFileProviderError(.syncAnchorExpired)
                 }
-                let (changes, newAnchor) = try store.changes(
-                    since: anchor.rawValue, for: containerIdentifier)
+                let changes: [RemoteStore.FpEvent]
+                let newAnchor: NSFileProviderSyncAnchor
+                do {
+                    (changes, newAnchor) = try store.changes(
+                        since: anchor.rawValue, for: containerIdentifier)
+                } catch let error as NSFileProviderError
+                    where error.code == .syncAnchorExpired
+                        && containerIdentifier == .workingSet
+                {
+                    // A rescan marker invalidated the anchor: events may have
+                    // been missed while the stream was down. Items that vanish
+                    // from a plain working-set re-enumeration are not removed
+                    // by the system, so reconcile against the server and
+                    // deliver the delta — including deletions — explicitly.
+                    logger.notice("anchor expired; reconciling working set with the server")
+                    // Do not acknowledge events that arrive while the server
+                    // reconciliation is running; the next request must replay them.
+                    let reconciliationAnchor = store.currentSyncAnchor()
+                    logger.notice(
+                        "reconciliation captured anchor \(String(data: reconciliationAnchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"
+                    )
+                    let (updated, deleted) = try await store.reconcileWorkingSet()
+                    if !updated.isEmpty {
+                        logger.notice(
+                            "reconciliation updating \(updated.count) item(s)")
+                        observer.didUpdate(updated)
+                    }
+                    if !deleted.isEmpty {
+                        logger.notice(
+                            "reconciliation deleting \(deleted.count) item(s)")
+                        observer.didDeleteItems(withIdentifiers: deleted)
+                    }
+                    observer.finishEnumeratingChanges(
+                        upTo: reconciliationAnchor, moreComing: false)
+                    return
+                }
                 for change in changes {
                     try await apply(change: change, to: observer)
                 }
                 // Deliver queued Keep Downloaded policy changes.
                 if containerIdentifier == .workingSet {
+                    let stabilizationDeletes = store.takeStabilizationDeletes()
+                    if !stabilizationDeletes.isEmpty {
+                        logger.notice(
+                            "delivering \(stabilizationDeletes.count) stabilization delete(s)"
+                        )
+                        observer.didDeleteItems(withIdentifiers: stabilizationDeletes)
+                    }
                     let pending = store.takePendingItemUpdates()
                     if !pending.isEmpty {
                         var items: [NSFileProviderItem] = []
@@ -108,7 +166,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                                 break
                             }
                             do {
-                                let file = try await store.client.fileInfo(uri: uri)
+                                let file = try await store.client.fileInfoWithShareState(uri: uri)
                                 items.append(store.makeItem(file))
                             } catch CloudreveError.noSuchItem {
                                 // The remote delete superseded this update.
@@ -146,35 +204,67 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         }
     }
 
+    private func consumePresentedContainerRefresh() -> Bool {
+        refreshLock.lock()
+        defer { refreshLock.unlock() }
+        guard needsPresentedContainerRefresh else { return false }
+        needsPresentedContainerRefresh = false
+        return true
+    }
+
     private func apply(
         change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver
     ) async throws {
+        if change.type == "metadata_rescan" {
+            let items = await store.refreshPresentedShareMetadata()
+            if !items.isEmpty {
+                logger.notice("refreshing share metadata for \(items.count) presented item(s)")
+                observer.didUpdate(items)
+            }
+            return
+        }
+        if change.type == "metadata_name" {
+            let items = await store.refreshShareMetadata(named: change.from)
+            if !items.isEmpty { observer.didUpdate(items) }
+            return
+        }
         let fromURI = store.uri(forEventPath: change.from)
+        logger.notice(
+            "applying \(change.type, privacy: .public) for \(fromURI, privacy: .public)"
+        )
         switch change.type {
-        case "create", "modify":
+        case "create", "modify", "metadata":
             // Refresh metadata; a disappeared item becomes a delete.
             do {
-                let file = try await store.client.fileInfo(uri: fromURI)
+                let file = try await store.client.fileInfoWithShareState(uri: fromURI)
+                logger.notice(
+                    "refreshed \(fromURI, privacy: .public), shared: \(file.shared == true, privacy: .public)"
+                )
                 observer.didUpdate([store.makeItem(file)])
             } catch CloudreveError.noSuchItem {
-                observer.didDeleteItems(withIdentifiers: [
-                    NSFileProviderItemIdentifier(fromURI)
-                ])
+                let identifier = store.identifier(forURI: fromURI)
+                store.evictCachedItems(withIdentifiers: [identifier])
+                observer.didDeleteItems(withIdentifiers: [identifier])
             }
         case "delete":
-            observer.didDeleteItems(withIdentifiers: [
-                store.identifier(forURI: fromURI)
-            ])
+            let identifier = store.identifier(forURI: fromURI)
+            logger.notice(
+                "delivering remote delete for \(fromURI, privacy: .public) as \(identifier.rawValue, privacy: .public)"
+            )
+            store.recordRemoteDelete(for: fromURI)
+            store.evictCachedItems(withIdentifiers: [identifier])
+            observer.didDeleteItems(withIdentifiers: [identifier])
         case "rename":
             let identifier = store.identifier(forURI: fromURI)
             if let to = change.to {
                 let toURI = store.uri(forEventPath: to)
                 do {
-                    let file = try await store.client.fileInfo(uri: toURI)
+                    let file = try await store.client.fileInfoWithShareState(uri: toURI)
                     observer.didUpdate([
                         store.makeItem(file, preservingIdentifier: identifier)
                     ])
                 } catch CloudreveError.noSuchItem {
+                    store.evictCachedItems(withIdentifiers: [identifier])
                     observer.didDeleteItems(withIdentifiers: [identifier])
                 }
             }
@@ -198,7 +288,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         case CloudreveError.nameCollision:
             return NSFileProviderError(.filenameCollision)
         default:
-            return error
+            // File Provider only accepts Cocoa and File Provider error
+            // domains. Keep implementation errors inside the extension.
+            return NSFileProviderError(.serverUnreachable)
         }
     }
 }

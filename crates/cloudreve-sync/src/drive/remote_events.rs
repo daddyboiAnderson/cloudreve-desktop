@@ -1,24 +1,24 @@
+use crate::drive::mounts::Mount;
+#[cfg(not(target_os = "macos"))]
 use crate::{
     cfapi::placeholder::LocalFileInfo,
-    drive::{commands::MountCommand, mounts::Mount, sync::SyncMode},
+    drive::{commands::MountCommand, sync::SyncMode},
 };
-use anyhow::{Context, Result};
-use cloudreve_api::models::explorer::{FileEvent, FileEventData, FileEventType};
+use anyhow::Result;
+#[cfg(not(target_os = "macos"))]
+use anyhow::Context;
 #[cfg(target_os = "macos")]
 use cloudreve_api::api::explorer::ExplorerApi;
 #[cfg(not(target_os = "macos"))]
 use cloudreve_api::api::explorer::FileEventsApi;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use cloudreve_api::models::explorer::{FileEvent, FileEventData, FileEventType};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+#[cfg(not(target_os = "macos"))]
+use std::{collections::HashMap, path::Path};
 
-const MAX_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 32;
-const LONG_RETRY_DELAY_SECS: u64 = 3600; // 1 hour
+const EVENT_STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
 
 struct BackoffState {
     retry_count: u32,
@@ -38,20 +38,20 @@ impl BackoffState {
         self.current_delay = Duration::from_secs(INITIAL_BACKOFF_SECS);
     }
 
-    fn next_delay(&mut self) -> Option<Duration> {
-        if self.retry_count >= MAX_RETRIES {
-            return None;
-        }
+    fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
         self.retry_count += 1;
         self.current_delay =
             Duration::from_secs((self.current_delay.as_secs() * 2).min(MAX_BACKOFF_SECS));
-        Some(delay)
+        delay
     }
 }
 
 enum ListenResult {
-    Error(anyhow::Error),
+    Error {
+        error: anyhow::Error,
+        was_connected: bool,
+    },
     ReconnectRequired,
     StreamEnded,
 }
@@ -60,11 +60,6 @@ impl Mount {
     pub async fn process_remote_events(s: Arc<Self>) {
         tracing::info!(target: "drive::remote_events", "Listening to remote events");
         let mut backoff = BackoffState::new();
-
-        let sync_path = {
-            let config = s.config.read().await;
-            config.sync_path.clone()
-        };
 
         loop {
             let result = s.listen_remote_events().await;
@@ -79,31 +74,25 @@ impl Mount {
                     backoff.reset();
                     continue;
                 }
-                ListenResult::Error(e) => {
-                    if let Some(delay) = backoff.next_delay() {
-                        tracing::error!(
-                            target: "drive::remote_events",
-                            error = %e,
-                            retry_count = backoff.retry_count,
-                            delay_secs = delay.as_secs(),
-                            "Failed to listen to remote events, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                    } else {
-                        tracing::error!(
-                            target: "drive::remote_events",
-                            error = %e,
-                            "Max retries reached, waiting 1 hour before retrying. Triggerring full sync..."
-                        );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        let _ = s.command_tx.send(MountCommand::Sync {
-                            local_paths: vec![sync_path.clone()],
-                            mode: SyncMode::FullHierarchy,
-                            user_initiated: false,
-                        });
-                        tokio::time::sleep(Duration::from_secs(LONG_RETRY_DELAY_SECS)).await;
+                ListenResult::Error {
+                    error: e,
+                    was_connected,
+                } => {
+                    // A healthy subscription starts a new retry sequence. Without
+                    // this reset, unrelated failures accumulate over the process
+                    // lifetime and eventually disable events for an hour.
+                    if was_connected {
                         backoff.reset();
                     }
+                    let delay = backoff.next_delay();
+                    tracing::error!(
+                        target: "drive::remote_events",
+                        error = %e,
+                        retry_count = backoff.retry_count,
+                        delay_secs = delay.as_secs(),
+                        "Failed to listen to remote events, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
@@ -122,22 +111,40 @@ impl Mount {
         #[cfg(target_os = "macos")]
         let subscription = self
             .cr_client
-            .subscribe_file_events_with_client_id(
-                &remote_base,
-                &uuid::Uuid::new_v4().to_string(),
-            )
+            .subscribe_file_events_with_client_id(&remote_base, &uuid::Uuid::new_v4().to_string())
             .await;
         #[cfg(not(target_os = "macos"))]
         let subscription = self.cr_client.subscribe_file_events(&remote_base).await;
 
         let mut subscription = match subscription {
             Ok(sub) => sub,
-            Err(e) => return ListenResult::Error(e.into()),
+            Err(e) => {
+                return ListenResult::Error {
+                    error: e.into(),
+                    was_connected: false,
+                }
+            }
         };
+        let mut was_connected = false;
 
         loop {
-            match subscription.next_event().await {
-                Ok(Some(event)) => match event {
+            let next_event = tokio::time::timeout(
+                Duration::from_secs(EVENT_STREAM_IDLE_TIMEOUT_SECS),
+                subscription.next_event(),
+            )
+            .await;
+
+            match next_event {
+                Err(_) => {
+                    tracing::warn!(
+                        target: "drive::remote_events",
+                        idle_secs = EVENT_STREAM_IDLE_TIMEOUT_SECS,
+                        "Event stream became idle, reconnecting"
+                    );
+                    self.set_event_push_subscribed(false).await;
+                    return ListenResult::ReconnectRequired;
+                }
+                Ok(Ok(Some(event))) => match event {
                     FileEvent::Event(events) => {
                         tracing::trace!(target: "drive::remote_events", events = ?events, "Handling file events batch");
                         if let Err(e) = self.handle_file_events(sync_path.clone(), events).await {
@@ -145,12 +152,14 @@ impl Mount {
                         }
                     }
                     FileEvent::Resumed => {
+                        was_connected = true;
                         self.set_event_push_subscribed(true).await;
                         tracing::debug!(target: "drive::remote_events", "Subscription resumed");
                         #[cfg(target_os = "macos")]
                         self.record_rescan_marker().await;
                     }
                     FileEvent::Subscribed => {
+                        was_connected = true;
                         self.set_event_push_subscribed(true).await;
                         tracing::info!(target: "drive::remote_events", "New subscribtion, triggger full sync...");
                         #[cfg(target_os = "macos")]
@@ -175,30 +184,34 @@ impl Mount {
                         return ListenResult::ReconnectRequired;
                     }
                 },
-                Ok(None) => {
+                Ok(Ok(None)) => {
                     self.set_event_push_subscribed(false).await;
                     return ListenResult::StreamEnded;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.set_event_push_subscribed(false).await;
-                    return ListenResult::Error(e.into());
+                    return ListenResult::Error {
+                        error: e.into(),
+                        was_connected,
+                    };
                 }
             }
         }
     }
 
-    /// On macOS, after every (re)subscription write a "rescan" marker to the
-    /// FP event log and signal the working set. The extension answers with a
-    /// syncAnchorExpired full rescan, closing gaps from events missed while
-    /// the stream was down.
+    /// Refresh the File Provider after a remote event stream reconnects.
     #[cfg(target_os = "macos")]
     async fn record_rescan_marker(&self) {
         let (drive_id, drive_name) = {
             let config = self.config.read().await;
             (config.id.clone(), config.name.clone())
         };
-        if let Err(e) = crate::fileprovider::append_rescan_marker(&drive_id) {
-            tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP rescan marker");
+        if let Err(error) = crate::fileprovider::append_rescan_marker(&drive_id) {
+            tracing::warn!(
+                target: "drive::remote_events",
+                error = %error,
+                "Failed to record File Provider reconciliation marker"
+            );
         }
         crate::fileprovider::signal_containers(
             &crate::fileprovider::domain_identifier(&drive_id),
@@ -214,9 +227,8 @@ impl Mount {
     ) -> Result<()> {
         // On macOS the File Provider extension owns the file view; instead of
         // writing to a local replica, record the events to a shared log the
-        // extension replays from, then signal the domain's working set so the
-        // system pulls the changes. Note: for replicated extensions the
-        // system ignores signals for any container other than the working set.
+        // extension replays from, then signal the domain so the system pulls
+        // the changes.
         #[cfg(target_os = "macos")]
         {
             let _ = sync_root;
@@ -266,6 +278,16 @@ impl Mount {
                 if let Err(e) = crate::fileprovider::append_domain_events(&drive_id, &events_to_log)
                 {
                     tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP domain events");
+                } else {
+                    for event in &events_to_log {
+                        tracing::info!(
+                            target: "drive::remote_events",
+                            event_type = ?event.event_type,
+                            from = %event.from,
+                            to = %event.to,
+                            "Recorded File Provider event"
+                        );
+                    }
                 }
             }
 
@@ -355,6 +377,7 @@ impl Mount {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     async fn handle_rename_events(
         &self,
         sync_root: PathBuf,
@@ -435,6 +458,7 @@ impl Mount {
         Ok(())
     }
 
+    #[cfg(not(target_os = "macos"))]
     async fn handle_delete_events(
         &self,
         sync_root: PathBuf,
@@ -496,6 +520,7 @@ impl Mount {
         Ok(())
     }
 
+    #[cfg(not(target_os = "macos"))]
     async fn handle_create_update_events(
         &self,
         sync_root: PathBuf,
@@ -534,6 +559,7 @@ impl Mount {
         Ok(())
     }
 
+    #[cfg(not(target_os = "macos"))]
     async fn sync_last_presented_parent(
         &self,
         sync_root: PathBuf,

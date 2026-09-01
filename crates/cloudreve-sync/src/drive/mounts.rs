@@ -158,6 +158,8 @@ pub struct Mount {
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     props_refresh_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(target_os = "macos")]
+    share_poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     initial_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
@@ -271,6 +273,8 @@ impl Mount {
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
             props_refresh_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            share_poll_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
             initial_sync_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cr_client: cr_client_arc,
@@ -758,6 +762,14 @@ impl Mount {
             let _ = handle.await;
         }
 
+        // Stop the share poll task
+        #[cfg(target_os = "macos")]
+        if let Some(handle) = self.share_poll_handle.lock().await.take() {
+            tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping share poll task");
+            handle.abort();
+            let _ = handle.await;
+        }
+
         // Stop any in-progress initial sync so we don't leave partial file
         // writes or dangling API sessions when the app quits.
         if let Some(handle) = self.initial_sync_handle.lock().await.take() {
@@ -815,6 +827,118 @@ impl Mount {
         });
 
         *self.props_refresh_handle.lock().await = Some(handle);
+    }
+
+    /// Spawn the periodic share-state poll (macOS File Provider only).
+    ///
+    /// Cloudreve does not emit file events when shares are created or
+    /// removed (verified against the raw SSE stream), and the share list API
+    /// does not expose source paths, so web-UI share changes never reach the
+    /// event stream on their own. Poll the share list and, when the set of
+    /// active share IDs changes, trigger a working-set reconciliation. Share
+    /// responses omit source IDs and paths, so the exact changed item cannot
+    /// be identified safely from this endpoint.
+    #[cfg(target_os = "macos")]
+    pub async fn spawn_share_poll_task(self: &Arc<Self>) {
+        use cloudreve_api::api::share::ShareApi;
+        use cloudreve_api::models::share::ListShareService;
+
+        let mount = self.clone();
+        let mount_id = self.id.clone();
+        let drive_name = self.config.read().await.name.clone();
+        let share_state_path = dirs::home_dir().map(|home| {
+            home.join(".cloudreve").join("fp-share-state").join(format!("{mount_id}.json"))
+        });
+
+        let handle = spawn(async move {
+            let interval = Duration::from_secs(10);
+            // The first poll establishes the baseline and repairs stale share
+            // flags left behind by a previous process.
+            let mut known: Option<std::collections::BTreeMap<String, String>> = share_state_path
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|data| serde_json::from_slice(&data).ok());
+            // Let the initial SSE subscription reconciliation finish first so
+            // File Provider does not coalesce the two independent signals.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            loop {
+                let poll = async {
+                    let mut shares = std::collections::BTreeMap::new();
+                    let mut next_page_token: Option<String> = None;
+                    loop {
+                        let page = mount
+                            .cr_client
+                            .list_share_links(&ListShareService {
+                                page_size: 100,
+                                order_by: None,
+                                order_direction: None,
+                                next_page_token: next_page_token.clone(),
+                            })
+                            .await?;
+                        for share in page.shares {
+                            if !share.expired.unwrap_or(false) {
+                                shares.insert(share.id, share.name.unwrap_or_default());
+                            }
+                        }
+                        match page.pagination.next_token {
+                            Some(token) if !token.is_empty() => next_page_token = Some(token),
+                            _ => break,
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(shares)
+                }
+                .await;
+
+                let shares = match poll {
+                    Ok(shares) => shares,
+                    Err(e) => {
+                        tracing::warn!(target: "drive::mounts", id=%mount_id, error=%e, "Share state poll failed");
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                };
+
+                let changed = known.as_ref().is_none_or(|previous| previous != &shares);
+                if changed {
+                    tracing::info!(
+                        target: "drive::mounts",
+                        id=%mount_id,
+                        initial = known.is_none(),
+                        "Share set changed, refreshing cached File Provider metadata"
+                    );
+                    if let Some(previous) = &known {
+                        let mut names = std::collections::BTreeSet::new();
+                        for (id, name) in previous {
+                            if shares.get(id) != Some(name) && !name.is_empty() {
+                                names.insert(name.clone());
+                            }
+                        }
+                        for (id, name) in &shares {
+                            if previous.get(id) != Some(name) && !name.is_empty() {
+                                names.insert(name.clone());
+                            }
+                        }
+                        crate::fileprovider::signal_metadata_name_refresh(
+                            &mount_id, &drive_name, &names.into_iter().collect::<Vec<_>>());
+                    } else {
+                        crate::fileprovider::signal_metadata_refresh(&mount_id, &drive_name, &[]);
+                    }
+                }
+                known = Some(shares);
+                if let (Some(path), Some(current)) = (&share_state_path, &known) {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Ok(data) = serde_json::to_vec(current) {
+                        let _ = std::fs::write(path, data);
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+
+        *self.share_poll_handle.lock().await = Some(handle);
     }
 
     /// Refresh drive props from the API (capacity and user settings)
@@ -983,4 +1107,5 @@ mod tests {
         // Command processor handle should be cleared.
         assert!(mount.processor_handle.lock().await.is_none());
     }
+
 }

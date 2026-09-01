@@ -44,6 +44,7 @@ aes = "0.8"
 ctr = "0.9"
 tokio-util = { version = "0.7", features = ["io"] }
 globset = "0.4"
+urlencoding = "2.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.58.0"

@@ -10,7 +10,7 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use block2::RcBlock;
@@ -83,9 +83,13 @@ pub async fn user_visible_url(domain_id: &str, display_name: &str) -> Option<Str
 }
 
 /// The raw value of `NSFileProviderWorkingSetContainerItemIdentifier`.
-/// For replicated extensions this is the *only* container the system accepts
-/// in `signalEnumerator` — other container identifiers are ignored.
 pub const WORKING_SET_CONTAINER: &str = "NSFileProviderWorkingSetContainerItemIdentifier";
+
+fn canonical_fileprovider_uri(uri: &str) -> String {
+    urlencoding::decode(uri)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| uri.to_string())
+}
 
 // MARK: - Shared event log
 
@@ -99,15 +103,56 @@ pub struct FpEventRecord {
     pub ts: i64,
     #[serde(rename = "type")]
     pub event_type: String,
-    /// Path relative to the drive root, leading slash.
+    /// Relative event path, or an absolute Cloudreve URI for metadata events.
     pub from: String,
     #[serde(default)]
     pub to: String,
 }
 
+static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const MAX_EVENT_LOG_BYTES: u64 = 256 * 1024;
+
+fn trim_event_log_if_needed(path: &std::path::Path, file: std::fs::File) -> Result<()> {
+    if file.metadata()?.len() <= MAX_EVENT_LOG_BYTES {
+        return Ok(());
+    }
+    drop(file);
+    let content = std::fs::read_to_string(path)?;
+    let all: Vec<&str> = content.lines().collect();
+    let keep = &all[all.len().saturating_sub(500)..];
+    std::fs::write(path, keep.join("\n") + "\n")?;
+    Ok(())
+}
+
+fn next_event_timestamp(path: &std::path::Path) -> Result<i64> {
+    let latest = match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<FpEventRecord>(line).ok())
+            .map(|record| record.ts)
+            .unwrap_or_default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(chrono::Utc::now()
+        .timestamp_millis()
+        .max(latest.saturating_add(1)))
+}
+
 fn events_dir() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("Failed to get user home directory")?;
     Ok(home.join(".cloudreve").join("fp-events"))
+}
+
+/// Ask the next extension process to discard its local identity and pin state.
+pub fn request_local_state_reset(drive_id: &str) -> Result<()> {
+    let home = dirs::home_dir().context("Failed to get user home directory")?;
+    let dir = home.join(".cloudreve").join("fp-reset");
+    std::fs::create_dir_all(&dir)?;
+    let token = format!("{}-{}\n", chrono::Utc::now().timestamp_millis(), uuid::Uuid::new_v4());
+    std::fs::write(dir.join(format!("{drive_id}.marker")), token)?;
+    Ok(())
 }
 
 /// Append remote events to the drive's FP event log, keeping the file bounded.
@@ -116,12 +161,16 @@ pub fn append_domain_events(
     events: &[cloudreve_api::models::explorer::FileEventData],
 ) -> Result<()> {
     use std::io::Write;
+    let _guard = EVENT_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
 
     let dir = events_dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{drive_id}.jsonl"));
 
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = next_event_timestamp(&path)?;
     let mut lines = String::new();
     for (i, e) in events.iter().enumerate() {
         let record = FpEventRecord {
@@ -140,15 +189,7 @@ pub fn append_domain_events(
         .open(&path)?;
     file.write_all(lines.as_bytes())?;
 
-    // Keep the log bounded: rewrite with the tail when it grows past 256 KiB.
-    const MAX_BYTES: u64 = 256 * 1024;
-    if file.metadata()?.len() > MAX_BYTES {
-        drop(file);
-        let content = std::fs::read_to_string(&path)?;
-        let all: Vec<&str> = content.lines().collect();
-        let keep = &all[all.len().saturating_sub(500)..];
-        std::fs::write(&path, keep.join("\n") + "\n")?;
-    }
+    trim_event_log_if_needed(&path, file)?;
     Ok(())
 }
 
@@ -157,12 +198,16 @@ pub fn append_domain_events(
 /// rescan via `syncAnchorExpired`.
 pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
     use std::io::Write;
+    let _guard = EVENT_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
 
     let dir = events_dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{drive_id}.jsonl"));
     let record = FpEventRecord {
-        ts: chrono::Utc::now().timestamp_millis(),
+        ts: next_event_timestamp(&path)?,
         event_type: "rescan".to_string(),
         from: String::new(),
         to: String::new(),
@@ -172,6 +217,84 @@ pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
         .append(true)
         .open(&path)?;
     writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    trim_event_log_if_needed(&path, file)?;
+    Ok(())
+}
+
+/// Record metadata-only changes, such as a share being added or removed.
+pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<()> {
+    use std::io::Write;
+
+    if source_uris.is_empty() {
+        let _guard = EVENT_LOG_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let dir = events_dir()?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{drive_id}.jsonl"));
+        let record = FpEventRecord {
+            ts: next_event_timestamp(&path)?,
+            event_type: "metadata_rescan".to_string(),
+            from: String::new(),
+            to: String::new(),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+        trim_event_log_if_needed(&path, file)?;
+        return Ok(());
+    }
+    let _guard = EVENT_LOG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+
+    let dir = events_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{drive_id}.jsonl"));
+    let now = next_event_timestamp(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+
+    for (index, source_uri) in source_uris.iter().enumerate() {
+        let record = FpEventRecord {
+            ts: now + index as i64,
+            event_type: "metadata".to_string(),
+            from: source_uri.clone(),
+            to: String::new(),
+        };
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    }
+
+    trim_event_log_if_needed(&path, file)?;
+    Ok(())
+}
+
+/// Record share changes by filename when Cloudreve omits the source URI.
+pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<()> {
+    use std::io::Write;
+    if names.is_empty() { return Ok(()); }
+    let _guard = EVENT_LOG_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let dir = events_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{drive_id}.jsonl"));
+    let now = next_event_timestamp(&path)?;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    for (index, name) in names.iter().enumerate() {
+        let record = FpEventRecord {
+            ts: now + index as i64,
+            event_type: "metadata_name".to_string(),
+            from: name.clone(),
+            to: String::new(),
+        };
+        writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    }
+    trim_event_log_if_needed(&path, file)?;
     Ok(())
 }
 
@@ -207,6 +330,52 @@ pub fn signal_containers(domain_id: &str, display_name: &str, containers: &[Stri
     }
 }
 
+/// Refresh shared metadata in the replicated working set.
+pub fn signal_metadata_refresh(drive_id: &str, display_name: &str, source_uris: &[String]) {
+    let canonical_uris = source_uris
+        .iter()
+        .map(|uri| canonical_fileprovider_uri(uri))
+        .collect::<Vec<_>>();
+
+    if let Err(error) = append_metadata_events(drive_id, &canonical_uris) {
+        tracing::warn!(
+            target: "fileprovider",
+            error = %error,
+            "Failed to record metadata refresh"
+        );
+    }
+
+    let mut containers = vec![WORKING_SET_CONTAINER.to_string()];
+    for uri in &canonical_uris {
+        let trimmed = uri.trim_end_matches('/');
+        let parent = trimmed
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let container = if parent.is_empty() || parent == "cloudreve:" || parent == "cloudreve://my"
+        {
+            ROOT_CONTAINER.to_string()
+        } else {
+            parent.to_string()
+        };
+        if !containers.contains(&container) {
+            containers.push(container);
+        }
+    }
+
+    signal_containers(&domain_identifier(drive_id), display_name, &containers);
+}
+
+pub fn signal_metadata_name_refresh(drive_id: &str, display_name: &str, names: &[String]) {
+    if let Err(error) = append_metadata_name_events(drive_id, names) {
+        tracing::warn!(target: "fileprovider", error = %error, "Failed to record named metadata refresh");
+    }
+    signal_containers(
+        &domain_identifier(drive_id), display_name,
+        &[WORKING_SET_CONTAINER.to_string()],
+    );
+}
+
 fn describe_error(error: *mut NSError) -> anyhow::Error {
     if error.is_null() {
         return anyhow!("unknown FileProvider error");
@@ -238,7 +407,9 @@ pub async fn list_domains() -> Result<Vec<(String, String)>> {
                     let domains = unsafe { &*domains };
                     Ok(domains
                         .iter()
-                        .map(|d| unsafe { (d.identifier().to_string(), d.displayName().to_string()) })
+                        .map(|d| unsafe {
+                            (d.identifier().to_string(), d.displayName().to_string())
+                        })
                         .collect())
                 };
                 if let Some(tx) = tx.lock().unwrap().take() {
@@ -253,7 +424,8 @@ pub async fn list_domains() -> Result<Vec<(String, String)>> {
             ];
         }
     }
-    rx.await.map_err(|_| anyhow!("domain list callback dropped"))?
+    rx.await
+        .map_err(|_| anyhow!("domain list callback dropped"))?
 }
 
 /// Register a new domain. Errors if the domain already exists.
@@ -280,46 +452,51 @@ pub async fn add_domain(domain_id: &str, display_name: &str) -> Result<()> {
             ];
         }
     }
-    rx.await.map_err(|_| anyhow!("addDomain callback dropped"))?
+    rx.await
+        .map_err(|_| anyhow!("addDomain callback dropped"))?
 }
 
 /// Remove a domain. WARNING: this deletes the local replica of the domain
-/// (the folder under ~/Library/CloudStorage).
+/// (the folder under ~/Library/CloudStorage). Locally modified but not yet
+/// uploaded ("dirty") items are preserved by the system; clean downloaded
+/// content is discarded so a fresh domain cannot re-ingest stale downloads
+/// as new uploads (the legacy removeDomain API preserves downloaded data).
 pub async fn remove_domain(domain_id: &str, display_name: &str) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     {
         let domain = make_domain(domain_id, display_name);
         let tx = Mutex::new(Some(tx));
-        let block = RcBlock::new(move |error: *mut NSError| {
-            let result = if error.is_null() {
-                Ok(())
-            } else {
-                Err(describe_error(error))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        });
+        let block = RcBlock::new(
+            move |_preserved_location: *mut NSURL, error: *mut NSError| {
+                let result = if error.is_null() {
+                    Ok(())
+                } else {
+                    Err(describe_error(error))
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            },
+        );
         unsafe {
+            // NSFileProviderDomainRemovalModePreserveDirtyUserData = 1
             let _: () = msg_send![
                 class!(NSFileProviderManager),
                 removeDomain: &*domain,
+                mode: 1isize,
                 completionHandler: &*block
             ];
         }
     }
-    rx.await.map_err(|_| anyhow!("removeDomain callback dropped"))?
+    rx.await
+        .map_err(|_| anyhow!("removeDomain callback dropped"))?
 }
 
 /// Tell macOS whether the host application is available for a registered
 /// domain. Disconnecting keeps downloaded files visible, but prevents Finder
 /// from asking the extension to enumerate or mutate remote content and shows
 /// the localized reason at the top of the domain.
-async fn set_domain_connected(
-    domain_id: &str,
-    display_name: &str,
-    connected: bool,
-) -> Result<()> {
+async fn set_domain_connected(domain_id: &str, display_name: &str, connected: bool) -> Result<()> {
     let (tx, rx) = oneshot::channel();
     {
         let domain = make_domain(domain_id, display_name);
@@ -374,42 +551,6 @@ pub async fn set_domains_connected(drives: &[DriveConfig], connected: bool) {
             );
         }
     }
-}
-
-/// Remove a domain while asking macOS to preserve dirty local data.
-/// Returns the folder containing preserved data when macOS creates one.
-pub async fn remove_domain_preserving_dirty_data(
-    domain_id: &str,
-    display_name: &str,
-) -> Result<Option<String>> {
-    let (tx, rx) = oneshot::channel();
-    {
-        let domain = make_domain(domain_id, display_name);
-        let tx = Mutex::new(Some(tx));
-        let block = RcBlock::new(move |url: *mut NSURL, error: *mut NSError| {
-            let result = if !error.is_null() {
-                Err(describe_error(error))
-            } else if url.is_null() {
-                Ok(None)
-            } else {
-                Ok(unsafe { (*url).path() }.map(|path| path.to_string()))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        });
-        unsafe {
-            // NSFileProviderDomainRemovalModePreserveDirtyUserData = 1.
-            let _: () = msg_send![
-                class!(NSFileProviderManager),
-                removeDomain: &*domain,
-                mode: 1isize,
-                completionHandler: &*block
-            ];
-        }
-    }
-    rx.await
-        .map_err(|_| anyhow!("removeDomain preserving data callback dropped"))?
 }
 
 /// Lightweight status for Drive Settings. This deliberately checks only the

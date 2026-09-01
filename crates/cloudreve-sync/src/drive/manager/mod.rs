@@ -270,6 +270,8 @@ impl DriveManager {
             .spawn_remote_event_processor(mount_arc.clone())
             .await;
         mount_arc.spawn_props_refresh_task().await;
+        #[cfg(target_os = "macos")]
+        mount_arc.spawn_share_poll_task().await;
 
         // On macOS, files are served by the File Provider extension, so no
         // local sync machinery is needed here. The remote event processor

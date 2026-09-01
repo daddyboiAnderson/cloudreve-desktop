@@ -69,6 +69,8 @@ struct RemoteFile: Decodable {
     let created_at: String?
     let updated_at: String?
     let metadata: [String: String]?
+    let shared: Bool?
+    let owned: Bool?
 
     var isFolder: Bool { type == 1 }
 }
@@ -165,7 +167,7 @@ enum CloudreveError: Error, LocalizedError {
 func mapApiError(code: Int, message: String?) -> CloudreveError {
     switch code {
     case 40004: return .nameCollision  // ObjectExisted
-    case 40016: return .noSuchItem  // ParentNotExist / path not exist
+    case 40016, 40077, 40081: return .noSuchItem  // Entity/parent/target does not exist
     case 40020, 40089: return .notAuthenticated  // CredentialInvalid / SessionExpired
     default: return .api(code: code, message: message ?? "unknown")
     }
@@ -426,6 +428,16 @@ final class CloudreveClient {
             query: [URLQueryItem(name: "uri", value: uri)])
     }
 
+    /// Fetch the exact item with extended metadata so share state is included.
+    func fileInfoWithShareState(uri: String) async throws -> RemoteFile {
+        try await call(
+            "GET", "/file/info", body: nil as String?,
+            query: [
+                URLQueryItem(name: "uri", value: uri),
+                URLQueryItem(name: "extended", value: "true"),
+            ])
+    }
+
     /// Fetches the server-generated thumbnail without materializing the file.
     func thumbnail(uri: String) async throws -> Data {
         var payload: FileThumbPayload?
@@ -443,8 +455,8 @@ final class CloudreveClient {
                     "GET", "/file/thumb", body: nil as String?,
                     query: [URLQueryItem(name: "uri", value: uri)])
                 break
-            } catch CloudreveError.api(let code, let message) where code == 40077 {
-                lastError = CloudreveError.api(code: code, message: message)
+            } catch CloudreveError.noSuchItem {
+                lastError = CloudreveError.noSuchItem
             } catch {
                 throw error
             }

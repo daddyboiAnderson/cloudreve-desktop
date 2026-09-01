@@ -17,14 +17,23 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let pinned: Bool
     /// Effective state, including inheritance from a pinned folder.
     let effectivelyPinned: Bool
+    /// Whether the item has an active Cloudreve share.
+    let sharedState: Bool
+    /// Whether the current Cloudreve account owns the share.
+    let sharedByCurrentUserState: Bool
     /// Unmarked metadata version used when rebuilding the item.
     let baseMetadataVersion: Data
 
     /// Forces File Provider to notice a policy-only metadata change.
     private static let pinnedVersionMarker = Data("#kd".utf8)
+    private static let sharedVersionMarker = Data("#shared".utf8)
+    private static let sharedByCurrentUserVersionMarker = Data("#shared-owner".utf8)
     static let keepDownloadedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.keep-downloaded-v2")
+    static let sharedDecoration =
+        NSFileProviderItemDecorationIdentifier(
+            "cloudreve.desktop.dev.fileprovider.shared-v1")
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -39,7 +48,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         creationDate: Date?,
         contentModificationDate: Date?,
         pinned: Bool,
-        effectivelyPinned: Bool? = nil
+        effectivelyPinned: Bool? = nil,
+        sharedState: Bool = false,
+        sharedByCurrentUserState: Bool = false
     ) {
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parentIdentifier
@@ -50,19 +61,21 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         self.pinned = pinned
         let resolvedEffectivelyPinned = effectivelyPinned ?? pinned
         self.effectivelyPinned = resolvedEffectivelyPinned
-        // Eviction requires the capability; pinned items must not advertise it.
-        if identifier == .rootContainer {
-            self.capabilities = capabilities
-        } else if resolvedEffectivelyPinned {
-            self.capabilities = capabilities.subtracting(.allowsEvicting)
-        } else {
-            self.capabilities = capabilities.union(.allowsEvicting)
-        }
+        self.sharedState = sharedState
+        self.sharedByCurrentUserState = sharedByCurrentUserState
+        // macOS 13+ uses contentPolicy for eviction behavior.
+        self.capabilities = capabilities
         self.baseMetadataVersion = metadataVersion
-        let effectiveMetadataVersion =
-            self.effectivelyPinned
-            ? metadataVersion + Self.pinnedVersionMarker
-            : metadataVersion
+        var effectiveMetadataVersion = metadataVersion
+        if self.effectivelyPinned {
+            effectiveMetadataVersion += Self.pinnedVersionMarker
+        }
+        if self.sharedState {
+            effectiveMetadataVersion += Self.sharedVersionMarker
+        }
+        if self.sharedByCurrentUserState {
+            effectiveMetadataVersion += Self.sharedByCurrentUserVersionMarker
+        }
         self.itemVersion = NSFileProviderItemVersion(
             contentVersion: contentVersion,
             metadataVersion: effectiveMetadataVersion)
@@ -76,17 +89,29 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .inherited
     }
 
+    var isShared: Bool { sharedState }
+
+    var isSharedByCurrentUser: Bool { sharedByCurrentUserState }
+
     /// Activation-rule values for the custom actions.
     var userInfo: [AnyHashable: Any]? {
         [
             "displayKeepDownloaded": NSNumber(value: !pinned),
             "displayRemoveKeepDownloaded": NSNumber(value: pinned),
+            "displayShare": NSNumber(value: itemIdentifier != .rootContainer),
         ]
     }
 
-    /// Finder badge for effective Keep Downloaded state.
+    /// Finder decorations for Keep Downloaded and sharing state.
     var decorations: [NSFileProviderItemDecorationIdentifier]? {
-        effectivelyPinned ? [Self.keepDownloadedDecoration] : nil
+        var result: [NSFileProviderItemDecorationIdentifier] = []
+        if effectivelyPinned {
+            result.append(Self.keepDownloadedDecoration)
+        }
+        if sharedState {
+            result.append(Self.sharedDecoration)
+        }
+        return result.isEmpty ? nil : result
     }
 
     /// Copy with updated explicit and effective pin state.
@@ -104,7 +129,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             creationDate: creationDate,
             contentModificationDate: contentModificationDate,
             pinned: pinned,
-            effectivelyPinned: effectivelyPinned ?? pinned
+            effectivelyPinned: effectivelyPinned ?? pinned,
+            sharedState: sharedState,
+            sharedByCurrentUserState: sharedByCurrentUserState
         )
     }
 }

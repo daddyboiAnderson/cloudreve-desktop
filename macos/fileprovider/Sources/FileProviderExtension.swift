@@ -1,4 +1,5 @@
 import FileProvider
+import AppKit
 import OSLog
 
 /// Replicated File Provider backed by the Cloudreve API.
@@ -234,6 +235,31 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let parentURI = store.uri(for: itemTemplate.parentItemIdentifier)
                 let uri = parentURI + "/" + itemTemplate.filename
                 let isFolder = itemTemplate.contentType?.conforms(to: .folder) ?? false
+                let deleteGeneration = store.remoteDeleteGeneration(for: uri)
+
+                // macOS can replay a create callback for a locally mirrored
+                // item after a File Provider domain is removed and re-added.
+                // If that stable identity is known but the server item is
+                // gone, acknowledge the remote deletion instead of restoring
+                // it by uploading the stale local copy.
+                if store.isKnownIdentity(itemTemplate.itemIdentifier, forURI: uri) {
+                    do {
+                        let existing = try await store.client.fileInfoWithShareState(uri: uri)
+                        completionHandler(
+                            store.makeItem(
+                                existing, preservingIdentifier: itemTemplate.itemIdentifier),
+                            [], false, nil)
+                        return
+                    } catch CloudreveError.noSuchItem {
+                        store.evictCachedItems(
+                            withIdentifiers: [itemTemplate.itemIdentifier])
+                        logger.notice(
+                            "discarded stale mirrored create for remotely absent \(uri, privacy: .public)"
+                        )
+                        completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                        return
+                    }
+                }
 
                 let file: RemoteFile
                 if isFolder {
@@ -242,12 +268,55 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     // Upload files with supplied content.
                     try await store.client.uploadFile(
                         at: uri, from: contentURL, overwrite: false, progress: progress)
-                    file = try await store.client.fileInfo(uri: uri)
+                    file = try await store.client.fileInfoWithShareState(uri: uri)
                 } else {
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: false)
                 }
+
+                // A Web UI deletion can arrive while Finder is still uploading.
+                // Do not let the late upload completion recreate the deleted item.
+                if store.remoteDeleteOccurred(for: uri, after: deleteGeneration) {
+                    try? await store.client.deleteFile(uri: uri)
+                    let remoteIdentifier = store.identifier(forURI: uri)
+                    store.evictCachedItems(withIdentifiers: [
+                        itemTemplate.itemIdentifier, remoteIdentifier,
+                    ])
+                    logger.notice(
+                        "discarded local create superseded by remote delete for \(uri, privacy: .public)"
+                    )
+                    completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                    return
+                }
+
                 logger.notice("created \(uri, privacy: .public)")
                 completionHandler(store.makeItem(file), [], false, nil)
+
+                // Cloudreve can omit both lifecycle events when a new upload
+                // is deleted immediately by another client. Verify only this
+                // URI for a short window and explicitly remove Finder's copy.
+                Task {
+                    for delay in [2, 6, 22] {
+                        try? await Task.sleep(for: .seconds(delay))
+                        if Task.isCancelled { return }
+                        do {
+                            guard try await Self.itemStillInParent(
+                                store: store, uri: uri, remoteID: file.id)
+                            else { throw CloudreveError.noSuchItem }
+                        } catch CloudreveError.noSuchItem {
+                            let identifier = store.identifier(forURI: uri)
+                            store.queueStabilizationDelete(identifier)
+                            logger.notice(
+                                "queued stabilization delete for \(uri, privacy: .public)"
+                            )
+                            await store.signalWorkingSet()
+                            return
+                        } catch {
+                            logger.error(
+                                "stabilization check failed for \(uri, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                            )
+                        }
+                    }
+                }
             } catch {
                 logger.error(
                     "createItem \(itemTemplate.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
@@ -283,6 +352,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         Task {
             do {
                 var uri = store.uri(for: item.itemIdentifier)
+                let originalURI = uri
+                let deleteGeneration = store.remoteDeleteGeneration(for: originalURI)
                 var pending = changedFields
 
                 // Apply supported content, name, and parent changes.
@@ -305,8 +376,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     pending.remove(.parentItemIdentifier)
                 }
 
+                if store.remoteDeleteOccurred(
+                    for: originalURI, after: deleteGeneration)
+                {
+                    try? await store.client.deleteFile(uri: uri)
+                    store.evictCachedItems(withIdentifiers: [item.itemIdentifier])
+                    logger.notice(
+                        "discarded local modification superseded by remote delete for \(originalURI, privacy: .public)"
+                    )
+                    completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                    return
+                }
+
                 // Read back fresh metadata so the system records the new version.
-                let fresh = try await store.client.fileInfo(uri: uri)
+                let fresh = try await store.client.fileInfoWithShareState(uri: uri)
                 logger.notice("modified \(uri, privacy: .public) (fields: \(changedFields.rawValue))")
                 completionHandler(
                     store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
@@ -341,7 +424,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         Task {
             do {
                 try await store.client.deleteFile(uri: store.uri(for: identifier))
+                store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice("deleted \(identifier.rawValue, privacy: .public)")
+                completionHandler(nil)
+            } catch CloudreveError.noSuchItem {
+                // Deletes are idempotent. Finder may retain an item after it
+                // was already removed remotely; acknowledge that state so
+                // the stale local replica is discarded instead of re-uploaded.
+                store.evictCachedItems(withIdentifiers: [identifier])
+                logger.notice(
+                    "delete acknowledged for already absent \(identifier.rawValue, privacy: .public)"
+                )
                 completionHandler(nil)
             } catch {
                 logger.error(
@@ -353,20 +446,89 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         return Progress()
     }
 
-    // MARK: - Custom actions ("Keep Downloaded")
+    // MARK: - Custom actions
 
     private static let keepDownloadedAction =
         "cloudreve.desktop.dev.fileprovider.KeepDownloaded"
     private static let removeKeepDownloadedAction =
         "cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded"
+    private static let shareAction =
+        "cloudreve.desktop.dev.fileprovider.Share"
 
-    /// Handles the Keep Downloaded custom actions.
+    /// Handles Finder actions and forwards Share targets to the main app.
     func performAction(
         identifier actionIdentifier: NSFileProviderExtensionActionIdentifier,
         onItemsWithIdentifiers itemIdentifiers: [NSFileProviderItemIdentifier],
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+
+        if actionIdentifier.rawValue == Self.shareAction {
+            guard let store else {
+                completionHandler(unavailableError)
+                return progress
+            }
+            guard itemIdentifiers.count == 1 else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSUserCancelledError,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Select one file or folder to share."
+                        ]))
+                return progress
+            }
+
+            let identifier = itemIdentifiers[0]
+            guard identifier != .rootContainer else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFeatureUnsupportedError,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "The drive root cannot be shared."
+                        ]))
+                return progress
+            }
+
+            var components = URLComponents()
+            components.scheme = "cloudreve"
+            components.host = "share"
+            components.queryItems = [
+                URLQueryItem(name: "drive_id", value: store.drive.id),
+                URLQueryItem(name: "uri", value: store.uri(for: identifier)),
+            ]
+            guard let url = components.url else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSURLErrorBadURL,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Could not create a Share URL."
+                        ]))
+                return progress
+            }
+
+            guard NSWorkspace.shared.open(url) else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFeatureUnsupportedError,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Cloudreve is not available to open Share."
+                        ]))
+                return progress
+            }
+
+            progress.completedUnitCount = 1
+            completionHandler(nil)
+            return progress
+        }
+
         let pin: Bool
         switch actionIdentifier.rawValue {
         case Self.keepDownloadedAction: pin = true
@@ -386,16 +548,26 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             return progress
         }
 
+        // Update the desired state immediately so a newer opposite action can
+        // stop an older download or eviction while it is still running.
+        for identifier in itemIdentifiers {
+            store.setPinned(pin, for: identifier)
+        }
+
         let task = Task {
             var firstError: Error?
             for identifier in itemIdentifiers {
                 if Task.isCancelled || progress.isCancelled {
-                    completionHandler(CocoaError(.userCancelled))
-                    return
+                    firstError = CocoaError(.userCancelled)
+                    break
                 }
                 do {
-                    try await setPinned(
-                        pin, for: identifier, store: store, manager: manager)
+                    let item = try await store.refreshItem(
+                        for: identifier, displayName: domain.displayName)
+                    await store.withActionLock {
+                        await setPinned(
+                            pin, for: identifier, item: item, store: store, manager: manager)
+                    }
                 } catch {
                     logger.error(
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
@@ -404,22 +576,23 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 }
                 progress.completedUnitCount += 1
             }
+            logger.notice(
+                "completed \(actionIdentifier.rawValue, privacy: .public) for \(itemIdentifiers.count) item(s)"
+            )
             completionHandler(firstError)
         }
         progress.cancellationHandler = { task.cancel() }
         return progress
     }
 
-    /// Persist the pin, refresh working-set metadata, and materialize or evict content.
+    /// Refresh working-set metadata and materialize or evict content.
     private func setPinned(
         _ pin: Bool,
         for identifier: NSFileProviderItemIdentifier,
+        item: FileProviderItem,
         store: RemoteStore,
         manager: NSFileProviderManager
-    ) async throws {
-        let item = try await store.item(
-            for: identifier, displayName: domain.displayName)
-        store.setPinned(pin, for: identifier)
+    ) async {
         let isFolder =
             identifier == .rootContainer || item.contentType.conforms(to: .folder)
 
@@ -448,7 +621,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         } else if pin && isFolder {
             // File Provider does not recursively materialize directories.
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
             let files = descendants.filter {
                 !$0.contentType.conforms(to: .folder)
             }
@@ -470,8 +642,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         } else if !pin {
             // Inherited policy permits eviction but does not remove existing content.
-            try? await Task.sleep(nanoseconds: 500_000_000)
-
             let files: [NSFileProviderItemIdentifier]
             if isFolder {
                 // File Provider does not reliably evict provider folders recursively.
@@ -511,13 +681,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
             if !failedEvictions.isEmpty {
                 let identifiers = failedEvictions.prefix(3).map(\.rawValue).joined(separator: ", ")
-                throw NSError(
-                    domain: "CloudreveFileProvider",
-                    code: NSFileWriteUnknownError,
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "Could not remove downloaded content for: \(identifiers.isEmpty ? identifier.rawValue : identifiers)"
-                    ])
+                logger.notice(
+                    "deferring eviction while downloads settle for \(identifiers, privacy: .public)"
+                )
+                store.retryEvictionsWhenUnpinned(failedEvictions, manager: manager)
             }
         }
         logger.notice(
@@ -563,6 +730,19 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if u.hasSuffix("/") { u.removeLast() }
         guard let idx = u.lastIndex(of: "/") else { return u }
         return String(u[..<idx])
+    }
+
+    private static func itemStillInParent(
+        store: RemoteStore, uri: String, remoteID: String
+    ) async throws -> Bool {
+        let parent = parentURI(of: uri)
+        var page: String?
+        repeat {
+            let result = try await store.client.listDirectory(uri: parent, page: page)
+            if result.files.contains(where: { $0.id == remoteID }) { return true }
+            page = result.nextPage
+        } while page != nil
+        return false
     }
 
     // MARK: - Enumeration

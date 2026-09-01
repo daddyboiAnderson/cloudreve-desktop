@@ -258,7 +258,7 @@ mod tests {
         ];
         let matcher = IgnoreMatcher::new(&patterns, sync_root.clone()).unwrap();
 
-        assert_eq!(matcher.len(), 4); // 1 user pattern + 3 default office temp patterns
+        assert_eq!(matcher.len(), 6); // 1 user pattern + 5 built-in patterns
         assert!(matcher.is_match(test_path("file.tmp")));
         assert!(!matcher.is_match(test_path("file.txt")));
     }
