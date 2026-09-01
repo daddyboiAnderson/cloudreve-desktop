@@ -47,7 +47,7 @@ swiftc -swift-version 5 \
     -sdk "$SDK" \
     -application-extension \
     "${OPT_FLAGS[@]}" \
-    -framework Foundation -framework FileProvider -framework UniformTypeIdentifiers \
+    -framework Foundation -framework AppKit -framework FileProvider -framework UniformTypeIdentifiers \
     -Xlinker -e -Xlinker _NSExtensionMain \
     -o "$APPEX/Contents/MacOS/CloudreveFileProvider" \
     "$SRC_DIR"/*.swift
@@ -56,6 +56,8 @@ echo "==> Assembling bundle"
 cp "$SUPPORT_DIR/Info.plist" "$APPEX/Contents/Info.plist"
 cp "$ROOT/src-tauri/icons/icon.icns" "$APPEX/Contents/Resources/Cloudreve.icns"
 bash "$ROOT/macos/scripts/build-keep-downloaded-badge.sh" \
+    "$APPEX/Contents/Resources"
+bash "$ROOT/macos/scripts/build-shared-badge.sh" \
     "$APPEX/Contents/Resources"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$APPEX/Contents/Info.plist"

@@ -52,6 +52,16 @@
 				<key>Label</key>
 				<string>Keep Downloaded</string>
 			</dict>
+			<dict>
+				<key>Identifier</key>
+				<string>cloudreve.desktop.dev.fileprovider.shared-v1</string>
+				<key>BadgeImageType</key>
+				<string>cloudreve.desktop.dev.fileprovider.decoration.shared-v1</string>
+				<key>Category</key>
+				<string>Sharing</string>
+				<key>Label</key>
+				<string>Shared</string>
+			</dict>
 		</array>
 		<key>NSExtensionFileProviderActions</key>
 		<array>
@@ -70,6 +80,14 @@
 				<string>cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Remove Keep Downloaded</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>fileproviderItems.@count == 1 AND SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayShare == true ).@count == 1</string>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>cloudreve.desktop.dev.fileprovider.Share</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Share</string>
 			</dict>
 		</array>
 		<key>NSExtensionPointIdentifier</key>

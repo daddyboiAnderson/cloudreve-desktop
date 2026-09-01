@@ -27,6 +27,8 @@ echo "==> Embedding extension"
 cp -R "$BUILD_DIR/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
 cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/KeepDownloaded.icns" \
     "$APP/Contents/Resources/KeepDownloaded.icns"
+cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/Shared.icns" \
+    "$APP/Contents/Resources/Shared.icns"
 
 echo "==> Signing app bundle"
 codesign --force --sign - --timestamp=none "$APP"

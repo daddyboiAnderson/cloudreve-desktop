@@ -34,39 +34,54 @@ mkdir -p "$APP/Contents/PlugIns"
 rm -rf "$APP/Contents/PlugIns/CloudreveFileProvider.appex"
 cp -R "$ROOT/macos/build/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
 
-# Export the badge UTI from the host app so Launch Services can resolve it.
-# The extension keeps its own copy for standalone builds.
-BADGE_RESOURCE="$APP/Contents/PlugIns/CloudreveFileProvider.appex/Contents/Resources/KeepDownloaded.icns"
-if [[ ! -f "$BADGE_RESOURCE" ]]; then
-    echo "error: Keep Downloaded badge resource was not built" >&2
-    exit 1
-fi
-cp "$BADGE_RESOURCE" "$APP/Contents/Resources/KeepDownloaded.icns"
-
-BADGE_UTI="cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2"
-if /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
-    "$APP/Contents/Info.plist" >/dev/null 2>&1; then
-    if ! /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
-        "$APP/Contents/Info.plist" | grep -Fq "$BADGE_UTI"; then
-        echo "error: app Info.plist already has UTI declarations; cannot add $BADGE_UTI safely" >&2
+for resource in KeepDownloaded.icns Shared.icns; do
+    badge_resource="$APP/Contents/PlugIns/CloudreveFileProvider.appex/Contents/Resources/$resource"
+    if [[ ! -f "$badge_resource" ]]; then
+        echo "error: $resource was not built" >&2
         exit 1
     fi
-else
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations array" \
+    cp "$badge_resource" "$APP/Contents/Resources/$resource"
+done
+
+ensure_exported_uti() {
+    local uti="$1"
+    local description="$2"
+    local icon="$3"
+    local index=0
+
+    if ! /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
+        "$APP/Contents/Info.plist" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations array" \
+            "$APP/Contents/Info.plist"
+    fi
+    if /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations" \
+        "$APP/Contents/Info.plist" | grep -Fq "$uti"; then
+        return
+    fi
+    while /usr/libexec/PlistBuddy -c "Print :UTExportedTypeDeclarations:$index" \
+        "$APP/Contents/Info.plist" >/dev/null 2>&1; do
+        index=$((index + 1))
+    done
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index dict" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0 dict" \
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index:UTTypeIdentifier string $uti" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIdentifier string $BADGE_UTI" \
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index:UTTypeDescription string $description" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeDescription string Cloudreve Keep Downloaded badge" \
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index:UTTypeConformsTo array" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo array" \
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index:UTTypeConformsTo:0 string com.apple.icon-decoration.badge" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeConformsTo:0 string com.apple.icon-decoration.badge" \
+    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:$index:UTTypeIconFile string $icon" \
         "$APP/Contents/Info.plist"
-    /usr/libexec/PlistBuddy -c "Add :UTExportedTypeDeclarations:0:UTTypeIconFile string KeepDownloaded.icns" \
-        "$APP/Contents/Info.plist"
-fi
+}
+
+ensure_exported_uti \
+    "cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2" \
+    "Cloudreve Keep Downloaded badge" KeepDownloaded.icns
+ensure_exported_uti \
+    "cloudreve.desktop.dev.fileprovider.decoration.shared-v1" \
+    "Cloudreve Shared badge" Shared.icns
 
 echo "==> Setting app and extension version to $SHORT_VERSION ($BUILD_NUMBER)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"

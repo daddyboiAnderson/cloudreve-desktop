@@ -36,6 +36,18 @@
 			<key>UTTypeIdentifier</key>
 			<string>cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2</string>
 		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.icon-decoration.badge</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Cloudreve Shared badge</string>
+			<key>UTTypeIconFile</key>
+			<string>Shared.icns</string>
+			<key>UTTypeIdentifier</key>
+			<string>cloudreve.desktop.dev.fileprovider.decoration.shared-v1</string>
+		</dict>
 	</array>
 </dict>
 </plist>
