@@ -117,14 +117,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     where error.code == .syncAnchorExpired
                         && containerIdentifier == .workingSet
                 {
-                    // A rescan marker invalidated the anchor: events may have
-                    // been missed while the stream was down. Items that vanish
-                    // from a plain working-set re-enumeration are not removed
-                    // by the system, so reconcile against the server and
-                    // deliver the delta — including deletions — explicitly.
+                    // Reconcile the working set after a missed event window.
                     logger.notice("anchor expired; reconciling working set with the server")
-                    // Do not acknowledge events that arrive while the server
-                    // reconciliation is running; the next request must replay them.
+                    // Preserve events received during reconciliation for the next pass.
                     let reconciliationAnchor = store.currentSyncAnchor()
                     logger.notice(
                         "reconciliation captured anchor \(String(data: reconciliationAnchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"
