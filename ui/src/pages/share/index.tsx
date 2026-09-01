@@ -114,7 +114,7 @@ interface SelectedPerson {
 
 interface FooterNotice {
   message: string;
-  severity: "success" | "info";
+  severity: "success" | "error";
   action?: "undo";
 }
 
@@ -318,6 +318,7 @@ export default function Share() {
   const [deletingShareId, setDeletingShareId] = useState<string | null>(null);
   const [pendingDeletion, setPendingDeletion] = useState<PendingDeletion | null>(null);
   const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deleteInFlightRef = useRef<Promise<boolean> | null>(null);
   const [error, setError] = useState("");
 
   const expirationOptions = useMemo(() => {
@@ -668,30 +669,41 @@ export default function Share() {
     });
   };
 
-  const completeDelete = async (pending: PendingDeletion) => {
-    let deleted = false;
-    setPendingDeletion(null);
-    try {
-      await invoke("delete_share_link", {
-        driveId: pending.driveId,
-        shareId: pending.share.id,
-      });
-      deleted = true;
-      if (editingShareId === pending.share.id) resetForm();
-      const refreshed = await invoke<ShareTarget>("get_share_target", {
-        driveId: pending.driveId,
-        uri: pending.uri,
-      });
-      setTarget(refreshed);
-      setFooterNotice(null);
-    } catch (deleteError) {
-      if (!deleted) restorePendingDeletion(pending);
-      setError(String(deleteError));
-      if (deleted) setFooterNotice(null);
-    } finally {
+  const completeDelete = (pending: PendingDeletion): Promise<boolean> => {
+    if (deleteInFlightRef.current) return deleteInFlightRef.current;
+
+    const operation = (async () => {
+      let deleted = false;
       setPendingDeletion(null);
-      setDeletingShareId(null);
-    }
+      try {
+        await invoke("delete_share_link", {
+          driveId: pending.driveId,
+          shareId: pending.share.id,
+        });
+        deleted = true;
+        if (editingShareId === pending.share.id) resetForm();
+        const refreshed = await invoke<ShareTarget>("get_share_target", {
+          driveId: pending.driveId,
+          uri: pending.uri,
+        });
+        setTarget(refreshed);
+        setFooterNotice(null);
+      } catch (deleteError) {
+        if (!deleted) restorePendingDeletion(pending);
+        setError(String(deleteError));
+        if (deleted) setFooterNotice(null);
+      } finally {
+        setPendingDeletion(null);
+        setDeletingShareId(null);
+      }
+      return deleted;
+    })();
+
+    deleteInFlightRef.current = operation;
+    operation.finally(() => {
+      if (deleteInFlightRef.current === operation) deleteInFlightRef.current = null;
+    }).catch(() => undefined);
+    return operation;
   };
 
   const handleDelete = (share: ShareLink) => {
@@ -706,7 +718,7 @@ export default function Share() {
     setPendingDeletion(pending);
     setDeletingShareId(share.id);
     clearFooterNoticeTimer();
-    setFooterNotice({ message: "Share link deleted", severity: "info", action: "undo" });
+    setFooterNotice({ message: "Share link deleted", severity: "error", action: "undo" });
     setTarget((current) => {
       if (!current || current.drive_id !== pending.driveId || current.uri !== pending.uri) {
         return current;
@@ -732,7 +744,12 @@ export default function Share() {
     showFooterNotice({ message: "Share link restored", severity: "success" });
   };
 
-  const closeWindow = () => {
+  const closeWindow = async () => {
+    clearDeleteTimer();
+    const pending = pendingDeletion;
+    const deletion = pending ? completeDelete(pending) : deleteInFlightRef.current;
+    if (deletion && !(await deletion)) return;
+
     getCurrentWindow().close().catch((closeError) => setError(String(closeError)));
   };
 
@@ -1407,6 +1424,42 @@ export default function Share() {
                   py: 0.25,
                   px: 1,
                   boxShadow: "none",
+                  backgroundColor: (theme) =>
+                    footerNotice.severity === "error"
+                      ? theme.palette.mode === "dark"
+                        ? "rgba(244, 67, 54, 0.24)"
+                        : "#ffebee"
+                      : theme.palette.mode === "dark"
+                        ? "rgba(76, 175, 80, 0.28)"
+                        : "#edf7ed",
+                  color: (theme) =>
+                    footerNotice.severity === "error"
+                      ? theme.palette.mode === "dark"
+                        ? "#ffb4ab"
+                        : "#b71c1c"
+                      : theme.palette.mode === "dark"
+                        ? "#b7f5b9"
+                        : "#205b29",
+                  "& .MuiAlert-icon": {
+                    color: (theme) =>
+                      footerNotice.severity === "error"
+                        ? theme.palette.mode === "dark"
+                          ? "#ff8a80"
+                          : "#d32f2f"
+                        : theme.palette.mode === "dark"
+                          ? "#7ee787"
+                          : "#388e3c",
+                  },
+                  "& .MuiButton-root": {
+                    color: (theme) =>
+                      footerNotice.severity === "error"
+                        ? theme.palette.mode === "dark"
+                          ? "#ffb4ab"
+                          : "#b71c1c"
+                        : theme.palette.mode === "dark"
+                          ? "#b7f5b9"
+                          : "#205b29",
+                  },
                   "& .MuiAlert-message": {
                     minWidth: 0,
                     overflow: "hidden",

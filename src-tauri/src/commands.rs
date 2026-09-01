@@ -1386,7 +1386,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         .decorations(false)
         .minimizable(false);
 
-    #[cfg(windows)]
+    #[cfg(any(target_os = "macos", windows))]
     let builder = builder.transparent(true);
 
     // Platform-specific: title_bar_style and hidden_title are macOS-only.

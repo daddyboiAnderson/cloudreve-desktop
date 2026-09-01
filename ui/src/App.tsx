@@ -70,7 +70,9 @@ function App() {
     platformType() === "macos" &&
     (window.location.hash.startsWith("#/popup") ||
       window.location.hash.startsWith("#/share") ||
-      window.location.hash.startsWith("#/settings"));
+      window.location.hash.startsWith("#/settings") ||
+      window.location.hash.startsWith("#/add-drive") ||
+      window.location.hash.startsWith("#/reauthorize"));
   const theme = useMemo(
     () => createAppTheme(darkMode ? "dark" : "light"),
     [darkMode]
