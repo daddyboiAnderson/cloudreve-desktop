@@ -547,6 +547,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             completionHandler(unavailableError)
             return progress
         }
+        if pin {
+            progress.kind = .file
+            progress.fileOperationKind = .downloading
+            progress.fileTotalCount = itemIdentifiers.count
+            progress.fileCompletedCount = 0
+        }
+        let itemProgresses: [Progress]
+        if itemIdentifiers.count == 1 {
+            itemProgresses = [progress]
+        } else {
+            itemProgresses = itemIdentifiers.map { _ in Progress(totalUnitCount: 1) }
+            for itemProgress in itemProgresses {
+                progress.addChild(itemProgress, withPendingUnitCount: 1)
+            }
+        }
 
         // Update the desired state immediately so a newer opposite action can
         // stop an older download or eviction while it is still running.
@@ -556,7 +571,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
         let task = Task {
             var firstError: Error?
-            for identifier in itemIdentifiers {
+            for (index, identifier) in itemIdentifiers.enumerated() {
                 if Task.isCancelled || progress.isCancelled {
                     firstError = CocoaError(.userCancelled)
                     break
@@ -566,15 +581,19 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         for: identifier, displayName: domain.displayName)
                     await store.withActionLock {
                         await setPinned(
-                            pin, for: identifier, item: item, store: store, manager: manager)
+                            pin, for: identifier, item: item, store: store, manager: manager,
+                            progress: itemProgresses[index])
                     }
                 } catch {
                     logger.error(
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                     )
                     firstError = firstError ?? error
+                    if !Task.isCancelled {
+                        itemProgresses[index].completedUnitCount =
+                            itemProgresses[index].totalUnitCount
+                    }
                 }
-                progress.completedUnitCount += 1
             }
             logger.notice(
                 "completed \(actionIdentifier.rawValue, privacy: .public) for \(itemIdentifiers.count) item(s)"
@@ -591,14 +610,48 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         for identifier: NSFileProviderItemIdentifier,
         item: FileProviderItem,
         store: RemoteStore,
-        manager: NSFileProviderManager
+        manager: NSFileProviderManager,
+        progress: Progress
     ) async {
         let isFolder =
             identifier == .rootContainer || item.contentType.conforms(to: .folder)
 
+        var publishedProgress = false
+        if pin && isFolder && identifier != .rootContainer {
+            do {
+                progress.fileURL = try await manager.getUserVisibleURL(for: identifier)
+                progress.publish()
+                publishedProgress = true
+            } catch {
+                logger.notice(
+                    "could not publish folder progress for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+        defer {
+            if publishedProgress {
+                progress.unpublish()
+            }
+        }
+
         var descendants: [FileProviderItem] = []
         if isFolder {
             descendants = await listSubtree(of: identifier, store: store)
+        }
+
+        let descendantFiles = descendants.filter {
+            !$0.contentType.conforms(to: .folder)
+        }
+        if isFolder && pin {
+            let expectedBytes = descendantFiles.reduce(Int64(0)) {
+                $0 + max($1.documentSize?.int64Value ?? 0, 1)
+            }
+            progress.totalUnitCount = max(expectedBytes, 1)
+            progress.fileTotalCount = max(descendantFiles.count, 1)
+            progress.fileCompletedCount = 0
+        } else if pin {
+            progress.fileTotalCount = 1
+            progress.fileCompletedCount = 0
         }
 
         // Queue the selected item and folder descendants for re-enumeration.
@@ -618,34 +671,40 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             // Use the same path as Finder's Download Now action.
             if store.isEffectivelyPinned(identifier, uri: store.uri(for: identifier)) {
                 _ = await store.requestDownloadWhenKnown(identifier, manager: manager)
+                progress.fileCompletedCount = progress.fileTotalCount
             }
         } else if pin && isFolder {
-            // File Provider does not recursively materialize directories.
-            let files = descendants.filter {
-                !$0.contentType.conforms(to: .folder)
+            if identifier != .rootContainer {
+                _ = await store.requestDownloadWhenKnown(identifier, manager: manager)
             }
-            for start in stride(from: 0, to: files.count, by: 8) {
+            // File Provider does not recursively materialize directories.
+            for start in stride(from: 0, to: descendantFiles.count, by: 8) {
                 if Task.isCancelled { return }
-                let end = min(start + 8, files.count)
-                await withTaskGroup(of: Void.self) { group in
-                    for descendant in files[start..<end] {
+                let end = min(start + 8, descendantFiles.count)
+                await withTaskGroup(of: Bool.self) { group in
+                    for descendant in descendantFiles[start..<end] {
                         group.addTask {
                             guard store.isEffectivelyPinned(
                                 descendant.itemIdentifier,
                                 uri: store.uri(for: descendant.itemIdentifier)
-                            ) else { return }
-                            _ = await store.requestDownloadWhenKnown(
+                            ) else { return true }
+                            return await store.requestDownloadWhenKnown(
                                 descendant.itemIdentifier, manager: manager)
                         }
                     }
+                    await group.waitForAll()
                 }
             }
+            await trackFolderDownloads(
+                below: identifier, manager: manager, progress: progress)
+            progress.completedUnitCount = progress.totalUnitCount
+            progress.fileCompletedCount = progress.fileTotalCount
         } else if !pin {
             // Inherited policy permits eviction but does not remove existing content.
-            let files: [NSFileProviderItemIdentifier]
+            let filesToEvict: [NSFileProviderItemIdentifier]
             if isFolder {
                 // File Provider does not reliably evict provider folders recursively.
-                files = descendants.compactMap { descendant in
+                filesToEvict = descendants.compactMap { descendant in
                     guard !descendant.contentType.conforms(to: .folder) else {
                         return nil
                     }
@@ -656,16 +715,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 }
             } else {
                 let selectedURI = store.uri(for: identifier)
-                files = store.isEffectivelyPinned(identifier, uri: selectedURI)
+                filesToEvict = store.isEffectivelyPinned(identifier, uri: selectedURI)
                     ? [] : [identifier]
+            }
+            progress.totalUnitCount = max(Int64(filesToEvict.count), 1)
+            if filesToEvict.isEmpty {
+                progress.completedUnitCount = progress.totalUnitCount
             }
 
             var failedEvictions: [NSFileProviderItemIdentifier] = []
-            for start in stride(from: 0, to: files.count, by: 8) {
+            for start in stride(from: 0, to: filesToEvict.count, by: 8) {
                 if Task.isCancelled { return }
-                let end = min(start + 8, files.count)
+                let end = min(start + 8, filesToEvict.count)
                 await withTaskGroup(of: (NSFileProviderItemIdentifier, Bool).self) { group in
-                    for fileIdentifier in files[start..<end] {
+                    for fileIdentifier in filesToEvict[start..<end] {
                         group.addTask {
                             let success = await store.evictWhenAllowed(
                                 fileIdentifier, manager: manager)
@@ -673,6 +736,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         }
                     }
                     for await (fileIdentifier, success) in group {
+                        progress.completedUnitCount += 1
                         if !success {
                             failedEvictions.append(fileIdentifier)
                         }
@@ -687,8 +751,64 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 store.retryEvictionsWhenUnpinned(failedEvictions, manager: manager)
             }
         }
+        if descendantFiles.isEmpty || !isFolder {
+            progress.completedUnitCount = progress.totalUnitCount
+            if pin {
+                progress.fileCompletedCount = progress.fileTotalCount
+            }
+        }
         logger.notice(
             "\(pin ? "pinned" : "unpinned", privacy: .public) \(identifier.rawValue, privacy: .public)"
+        )
+    }
+
+    /// Mirror File Provider's actual download progress onto a folder.
+    private func trackFolderDownloads(
+        below identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager,
+        progress: Progress
+    ) async {
+        let systemProgress = manager.globalProgress(for: .downloading)
+        let activityDeadline = Date().addingTimeInterval(1.5)
+        var sawActivity = false
+        var idleSince: Date?
+
+        while !Task.isCancelled && !progress.isCancelled {
+            let total = systemProgress.totalUnitCount
+            let completed = systemProgress.completedUnitCount
+            let isActive = total > 0 && completed < total
+
+            if isActive {
+                if !sawActivity {
+                    logger.notice(
+                        "tracking folder downloads below \(identifier.rawValue, privacy: .public)"
+                    )
+                }
+                sawActivity = true
+                idleSince = nil
+                progress.totalUnitCount = max(total, 1)
+                progress.completedUnitCount = min(completed, total)
+                if let totalFiles = systemProgress.fileTotalCount {
+                    progress.fileTotalCount = totalFiles
+                }
+                if let completedFiles = systemProgress.fileCompletedCount {
+                    progress.fileCompletedCount = completedFiles
+                }
+            } else if sawActivity {
+                if let idleSince {
+                    if Date().timeIntervalSince(idleSince) >= 0.3 { break }
+                } else {
+                    idleSince = Date()
+                }
+            } else if Date() >= activityDeadline {
+                break
+            }
+
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        logger.notice(
+            "folder downloads settled below \(identifier.rawValue, privacy: .public)"
         )
     }
 
