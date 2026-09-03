@@ -21,6 +21,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let sharedState: Bool
     /// Whether the current Cloudreve account owns the share.
     let sharedByCurrentUserState: Bool
+    let remoteID: String?
+    let remoteURI: String?
     /// Unmarked metadata version used when rebuilding the item.
     let baseMetadataVersion: Data
 
@@ -50,7 +52,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         pinned: Bool,
         effectivelyPinned: Bool? = nil,
         sharedState: Bool = false,
-        sharedByCurrentUserState: Bool = false
+        sharedByCurrentUserState: Bool = false,
+        remoteID: String? = nil,
+        remoteURI: String? = nil
     ) {
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parentIdentifier
@@ -63,6 +67,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         self.effectivelyPinned = resolvedEffectivelyPinned
         self.sharedState = sharedState
         self.sharedByCurrentUserState = sharedByCurrentUserState
+        self.remoteID = remoteID
+        self.remoteURI = remoteURI
         // macOS 13+ uses contentPolicy for eviction behavior.
         self.capabilities = capabilities
         self.baseMetadataVersion = metadataVersion
@@ -98,6 +104,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         [
             "displayKeepDownloaded": NSNumber(value: !pinned),
             "displayRemoveKeepDownloaded": NSNumber(value: pinned),
+            "displayOpenInBrowser": NSNumber(value: true),
             "displayShare": NSNumber(value: itemIdentifier != .rootContainer),
         ]
     }
@@ -131,7 +138,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             pinned: pinned,
             effectivelyPinned: effectivelyPinned ?? pinned,
             sharedState: sharedState,
-            sharedByCurrentUserState: sharedByCurrentUserState
+            sharedByCurrentUserState: sharedByCurrentUserState,
+            remoteID: remoteID,
+            remoteURI: remoteURI
         )
     }
 }

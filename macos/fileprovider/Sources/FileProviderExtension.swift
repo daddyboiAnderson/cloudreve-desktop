@@ -454,6 +454,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         "cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded"
     private static let shareAction =
         "cloudreve.desktop.dev.fileprovider.Share"
+    private static let openInBrowserAction =
+        "cloudreve.desktop.dev.fileprovider.OpenInBrowser"
 
     /// Handles Finder actions and forwards Share targets to the main app.
     func performAction(
@@ -462,6 +464,59 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+
+        if actionIdentifier.rawValue == Self.openInBrowserAction {
+            guard let store else {
+                completionHandler(unavailableError)
+                return progress
+            }
+            guard itemIdentifiers.count == 1 else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSUserCancelledError,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Select one file or folder to open in the browser."
+                        ]))
+                return progress
+            }
+
+            let identifier = itemIdentifiers[0]
+            let task = Task {
+                do {
+                    let item = try await store.item(
+                        for: identifier, displayName: domain.displayName, refreshIfStale: true)
+                    guard let url = store.browserURL(for: identifier, item: item) else {
+                        throw NSError(
+                            domain: NSURLErrorDomain,
+                            code: NSURLErrorBadURL,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Could not create the Cloudreve browser URL."
+                            ])
+                    }
+                    guard NSWorkspace.shared.open(url) else {
+                        throw NSError(
+                            domain: NSCocoaErrorDomain,
+                            code: NSFeatureUnsupportedError,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Could not open the default browser."
+                            ])
+                    }
+                    progress.completedUnitCount = 1
+                    completionHandler(nil)
+                } catch {
+                    logger.error(
+                        "OpenInBrowser failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                    completionHandler(error)
+                }
+            }
+            progress.cancellationHandler = { task.cancel() }
+            return progress
+        }
 
         if actionIdentifier.rawValue == Self.shareAction {
             guard let store else {

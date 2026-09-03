@@ -18,6 +18,7 @@ struct DriveConfig: Codable {
     var instance_url: String
     /// Drive root URI, e.g. "cloudreve://my/h"
     var remote_path: String
+    var user_id: String?
     var enabled: Bool
     var credentials: Credentials
 }

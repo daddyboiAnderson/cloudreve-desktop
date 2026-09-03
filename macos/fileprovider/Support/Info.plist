@@ -67,6 +67,14 @@
 		<array>
 			<dict>
 				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>fileproviderItems.@count == 1</string>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>cloudreve.desktop.dev.fileprovider.OpenInBrowser</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>View Online</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayKeepDownloaded == true ).@count &gt; 0</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
 				<string>cloudreve.desktop.dev.fileprovider.KeepDownloaded</string>

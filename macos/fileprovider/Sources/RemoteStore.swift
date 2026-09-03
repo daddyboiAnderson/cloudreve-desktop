@@ -1088,8 +1088,9 @@ final class RemoteStore {
         let canonicalIdentifier = Self.canonicalIdentifier(identifier.rawValue)
         cacheLock.lock()
         let mapped = uriByIdentifier[canonicalIdentifier]
+        let cached = cache[canonicalIdentifier]?.remoteURI
         cacheLock.unlock()
-        return mapped ?? Self.uri(fromPath: canonicalIdentifier)
+        return mapped ?? cached ?? Self.uri(fromPath: canonicalIdentifier)
     }
 
     /// Whether Finder is referring to an item identity we have already seen
@@ -1214,7 +1215,9 @@ final class RemoteStore {
             pinned: isPinned(identifier),
             effectivelyPinned: isEffectivelyPinned(identifier, uri: filePath),
             sharedState: file.shared ?? false,
-            sharedByCurrentUserState: file.shared == true && file.owned == true
+            sharedByCurrentUserState: file.shared == true && file.owned == true,
+            remoteID: file.id,
+            remoteURI: filePath
         )
         cacheLock.lock()
         cache[identifier.rawValue] = item
@@ -1381,7 +1384,8 @@ final class RemoteStore {
             metadataVersion: Data("root".utf8),
             creationDate: nil,
             contentModificationDate: nil,
-            pinned: isPinned(.rootContainer)
+            pinned: isPinned(.rootContainer),
+            remoteURI: drive.remote_path
         )
     }
 
@@ -1448,6 +1452,26 @@ final class RemoteStore {
         logger.debug(
             "metadata cache miss for \(identifier.rawValue, privacy: .public)")
         return try await refreshItem(for: identifier, displayName: displayName)
+    }
+
+    func browserURL(
+        for identifier: NSFileProviderItemIdentifier, item: FileProviderItem
+    ) -> URL? {
+        let itemURI = item.remoteURI ?? uri(for: identifier)
+        let isFolder = item.contentType.conforms(to: .folder)
+        let folderURI = isFolder ? itemURI : parentPath(of: itemURI)
+        guard var components = URLComponents(string: drive.instance_url) else { return nil }
+        components.path = "/home"
+        var queryItems = [URLQueryItem(name: "path", value: folderURI)]
+        if !isFolder {
+            queryItems.append(
+                URLQueryItem(name: "open", value: item.remoteID ?? itemURI))
+        }
+        if let userID = drive.user_id, !userID.isEmpty {
+            queryItems.append(URLQueryItem(name: "user_hint", value: userID))
+        }
+        components.queryItems = queryItems
+        return components.url
     }
 
     func children(
