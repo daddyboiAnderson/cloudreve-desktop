@@ -22,6 +22,8 @@ pub struct ShareLinkRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expire: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloads: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
@@ -52,7 +54,7 @@ pub struct ListShareResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::ListShareResponse;
+    use super::{ListShareResponse, ShareLinkRequest};
 
     #[test]
     fn accepts_null_share_list() {
@@ -72,5 +74,17 @@ mod tests {
 
         assert!(response.shares.is_empty());
         assert_eq!(response.pagination.page, 0);
+    }
+
+    #[test]
+    fn serializes_download_limit() {
+        let request = ShareLinkRequest {
+            uri: "cloudreve://my/report.pdf".to_string(),
+            downloads: Some(1),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["downloads"], 1);
     }
 }

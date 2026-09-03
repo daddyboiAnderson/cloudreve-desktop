@@ -64,6 +64,7 @@ interface ShareLink {
   expires?: string;
   is_private?: boolean;
   share_view?: boolean;
+  remain_downloads?: number;
   permission_setting?: PermissionSetting;
   password_protected?: boolean;
   password?: string;
@@ -161,6 +162,8 @@ const EXPIRATION_MULTIPLIERS: Record<ExpirationUnit, number> = {
   hours: 3_600,
   days: 86_400,
 };
+
+const DOWNLOAD_LIMIT_OPTIONS = [1, 5, 10, 25, 50, 100];
 
 function encodePermissions(permissions: PermissionState): string {
   let bits = 0;
@@ -446,6 +449,8 @@ export default function Share() {
   const [existingLinksOpen, setExistingLinksOpen] = useState(false);
   const [expiration, setExpiration] = useState(0);
   const [expirationUnit, setExpirationUnit] = useState<ExpirationUnit>("minutes");
+  const [expireAfterDownload, setExpireAfterDownload] = useState(false);
+  const [downloadLimit, setDownloadLimit] = useState(1);
   const [editingShareId, setEditingShareId] = useState<string | null>(null);
   const [footerNotice, setFooterNotice] = useState<FooterNotice | null>(null);
   const footerNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -503,6 +508,8 @@ export default function Share() {
     setExistingLinksOpen(false);
     setExpiration(0);
     setExpirationUnit("minutes");
+    setExpireAfterDownload(false);
+    setDownloadLimit(1);
     setEditingShareId(null);
     if (!preserveDeletion) {
       setFooterNotice(null);
@@ -699,8 +706,11 @@ export default function Share() {
       );
       setPasswordEnabled(details.password_protected === true || !!details.password);
       setPassword(details.password ?? "");
-      setShareView(details.share_view ?? false);
-      setShowReadme(details.show_readme ?? false);
+      setShareView(target.is_folder ? details.share_view ?? false : false);
+      setShowReadme(target.is_folder ? details.show_readme ?? false : false);
+      const remainingDownloads = details.remain_downloads ?? 0;
+      setExpireAfterDownload(!target.is_folder && remainingDownloads > 0);
+      setDownloadLimit(Math.max(1, remainingDownloads));
       const loadedExpiration = expirationFromShare(details.expires);
       setExpiration(loadedExpiration);
       setExpirationUnit(expirationUnitFor(loadedExpiration));
@@ -755,11 +765,12 @@ export default function Share() {
       permissions,
       uri: target.uri,
       is_private: !hasGeneralAccess || passwordEnabled,
-      share_view: shareView,
+      share_view: target.is_folder ? shareView : false,
       expire: expiration,
+      downloads: target.is_folder ? undefined : expireAfterDownload ? Math.max(1, downloadLimit) : 0,
       price: 0,
       password: passwordEnabled ? password.trim() : undefined,
-      show_readme: target.is_folder && showReadme,
+      show_readme: target.is_folder ? showReadme : false,
     };
   };
 
@@ -1151,14 +1162,75 @@ export default function Share() {
                         helperText="Use up to 32 letters or numbers."
                       />
                     )}
-                    <AdvancedOptionRow
-                      label="Enable share view"
-                      symbol={advancedSymbols["rectangle.grid.2x2.fill"]}
-                      fallback={<DashboardOutlinedIcon fontSize="small" />}
-                      checked={shareView}
-                      onChange={setShareView}
-                      isMacOS={isMacOS}
-                    />
+                    {target.is_folder ? (
+                      <>
+                        <AdvancedOptionRow
+                          label="Share view setting"
+                          symbol={advancedSymbols["rectangle.grid.2x2.fill"]}
+                          fallback={<DashboardOutlinedIcon fontSize="small" />}
+                          checked={shareView}
+                          onChange={setShareView}
+                          isMacOS={isMacOS}
+                        />
+                        {shareView && (
+                          <Typography
+                            variant="caption"
+                            color="text.secondary"
+                            sx={{ pl: 6, pr: 1, pb: 1 }}
+                          >
+                            If selected, other users can see your view setting (layout, sorting, etc.)
+                            saved on the server when accessing this shared folder.
+                          </Typography>
+                        )}
+                      </>
+                    ) : (
+                      <>
+                        <AdvancedOptionRow
+                          label="Expire after being downloaded"
+                          symbol={advancedSymbols.timer}
+                          fallback={<TimerOutlinedIcon fontSize="small" />}
+                          checked={expireAfterDownload}
+                          onChange={setExpireAfterDownload}
+                          isMacOS={isMacOS}
+                        />
+                        {expireAfterDownload && (
+                          <Stack
+                            direction="row"
+                            alignItems="center"
+                            gap={1}
+                            sx={{ pl: 6, pr: 1, pb: 1 }}
+                          >
+                            <Typography
+                              variant="body2"
+                              color="text.secondary"
+                              sx={{ whiteSpace: "nowrap" }}
+                            >
+                              Expire after
+                            </Typography>
+                            <FormControl size="small" sx={{ minWidth: 120 }}>
+                              <Select
+                                value={downloadLimit}
+                                onChange={(event) =>
+                                  setDownloadLimit(Math.max(1, Number(event.target.value) || 1))
+                                }
+                                inputProps={{ "aria-label": "Downloads before expiration" }}
+                              >
+                                {[...new Set([...DOWNLOAD_LIMIT_OPTIONS, downloadLimit])]
+                                  .sort((a, b) => a - b)
+                                  .map((limit) => (
+                                    <MenuItem key={limit} value={limit}>
+                                      {limit}
+                                    </MenuItem>
+                                  ))}
+                              </Select>
+                            </FormControl>
+                            <Typography variant="body2" color="text.secondary">
+                              downloads
+                            </Typography>
+                          </Stack>
+                        )}
+                      </>
+                    )}
                     {target.is_folder && (
                       <AdvancedOptionRow
                         label="Show README file"
