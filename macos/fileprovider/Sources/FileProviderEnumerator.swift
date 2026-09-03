@@ -117,9 +117,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     where error.code == .syncAnchorExpired
                         && containerIdentifier == .workingSet
                 {
-                    // Reconcile the working set after a missed event window.
+                    // Reconcile after an expired anchor.
                     logger.notice("anchor expired; reconciling working set with the server")
-                    // Preserve events received during reconciliation for the next pass.
+                    // Keep events received during reconciliation for the next pass.
                     let reconciliationAnchor = store.currentSyncAnchor()
                     logger.notice(
                         "reconciliation captured anchor \(String(data: reconciliationAnchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"

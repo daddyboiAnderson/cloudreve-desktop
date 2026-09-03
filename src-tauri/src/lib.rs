@@ -183,11 +183,7 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
 
     // Broadcast initial connection status
     event_broadcaster.connection_status_changed(true);
-    // Capture the no-drive state now, but do not emit it until APP_STATE is
-    // installed below. The UI event handler opens the add-drive window and that
-    // command reads AppStateHandle; emitting before `app.manage(AppStateHandle)`
-    // can make the first startup report "no drive" even when later commands
-    // cannot access the initialized manager.
+    // Emit the no-drive state after AppState is available.
     let has_no_drives = drive_manager.is_empty().await;
 
     // Store the state in the global cell
@@ -229,13 +225,7 @@ pub fn update_dock_visibility(app: &AppHandle) {
     }
 }
 
-/// Schedule multiple delayed checks of the Dock visibility.
-///
-/// `webview_windows()`/`is_visible()` can lag behind the actual window state on
-/// macOS, especially after a window is hidden or closed by clicking outside the
-/// frame. Calling `update_dock_visibility` immediately and then several more
-/// times gives AppKit enough time to reflect the new visibility state so the
-/// Dock icon reliably hides when no window is visible.
+/// Retry Dock visibility updates after native window state changes.
 #[cfg(target_os = "macos")]
 pub fn schedule_update_dock_visibility(app: &AppHandle) {
     let app = app.clone();
@@ -292,9 +282,7 @@ async fn shutdown() {
         // Broadcast disconnection event
         state.event_broadcaster.connection_status_changed(false);
 
-        // Keep the local replica registered, but tell Finder that the host app
-        // and its real-time event stream are unavailable. Finder displays the
-        // native reconnect message and stops sending work to the extension.
+        // Mark File Provider domains unavailable before shutdown.
         #[cfg(target_os = "macos")]
         {
             let drives = state.drive_manager.list_drives().await;
@@ -392,8 +380,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             "quit" => {
                 let app = app.clone();
                 spawn(async move {
-                    // Finish disconnecting File Provider domains before the host
-                    // exits so the next launch loads the replaced extension.
+                    // Disconnect File Provider domains before exit.
                     shutdown().await;
                     app.exit(0);
                 });
@@ -565,10 +552,7 @@ pub fn run() {
                         | tauri::WindowEvent::Focused(false),
                     ..
                 } => {
-                    // Re-evaluate Dock visibility several times after a window loses
-                    // focus or is closed/destroyed. `webview_windows()`/`is_visible()`
-                    // can lag, so retrying makes sure the Dock icon hides when no
-                    // window remains.
+                    // Retry after native window state changes.
                     crate::schedule_update_dock_visibility(app_handle);
                 }
                 _ => {}

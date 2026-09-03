@@ -973,17 +973,10 @@ pub fn show_main_window(app: &AppHandle) {
     show_main_window_at_position(app, Position::TrayCenter);
 }
 
-/// Show the main popup below the physical point that was actually clicked.
-///
-/// Menu-bar managers can report Cloudreve's hidden, original tray rectangle
-/// instead of the proxy icon rectangle. The click position remains accurate,
-/// so use it as the anchor on macOS and constrain the popup to that display.
+/// Show the main popup at the clicked screen position.
 #[cfg(target_os = "macos")]
 pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) {
-    // Read the cursor independently of the tray event. Menu-bar managers can
-    // replay an event whose embedded position belongs to the hidden status
-    // item, while the runtime cursor still reflects the proxy icon clicked by
-    // the user.
+    // Prefer the hardware cursor position for proxied status items.
     let click = hardware_cursor_position(app).unwrap_or(click);
     show_main_window_at_position(app, Position::TrayCenter);
 
@@ -992,10 +985,7 @@ pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) 
     };
     position_main_window_at_click(&window, click);
 
-    // Bartender and similar tools may finish their own status-item animation
-    // just after the click callback and cause AppKit to restore the reused
-    // window's previous position. Reapply the captured anchor once the current
-    // event-loop turn has settled.
+    // Reapply the position after the status-item callback settles.
     let window = window.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -1003,11 +993,7 @@ pub fn show_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) 
     });
 }
 
-/// Toggle the tray popup at the point actually clicked.
-///
-/// On macOS, clicking a status item can make its popup lose focus before the
-/// tray mouse-up callback arrives. Treat that just-recorded focus loss as an
-/// already-visible popup, otherwise the callback would immediately reopen it.
+/// Toggle the tray popup at the clicked position.
 #[cfg(target_os = "macos")]
 pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>) {
     let now = monotonic_popup_time_ms();
@@ -1019,8 +1005,7 @@ pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>
         .unwrap_or(false);
 
     if is_visible || recently_lost_focus {
-        // Hiding the window can itself emit Focused(false). Ignore that event
-        // so a subsequent intentional click can reopen the popup immediately.
+        // Ignore focus loss caused by hiding the window.
         SUPPRESS_MAIN_POPUP_FOCUS_LOSS_UNTIL_MS.store(now + 500, Ordering::Relaxed);
         MAIN_POPUP_FOCUS_LOST_AT_MS.store(0, Ordering::Relaxed);
         if let Some(window) = app.get_webview_window("main_popup") {
@@ -1035,9 +1020,7 @@ pub fn toggle_main_window_at_click(app: &AppHandle, click: PhysicalPosition<f64>
 
 #[cfg(target_os = "macos")]
 fn hardware_cursor_position(app: &AppHandle) -> Option<PhysicalPosition<f64>> {
-    // CGEvent reads the actual pointer location below AppKit's synthesized
-    // status-item events. Bartender can rewrite NSEvent.mouseLocation (used by
-    // both Tauri's tray event and cursor_position), but not this HID state.
+    // Use HID coordinates instead of proxy status-item coordinates.
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
     let location = CGEvent::new(source).ok()?.location();
     let scale = app.primary_monitor().ok().flatten()?.scale_factor();
@@ -1184,12 +1167,7 @@ fn activate_app(app: &AppHandle) {
     }
 }
 
-/// Attach a handler that updates macOS Dock visibility when the window is
-/// closed, destroyed, or loses focus. This is a per-window safeguard in
-/// addition to the global `RunEvent::WindowEvent` handler because some window
-/// state changes (e.g. clicking outside the add-drive/settings popup) are not
-/// reliably reflected by `webview_windows()`/`is_visible()` immediately. The
-/// check is retried several times to give AppKit time to catch up.
+/// Keep Dock visibility in sync with native window state.
 #[cfg(target_os = "macos")]
 fn update_dock_on_window_close(window: &WebviewWindow) {
     let window_clone = window.clone();
@@ -1207,7 +1185,6 @@ fn update_dock_on_window_close(window: &WebviewWindow) {
 
 /// Internal function to show or create the main window at a specific position
 fn show_main_window_at_position(app: &AppHandle, position: Position) {
-    // Check if window already exists
     if let Some(window) = app.get_webview_window("main_popup") {
         move_window_safely(&window, position, "main_popup");
         let _ = window.show();
@@ -1218,7 +1195,6 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
         return;
     }
 
-    // Create new main window
     let builder = WebviewWindowBuilder::new(
         app,
         "main_popup",
@@ -1232,14 +1208,10 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
     .skip_taskbar(true)
     .minimizable(false);
 
-    // The tray popup is undecorated, so AppKit does not provide its usual
-    // rounded window corners. Make only this macOS window transparent and let
-    // the popup UI paint and clip its native-looking rounded surface.
     #[cfg(target_os = "macos")]
     let builder = builder
         .transparent(true)
-        // Tray popups must be available from every macOS Space. Without this,
-        // AppKit keeps the hidden, reused window on the Space where it started.
+        // Keep the tray popup available on every Space.
         .visible_on_all_workspaces(true);
 
     let Some(builder) = apply_default_window_icon(builder, app, "main_popup") else {
@@ -1251,11 +1223,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
             #[cfg(target_os = "macos")]
             update_dock_on_window_close(&window);
 
-            // Set up window event handlers for macOS:
-            // - CloseRequested: when fast popup launch is enabled, hide instead of
-            //   destroying so the popup can be reshown quickly.
-            // - Focused(false): dismiss the popup when clicking outside and update
-            //   Dock visibility immediately.
+            // Hide the popup on close or focus loss.
             let window_for_events = window.clone();
             window.on_window_event(move |event| {
                 match event {
@@ -1263,8 +1231,6 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                         if ConfigManager::get().fast_popup_launch() {
                             api.prevent_close();
                             let _ = window_for_events.hide();
-                            // The window is hidden rather than destroyed; make
-                            // sure the Dock icon is re-evaluated repeatedly.
                             #[cfg(target_os = "macos")]
                             crate::schedule_update_dock_visibility(
                                 &window_for_events.app_handle().clone(),
@@ -1275,8 +1241,6 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                     tauri::WindowEvent::Focused(false) => {
                         record_main_popup_focus_loss();
                         let _ = window_for_events.hide();
-                        // Schedule multiple Dock visibility checks because the
-                        // window state reported by Tauri can lag behind AppKit.
                         crate::schedule_update_dock_visibility(
                             &window_for_events.app_handle().clone(),
                         );
@@ -1285,11 +1249,7 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
                 }
             });
 
-            // A newly created hidden window may not have a monitor assigned yet
-            // on macOS. Register it with the window server before asking the
-            // positioner to place it relative to the tray icon; otherwise the
-            // first launch falls back to the center of the screen. This is most
-            // noticeable when menu-bar managers proxy the initial tray click.
+            // Show once before positioning so AppKit assigns a monitor.
             let _ = window.show();
             move_window_safely(&window, position, "main_popup");
             let _ = window.set_focus();

@@ -34,11 +34,16 @@ import IosShareOutlinedIcon from "@mui/icons-material/IosShareOutlined";
 import LinkIcon from "@mui/icons-material/Link";
 import PublicIcon from "@mui/icons-material/Public";
 import SettingsIcon from "@mui/icons-material/Settings";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import LockOutlinedIcon from "@mui/icons-material/LockOutlined";
+import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
+import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import { useSearchParams } from "react-router-dom";
 
 type PermissionKey = "read" | "create" | "update" | "delete";
@@ -149,13 +154,13 @@ const PERMISSION_OPTIONS: {
   { value: "delete", label: "Delete" },
 ];
 
-const EXPIRATION_OPTIONS = [
-  { value: 0, label: "Never" },
-  { value: 86_400, label: "1 day" },
-  { value: 604_800, label: "7 days" },
-  { value: 2_592_000, label: "30 days" },
-  { value: 7_776_000, label: "90 days" },
-];
+type ExpirationUnit = "minutes" | "hours" | "days";
+
+const EXPIRATION_MULTIPLIERS: Record<ExpirationUnit, number> = {
+  minutes: 60,
+  hours: 3_600,
+  days: 86_400,
+};
 
 function encodePermissions(permissions: PermissionState): string {
   let bits = 0;
@@ -218,6 +223,12 @@ function expirationFromShare(expires?: string): number {
   return Math.max(1, Math.floor((timestamp - Date.now()) / 1000));
 }
 
+function expirationUnitFor(seconds: number): ExpirationUnit {
+  if (seconds > 0 && seconds % EXPIRATION_MULTIPLIERS.days === 0) return "days";
+  if (seconds > 0 && seconds % EXPIRATION_MULTIPLIERS.hours === 0) return "hours";
+  return "minutes";
+}
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <Box>
@@ -229,12 +240,106 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
+function PlatformCheckbox({
+  checked,
+  onChange,
+  isMacOS,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  isMacOS: boolean;
+}) {
+  if (!isMacOS) {
+    return (
+      <Checkbox
+        size="small"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+    );
+  }
+
+  return (
+    <Box
+      component="input"
+      type="checkbox"
+      checked={checked}
+      onChange={(event: ChangeEvent<HTMLInputElement>) => onChange(event.target.checked)}
+      sx={{
+        appearance: "auto",
+        WebkitAppearance: "checkbox",
+        width: 16,
+        height: 16,
+        m: "9px",
+        flexShrink: 0,
+        colorScheme: (theme) => theme.palette.mode,
+      }}
+    />
+  );
+}
+
+function AdvancedOptionRow({
+  label,
+  symbol,
+  fallback,
+  checked,
+  onChange,
+  isMacOS,
+}: {
+  label: string;
+  symbol?: string;
+  fallback: ReactNode;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  isMacOS: boolean;
+}) {
+  return (
+    <Box
+      component="label"
+      sx={{
+        display: "flex",
+        alignItems: "center",
+        width: "100%",
+        minHeight: 48,
+        px: 1,
+        borderRadius: 1.5,
+        cursor: "pointer",
+        userSelect: "none",
+        "&:hover": { bgcolor: "action.hover" },
+      }}
+    >
+      <Box sx={{ width: 32, display: "grid", placeItems: "center", color: "text.secondary" }}>
+        {symbol ? (
+          <Box
+            component="img"
+            src={symbol}
+            alt=""
+            sx={{
+              width: 21,
+              height: 21,
+              objectFit: "contain",
+              filter: (theme) => theme.palette.mode === "light" ? "invert(1)" : "none",
+              opacity: 0.72,
+            }}
+          />
+        ) : fallback}
+      </Box>
+      <Typography variant="body2" sx={{ flex: 1, ml: 1 }}>
+        {label}
+      </Typography>
+      <PlatformCheckbox isMacOS={isMacOS} checked={checked} onChange={onChange} />
+    </Box>
+  );
+}
+
 function PermissionCheckboxes({
   permissions,
   onChange,
+  isMacOS,
 }: {
   permissions: PermissionState;
   onChange: (permissions: PermissionState) => void;
+  isMacOS: boolean;
 }) {
   const normalized = normalizePermissions(permissions);
   return (
@@ -244,11 +349,11 @@ function PermissionCheckboxes({
           key={option.value}
           sx={{ mr: 0.75, my: -0.25 }}
           control={
-            <Checkbox
-              size="small"
+            <PlatformCheckbox
+              isMacOS={isMacOS}
               checked={normalized[option.value]}
-              onChange={(event) =>
-                onChange(updatePermission(normalized, option.value, event.target.checked))
+              onChange={(checked) =>
+                onChange(updatePermission(normalized, option.value, checked))
               }
             />
           }
@@ -281,7 +386,37 @@ function shareAccessLabel(share: ShareLink): string {
 }
 
 export default function Share() {
+  const isMacOS = platformType() === "macos";
+  const [systemShareSymbol, setSystemShareSymbol] = useState<string | null>(null);
+  const [advancedSymbols, setAdvancedSymbols] = useState<Record<string, string>>({});
   const [searchParams] = useSearchParams();
+
+  useEffect(() => {
+    if (!isMacOS) return;
+    const symbols = [
+      "square.and.arrow.up",
+      "lock.fill",
+      "rectangle.grid.2x2.fill",
+      "doc.text.fill",
+      "timer",
+    ];
+    Promise.all(
+      symbols.map(async (name) => [
+        name,
+        await invoke<string>("get_system_symbol", { name }).catch(() => ""),
+      ] as const),
+    )
+      .then((entries) => {
+        const rendered = Object.fromEntries(entries);
+        setSystemShareSymbol(rendered["square.and.arrow.up"]);
+        setAdvancedSymbols(rendered);
+      })
+      .catch(() => {
+        setSystemShareSymbol(null);
+        setAdvancedSymbols({});
+      });
+  }, [isMacOS]);
+
   const [routeTarget, setRouteTarget] = useState<ShareWindowTarget | null>(() => {
     const driveId = searchParams.get("drive_id");
     const uri = searchParams.get("uri");
@@ -310,26 +445,29 @@ export default function Share() {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [existingLinksOpen, setExistingLinksOpen] = useState(false);
   const [expiration, setExpiration] = useState(0);
+  const [expirationUnit, setExpirationUnit] = useState<ExpirationUnit>("minutes");
   const [editingShareId, setEditingShareId] = useState<string | null>(null);
   const [footerNotice, setFooterNotice] = useState<FooterNotice | null>(null);
   const footerNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [deletingShareId, setDeletingShareId] = useState<string | null>(null);
+  const [deletingShareIds, setDeletingShareIds] = useState<Set<string>>(() => new Set());
+  const deletingShareIdsRef = useRef<Set<string>>(new Set());
   const [pendingDeletion, setPendingDeletion] = useState<PendingDeletion | null>(null);
   const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const deleteInFlightRef = useRef<Promise<boolean> | null>(null);
+  const deleteQueueRef = useRef<Promise<boolean>>(Promise.resolve(true));
+  const deleteOperationsRef = useRef(new Map<string, Promise<boolean>>());
+  const closeInProgressRef = useRef(false);
+  const closeWindowRef = useRef<() => Promise<void>>(async () => undefined);
   const [error, setError] = useState("");
 
-  const expirationOptions = useMemo(() => {
-    if (expiration === 0 || EXPIRATION_OPTIONS.some((option) => option.value === expiration)) {
-      return EXPIRATION_OPTIONS;
-    }
-    return [
-      ...EXPIRATION_OPTIONS,
-      { value: expiration, label: "Current expiry" },
-    ];
-  }, [expiration]);
+  const updateDeletingShareIds = (update: (ids: Set<string>) => Set<string>) => {
+    setDeletingShareIds((ids) => {
+      const next = update(ids);
+      deletingShareIdsRef.current = next;
+      return next;
+    });
+  };
 
   const clearFooterNoticeTimer = useCallback(() => {
     if (footerNoticeTimerRef.current !== null) {
@@ -345,9 +483,11 @@ export default function Share() {
     }
   }, []);
 
-  const resetForm = useCallback(() => {
-    clearDeleteTimer();
-    clearFooterNoticeTimer();
+  const resetForm = useCallback((preserveDeletion = false) => {
+    if (!preserveDeletion) {
+      clearDeleteTimer();
+      clearFooterNoticeTimer();
+    }
     setAnonymousPermissions({ ...DEFAULT_PERMISSIONS });
     setEveryonePermissions({ ...DEFAULT_PERMISSIONS });
     setSelectedGroups([]);
@@ -362,9 +502,15 @@ export default function Share() {
     setAdvancedOpen(false);
     setExistingLinksOpen(false);
     setExpiration(0);
+    setExpirationUnit("minutes");
     setEditingShareId(null);
-    setFooterNotice(null);
-    setPendingDeletion(null);
+    if (!preserveDeletion) {
+      setFooterNotice(null);
+      setPendingDeletion(null);
+      const nextDeletingShareIds = new Set<string>();
+      deletingShareIdsRef.current = nextDeletingShareIds;
+      setDeletingShareIds(nextDeletingShareIds);
+    }
   }, [clearDeleteTimer, clearFooterNoticeTimer]);
 
   useEffect(
@@ -555,7 +701,9 @@ export default function Share() {
       setPassword(details.password ?? "");
       setShareView(details.share_view ?? false);
       setShowReadme(details.show_readme ?? false);
-      setExpiration(expirationFromShare(details.expires));
+      const loadedExpiration = expirationFromShare(details.expires);
+      setExpiration(loadedExpiration);
+      setExpirationUnit(expirationUnitFor(loadedExpiration));
       setEditingShareId(details.id);
       clearFooterNoticeTimer();
       setFooterNotice(null);
@@ -574,15 +722,17 @@ export default function Share() {
       throw new Error("Grant access to at least one person or general access group");
     }
 
+    const sameGroup = selectedGroups.find(
+      (group) => group.kind === "same_group" && hasAnyPermission(group.permissions),
+    );
+    const otherGroups = selectedGroups.find(
+      (group) => group.kind === "other" && hasAnyPermission(group.permissions),
+    );
     const permissions: PermissionSetting = {
-      same_group: encodePermissions(
-        selectedGroups.find((group) => group.kind === "same_group")?.permissions ?? EMPTY_PERMISSIONS,
-      ),
+      ...(sameGroup && { same_group: encodePermissions(sameGroup.permissions) }),
       anonymous: encodePermissions(anonymousPermissions),
       everyone: encodePermissions(everyonePermissions),
-      other: encodePermissions(
-        selectedGroups.find((group) => group.kind === "other")?.permissions ?? EMPTY_PERMISSIONS,
-      ),
+      ...(otherGroups && { other: encodePermissions(otherGroups.permissions) }),
       ...(selectedGroups.some(
         (group) => group.kind === "explicit" && hasAnyPermission(group.permissions),
       ) && {
@@ -609,7 +759,7 @@ export default function Share() {
       expire: expiration,
       price: 0,
       password: passwordEnabled ? password.trim() : undefined,
-      show_readme: showReadme,
+      show_readme: target.is_folder && showReadme,
     };
   };
 
@@ -670,45 +820,68 @@ export default function Share() {
   };
 
   const completeDelete = (pending: PendingDeletion): Promise<boolean> => {
-    if (deleteInFlightRef.current) return deleteInFlightRef.current;
+    const existing = deleteOperationsRef.current.get(pending.share.id);
+    if (existing) return existing;
 
-    const operation = (async () => {
-      let deleted = false;
-      setPendingDeletion(null);
-      try {
-        await invoke("delete_share_link", {
-          driveId: pending.driveId,
-          shareId: pending.share.id,
-        });
-        deleted = true;
-        if (editingShareId === pending.share.id) resetForm();
-        const refreshed = await invoke<ShareTarget>("get_share_target", {
-          driveId: pending.driveId,
-          uri: pending.uri,
-        });
-        setTarget(refreshed);
-        setFooterNotice(null);
-      } catch (deleteError) {
-        if (!deleted) restorePendingDeletion(pending);
-        setError(String(deleteError));
-        if (deleted) setFooterNotice(null);
-      } finally {
-        setPendingDeletion(null);
-        setDeletingShareId(null);
-      }
-      return deleted;
-    })();
+    const operation = deleteQueueRef.current
+      .catch(() => true)
+      .then(async () => {
+        let deleted = false;
+        setPendingDeletion((current) =>
+          current?.share.id === pending.share.id ? null : current,
+        );
+        try {
+          await invoke("delete_share_link", {
+            driveId: pending.driveId,
+            shareId: pending.share.id,
+          });
+          deleted = true;
+          if (editingShareId === pending.share.id) resetForm(true);
+          const refreshed = await invoke<ShareTarget>("get_share_target", {
+            driveId: pending.driveId,
+            uri: pending.uri,
+          });
+          setTarget({
+            ...refreshed,
+            shares: refreshed.shares.filter(
+              (share) => !deletingShareIdsRef.current.has(share.id),
+            ),
+          });
+        } catch (deleteError) {
+          if (!deleted) restorePendingDeletion(pending);
+          setError(String(deleteError));
+        } finally {
+          setPendingDeletion((current) =>
+            current?.share.id === pending.share.id ? null : current,
+          );
+          updateDeletingShareIds((ids) => {
+            const next = new Set(ids);
+            next.delete(pending.share.id);
+            return next;
+          });
+        }
+        return deleted;
+      });
 
-    deleteInFlightRef.current = operation;
+    deleteOperationsRef.current.set(pending.share.id, operation);
+    deleteQueueRef.current = operation.catch(() => false);
     operation.finally(() => {
-      if (deleteInFlightRef.current === operation) deleteInFlightRef.current = null;
+      if (deleteOperationsRef.current.get(pending.share.id) === operation) {
+        deleteOperationsRef.current.delete(pending.share.id);
+      }
     }).catch(() => undefined);
     return operation;
   };
 
   const handleDelete = (share: ShareLink) => {
-    if (!target || pendingDeletion || deletingShareId) return;
+    if (!target || deletingShareIds.has(share.id)) return;
     setError("");
+    if (pendingDeletion) {
+      const previous = pendingDeletion;
+      clearDeleteTimer();
+      setPendingDeletion(null);
+      void completeDelete(previous);
+    }
     const pending: PendingDeletion = {
       share,
       driveId: target.drive_id,
@@ -716,9 +889,8 @@ export default function Share() {
       index: target.shares.findIndex((item) => item.id === share.id),
     };
     setPendingDeletion(pending);
-    setDeletingShareId(share.id);
-    clearFooterNoticeTimer();
-    setFooterNotice({ message: "Share link deleted", severity: "error", action: "undo" });
+    updateDeletingShareIds((ids) => new Set(ids).add(share.id));
+    showFooterNotice({ message: "Share link deleted", severity: "error", action: "undo" });
     setTarget((current) => {
       if (!current || current.drive_id !== pending.driveId || current.uri !== pending.uri) {
         return current;
@@ -739,19 +911,60 @@ export default function Share() {
     const pending = pendingDeletion;
     clearDeleteTimer();
     setPendingDeletion(null);
-    setDeletingShareId(null);
+    updateDeletingShareIds((ids) => {
+      const next = new Set(ids);
+      next.delete(pending.share.id);
+      return next;
+    });
     restorePendingDeletion(pending);
     showFooterNotice({ message: "Share link restored", severity: "success" });
   };
 
   const closeWindow = async () => {
+    if (closeInProgressRef.current) return;
+    closeInProgressRef.current = true;
     clearDeleteTimer();
-    const pending = pendingDeletion;
-    const deletion = pending ? completeDelete(pending) : deleteInFlightRef.current;
-    if (deletion && !(await deletion)) return;
-
-    getCurrentWindow().close().catch((closeError) => setError(String(closeError)));
+    try {
+      const pending = pendingDeletion;
+      if (pending) {
+        setPendingDeletion(null);
+        void completeDelete(pending);
+      }
+      const deletions = [...deleteOperationsRef.current.values()];
+      const results = await Promise.all(deletions);
+      if (results.some((deleted) => !deleted)) return;
+      await getCurrentWindow().destroy();
+    } catch (closeError) {
+      setError(String(closeError));
+    } finally {
+      closeInProgressRef.current = false;
+    }
   };
+
+  closeWindowRef.current = closeWindow;
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        if (closeInProgressRef.current) return;
+        event.preventDefault();
+        await closeWindowRef.current();
+      })
+      .then((removeListener) => {
+        if (cancelled) {
+          removeListener();
+        } else {
+          unlisten = removeListener;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const groupSelectionKey = (group: Pick<SelectedGroup, "id" | "kind">) =>
     `${group.kind}:${group.id}`;
@@ -824,6 +1037,7 @@ export default function Share() {
           alignItems: "center",
           justifyContent: "space-between",
           px: 2,
+          pl: isMacOS ? "91px" : 2,
           py: 1.25,
           borderBottom: 1,
           borderColor: "divider",
@@ -831,16 +1045,34 @@ export default function Share() {
       >
         <Stack
           direction="row"
-          spacing={1}
+          spacing={isMacOS ? 1.25 : 1}
           alignItems="center"
-          sx={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+          sx={{ flex: 1, minWidth: 0, overflow: "hidden", transform: isMacOS ? "translateY(-2px)" : undefined }}
         >
-          <IosShareOutlinedIcon color="primary" sx={{ flexShrink: 0 }} />
+          {systemShareSymbol ? (
+            <Box
+              component="img"
+              src={systemShareSymbol}
+              alt=""
+              sx={{
+                width: 20,
+                height: 20,
+                flexShrink: 0,
+                objectFit: "contain",
+                filter: (theme) => theme.palette.mode === "light" ? "invert(1)" : "none",
+                transform: "translateY(-1px)",
+              }}
+            />
+          ) : (
+            <IosShareOutlinedIcon
+              sx={{ flexShrink: 0, fontSize: 20, color: isMacOS ? "text.primary" : "primary.main", transform: isMacOS ? "translateY(-1px)" : undefined }}
+            />
+          )}
           <Stack
             direction="row"
             spacing={0.75}
             alignItems="baseline"
-            sx={{ flex: 1, minWidth: 0, overflow: "hidden" }}
+            sx={{ flex: 1, minWidth: 0, overflow: "hidden", transform: isMacOS ? "translateY(1px)" : undefined }}
           >
             <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ flexShrink: 0 }}>
               Share
@@ -855,9 +1087,11 @@ export default function Share() {
             </Typography>
           </Stack>
         </Stack>
-        <IconButton size="small" onClick={closeWindow} aria-label="Close" sx={{ flexShrink: 0, ml: 1 }}>
-          <CloseIcon fontSize="small" />
-        </IconButton>
+        {!isMacOS && (
+          <IconButton size="small" onClick={closeWindow} aria-label="Close" sx={{ flexShrink: 0, ml: 1 }}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        )}
       </Box>
 
       <Box
@@ -897,9 +1131,13 @@ export default function Share() {
               <Section title="Advanced options">
                 <Paper variant="outlined" sx={{ p: 1.25 }}>
                   <Stack spacing={0.25}>
-                    <FormControlLabel
-                      control={<Checkbox checked={passwordEnabled} onChange={(event) => setPasswordEnabled(event.target.checked)} size="small" />}
+                    <AdvancedOptionRow
                       label="Protect with password"
+                      symbol={advancedSymbols["lock.fill"]}
+                      fallback={<LockOutlinedIcon fontSize="small" />}
+                      checked={passwordEnabled}
+                      onChange={setPasswordEnabled}
+                      isMacOS={isMacOS}
                     />
                     {passwordEnabled && (
                       <TextField
@@ -913,30 +1151,79 @@ export default function Share() {
                         helperText="Use up to 32 letters or numbers."
                       />
                     )}
-                    <FormControlLabel
-                      control={<Checkbox checked={shareView} onChange={(event) => setShareView(event.target.checked)} size="small" />}
+                    <AdvancedOptionRow
                       label="Enable share view"
+                      symbol={advancedSymbols["rectangle.grid.2x2.fill"]}
+                      fallback={<DashboardOutlinedIcon fontSize="small" />}
+                      checked={shareView}
+                      onChange={setShareView}
+                      isMacOS={isMacOS}
                     />
-                    <FormControlLabel
-                      control={<Checkbox checked={showReadme} onChange={(event) => setShowReadme(event.target.checked)} size="small" />}
-                      label="Show README file"
+                    {target.is_folder && (
+                      <AdvancedOptionRow
+                        label="Show README file"
+                        symbol={advancedSymbols["doc.text.fill"]}
+                        fallback={<DescriptionOutlinedIcon fontSize="small" />}
+                        checked={showReadme}
+                        onChange={setShowReadme}
+                        isMacOS={isMacOS}
+                      />
+                    )}
+                    <AdvancedOptionRow
+                      label="Automatic expiration"
+                      symbol={advancedSymbols.timer}
+                      fallback={<TimerOutlinedIcon fontSize="small" />}
+                      checked={expiration > 0}
+                      onChange={(checked) => {
+                        if (checked) setExpirationUnit("minutes");
+                        setExpiration(checked ? 5 * EXPIRATION_MULTIPLIERS.minutes : 0);
+                      }}
+                      isMacOS={isMacOS}
                     />
-                    <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2} sx={{ pt: 0.5 }}>
-                      <Typography variant="body2">Automatic expiration</Typography>
-                      <FormControl size="small" sx={{ minWidth: 135 }}>
-                        <Select
-                          value={expiration}
-                          onChange={(event) => setExpiration(Number(event.target.value))}
-                          displayEmpty
+                    {expiration > 0 && (
+                      <Stack
+                        direction="row"
+                        alignItems="center"
+                        gap={1}
+                        sx={{ pl: 6, pr: 1, pb: 1 }}
+                      >
+                        <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>
+                          Expire after
+                        </Typography>
+                        <TextField
+                          size="small"
+                          type="number"
+                          value={Math.max(
+                            1,
+                            Math.round(expiration / EXPIRATION_MULTIPLIERS[expirationUnit]),
+                          )}
+                          onChange={(event) => {
+                            const amount = Math.max(1, Math.floor(Number(event.target.value) || 1));
+                            setExpiration(amount * EXPIRATION_MULTIPLIERS[expirationUnit]);
+                          }}
+                          inputProps={{ min: 1, step: 1 }}
+                          sx={{ width: 110 }}
+                        />
+                        <FormControl size="small" sx={{ minWidth: 120 }}>
+                          <Select
+                            value={expirationUnit}
+                            onChange={(event) => {
+                              const nextUnit = event.target.value as ExpirationUnit;
+                              const amount = Math.max(
+                                1,
+                                Math.round(expiration / EXPIRATION_MULTIPLIERS[expirationUnit]),
+                              );
+                              setExpirationUnit(nextUnit);
+                              setExpiration(amount * EXPIRATION_MULTIPLIERS[nextUnit]);
+                            }}
                         >
-                          {expirationOptions.map((option) => (
-                            <MenuItem key={option.value} value={option.value}>
-                              {option.label}
-                            </MenuItem>
-                          ))}
-                        </Select>
-                      </FormControl>
-                    </Stack>
+                            <MenuItem value="minutes">Minutes</MenuItem>
+                            <MenuItem value="hours">Hours</MenuItem>
+                            <MenuItem value="days">Days</MenuItem>
+                          </Select>
+                        </FormControl>
+                      </Stack>
+                    )}
                   </Stack>
                 </Paper>
               </Section>
@@ -977,7 +1264,7 @@ export default function Share() {
                               <Stack direction="row" spacing={0.25}>
                                 <IconButton
                                   size="small"
-                                  disabled={!!deletingShareId}
+                                  disabled={deletingShareIds.has(share.id)}
                                   onClick={() => copyUrl(share.url)}
                                   aria-label="Copy link"
                                 >
@@ -985,7 +1272,7 @@ export default function Share() {
                                 </IconButton>
                                 <IconButton
                                   size="small"
-                                  disabled={!!deletingShareId}
+                                  disabled={deletingShareIds.has(share.id)}
                                   onClick={() => loadShareForEdit(share)}
                                   aria-label="Edit share"
                                 >
@@ -994,11 +1281,11 @@ export default function Share() {
                                 <IconButton
                                   size="small"
                                   color="error"
-                                  disabled={!!deletingShareId}
+                                  disabled={deletingShareIds.has(share.id)}
                                   onClick={() => handleDelete(share)}
                                   aria-label="Delete share"
                                 >
-                                  {deletingShareId === share.id ? (
+                                  {deletingShareIds.has(share.id) ? (
                                     <CircularProgress size={16} />
                                   ) : (
                                     <DeleteOutlineIcon fontSize="small" />
@@ -1258,6 +1545,7 @@ export default function Share() {
                               sx={{ m: 0 }}
                             />
                             <PermissionCheckboxes
+                              isMacOS={isMacOS}
                               permissions={group.permissions}
                               onChange={(permissions) =>
                                 setSelectedGroups((groups) =>
@@ -1311,6 +1599,7 @@ export default function Share() {
                               sx={{ m: 0 }}
                             />
                             <PermissionCheckboxes
+                              isMacOS={isMacOS}
                               permissions={person.permissions}
                               onChange={(permissions) =>
                                 setSelectedPeople((people) =>
@@ -1344,6 +1633,7 @@ export default function Share() {
                         Anyone with the link, without signing in
                       </Typography>
                       <PermissionCheckboxes
+                        isMacOS={isMacOS}
                         permissions={anonymousPermissions}
                         onChange={setAnonymousPermissions}
                       />
@@ -1363,6 +1653,7 @@ export default function Share() {
                         Signed-in Cloudreve users
                       </Typography>
                       <PermissionCheckboxes
+                        isMacOS={isMacOS}
                         permissions={everyonePermissions}
                         onChange={setEveryonePermissions}
                       />
@@ -1425,13 +1716,13 @@ export default function Share() {
                   px: 1,
                   boxShadow: "none",
                   backgroundColor: (theme) =>
-                    footerNotice.severity === "error"
-                      ? theme.palette.mode === "dark"
-                        ? "rgba(244, 67, 54, 0.24)"
-                        : "#ffebee"
-                      : theme.palette.mode === "dark"
-                        ? "rgba(76, 175, 80, 0.28)"
-                        : "#edf7ed",
+                      footerNotice.severity === "error"
+                        ? theme.palette.mode === "dark"
+                          ? "#8c1d18"
+                          : "#ffebee"
+                        : theme.palette.mode === "dark"
+                          ? "#2e7d32"
+                          : "#edf7ed",
                   color: (theme) =>
                     footerNotice.severity === "error"
                       ? theme.palette.mode === "dark"
@@ -1496,7 +1787,7 @@ export default function Share() {
               sx={{ flexShrink: 0, marginLeft: "auto" }}
             >
               {editingShareId && (
-                <Button variant="text" onClick={resetForm} disabled={saving}>
+                <Button variant="text" onClick={() => resetForm()} disabled={saving}>
                   Cancel edit
                 </Button>
               )}
@@ -1506,7 +1797,7 @@ export default function Share() {
                 disabled={
                   saving ||
                   !!pendingDeletion ||
-                  !!deletingShareId
+                  deletingShareIds.size > 0
                 }
                 startIcon={saving ? <CircularProgress size={16} color="inherit" /> : <LinkIcon />}
               >

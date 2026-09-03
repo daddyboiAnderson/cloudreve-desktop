@@ -145,8 +145,7 @@ final class RemoteStore {
                     (Self.canonicalIdentifier($0.key), Self.canonicalURI($0.value))
                 })
         }
-        // Recently enumerated folders, persisted so working-set
-        // reconciliation still covers them after an extension restart.
+        // Persist presented folders for later reconciliation.
         if let data = try? Data(contentsOf: presentedFileURL),
             let saved = try? JSONDecoder().decode([String: UInt64].self, from: data)
         {
@@ -369,8 +368,7 @@ final class RemoteStore {
             return NSFileProviderItemIdentifier(existing)
         }
 
-        // A path-based identifier remains reserved after Finder renames an
-        // item. Reusing that old path must not take over the renamed item.
+        // Do not reuse an identifier for a renamed item.
         if let mappedURI = uriByIdentifier[uri], mappedURI != uri {
             var identifier: String
             repeat {
@@ -393,9 +391,7 @@ final class RemoteStore {
         cacheLock.lock()
         defer { cacheLock.unlock() }
 
-        // A current URI mapping wins over a stale rename event. Previously
-        // makeItem cached the preserved identifier before recordIdentity
-        // rejected the collision, leaving Finder with two identities.
+        // Prefer the current URI mapping over a stale rename event.
         if let existing = identifierByURI[uri] {
             return NSFileProviderItemIdentifier(existing)
         }
@@ -724,9 +720,9 @@ final class RemoteStore {
     /// A working-set listing with the verification data used to build it.
     struct WorkingSetSnapshot {
         let items: [FileProviderItem]
-        /// Containers re-listed during this snapshot -> identifiers present.
+        /// Containers re-listed in this snapshot.
         let freshListings: [String: Set<String>]
-        /// URIs of containers proven gone on the server during this snapshot.
+        /// Containers proven absent on the server.
         let extinctURIs: [String]
     }
 
@@ -735,17 +731,14 @@ final class RemoteStore {
         try await workingSetSnapshot().items
     }
 
-    /// Build the current working set and record which containers were
-    /// re-listed, so callers can tell which absent items are truly gone.
+    /// Build the current working set and track fresh listings.
     func workingSetSnapshot() async throws -> WorkingSetSnapshot {
         var itemsByIdentifier: [String: FileProviderItem] = [:]
         var foldersToWalk: [NSFileProviderItemIdentifier] = []
         var queuedFolders: Set<String> = []
-        /// Containers re-listed during this run -> identifiers currently present.
-        /// Used to drop cached items the server no longer has; otherwise
-        /// remotely deleted items would linger in the working set forever.
+        /// Containers re-listed during this run and their current children.
         var freshListings: [String: Set<String>] = [:]
-        /// Containers proven gone on the server during this run.
+        /// Containers proven absent during this run.
         var extinctContainers: Set<String> = []
 
         func add(_ item: FileProviderItem) {
@@ -853,9 +846,7 @@ final class RemoteStore {
             }
         }
 
-        // Drop cached items that fresh listings prove are gone remotely, and
-        // anything under a container that no longer exists. Cached items
-        // whose container was not re-listed stay (their state is unknown).
+        // Remove cached items proven absent by fresh listings.
         let extinctURIs = extinctContainers.map {
             self.uri(for: NSFileProviderItemIdentifier($0))
         }
@@ -900,14 +891,7 @@ final class RemoteStore {
         return (uriByIdentifier, identifierByURI)
     }
 
-    /// Compute the delta between the system's mirror and the server after a
-    /// missed-event gap (rescan marker). The system does not remove items
-    /// that merely disappear from a working-set re-enumeration, so remote
-    /// deletions must be delivered explicitly as change events.
-    ///
-    /// Deletions are only reported for items whose parent container was
-    /// freshly listed (or proven gone) during the snapshot — everything else
-    /// is unverified and left alone.
+    /// Reconcile cached working-set items with the server.
     func reconcileWorkingSet() async throws -> (
         updated: [FileProviderItem], deleted: [NSFileProviderItemIdentifier]
     ) {

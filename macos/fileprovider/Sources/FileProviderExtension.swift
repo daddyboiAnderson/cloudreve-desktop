@@ -237,11 +237,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let isFolder = itemTemplate.contentType?.conforms(to: .folder) ?? false
                 let deleteGeneration = store.remoteDeleteGeneration(for: uri)
 
-                // macOS can replay a create callback for a locally mirrored
-                // item after a File Provider domain is removed and re-added.
-                // If that stable identity is known but the server item is
-                // gone, acknowledge the remote deletion instead of restoring
-                // it by uploading the stale local copy.
+                // Ignore replayed creates for known items.
                 if store.isKnownIdentity(itemTemplate.itemIdentifier, forURI: uri) {
                     do {
                         let existing = try await store.client.fileInfoWithShareState(uri: uri)
@@ -273,8 +269,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: false)
                 }
 
-                // A Web UI deletion can arrive while Finder is still uploading.
-                // Do not let the late upload completion recreate the deleted item.
+                // Do not recreate an item deleted during upload.
                 if store.remoteDeleteOccurred(for: uri, after: deleteGeneration) {
                     try? await store.client.deleteFile(uri: uri)
                     let remoteIdentifier = store.identifier(forURI: uri)
@@ -291,9 +286,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 logger.notice("created \(uri, privacy: .public)")
                 completionHandler(store.makeItem(file), [], false, nil)
 
-                // Cloudreve can omit both lifecycle events when a new upload
-                // is deleted immediately by another client. Verify only this
-                // URI for a short window and explicitly remove Finder's copy.
+                // Recheck new uploads because immediate deletes may have no events.
                 Task {
                     for delay in [2, 6, 22] {
                         try? await Task.sleep(for: .seconds(delay))
@@ -428,9 +421,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 logger.notice("deleted \(identifier.rawValue, privacy: .public)")
                 completionHandler(nil)
             } catch CloudreveError.noSuchItem {
-                // Deletes are idempotent. Finder may retain an item after it
-                // was already removed remotely; acknowledge that state so
-                // the stale local replica is discarded instead of re-uploaded.
+                // Treat an already-removed item as deleted.
                 store.evictCachedItems(withIdentifiers: [identifier])
                 logger.notice(
                     "delete acknowledged for already absent \(identifier.rawValue, privacy: .public)"
@@ -732,7 +723,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             if identifier != .rootContainer {
                 _ = await store.requestDownloadWhenKnown(identifier, manager: manager)
             }
-            // File Provider does not recursively materialize directories.
+            // File Provider does not recursively materialize folders.
             for start in stride(from: 0, to: descendantFiles.count, by: 8) {
                 if Task.isCancelled { return }
                 let end = min(start + 8, descendantFiles.count)
@@ -755,10 +746,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             progress.completedUnitCount = progress.totalUnitCount
             progress.fileCompletedCount = progress.fileTotalCount
         } else if !pin {
-            // Inherited policy permits eviction but does not remove existing content.
+            // Evict files not covered by another pin.
             let filesToEvict: [NSFileProviderItemIdentifier]
             if isFolder {
-                // File Provider does not reliably evict provider folders recursively.
+                // Evict folder descendants explicitly.
                 filesToEvict = descendants.compactMap { descendant in
                     guard !descendant.contentType.conforms(to: .folder) else {
                         return nil
