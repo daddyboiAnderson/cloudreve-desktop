@@ -513,6 +513,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             commands::reset_file_provider,
             commands::get_file_icon,
+            #[cfg(target_os = "macos")]
+            commands::get_system_symbol,
             commands::show_file_in_explorer,
             commands::show_add_drive_window,
             commands::show_share_window,

@@ -396,7 +396,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
           py: 4,
         }}
       >
-        {/* Drag region with close button */}<Box
+        <Box
           data-tauri-drag-region
           sx={{
             position: "absolute",
@@ -411,17 +411,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             zIndex: 1,
           }}
         >
-          <IconButton
-            size="small"
-            onClick={() => getCurrentWindow().close()}
-            sx={{
-              // Keep the button itself draggable-region-free so clicks work.
-              WebkitAppRegion: "no-drag",
-              appRegion: "no-drag",
-            }}
-          >
-            <CloseIcon fontSize="small" />
-          </IconButton>
+          {!isMacOS && (
+            <IconButton
+              size="small"
+              onClick={() => getCurrentWindow().close()}
+              sx={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" }}
+            >
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          )}
         </Box>
         <Box
           sx={{

@@ -77,7 +77,7 @@ export default function Settings() {
           data-tauri-drag-region
           sx={{
             px: 2,
-            pt: 2,
+            pt: isMacOS ? 5 : 2,
             pb: 1,
             display: "flex",
             alignItems: "center",
@@ -130,17 +130,15 @@ export default function Settings() {
             px: 0.5,
           }}
         >
-          <IconButton
-            size="small"
-            onClick={() => getCurrentWindow().close()}
-            sx={{
-              // Keep the button itself draggable-region-free so clicks work.
-              WebkitAppRegion: "no-drag",
-              appRegion: "no-drag",
-            }}
-          >
-            <CloseIcon fontSize="small" />
-          </IconButton>
+          {!isMacOS && (
+            <IconButton
+              size="small"
+              onClick={() => getCurrentWindow().close()}
+              sx={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" }}
+            >
+              <CloseIcon fontSize="small" />
+            </IconButton>
+          )}
         </Box>
         {/* Content */}
         <Box sx={{ flex: 1, overflow: "auto", px: 3, pb: 3,pt:1 }}>

@@ -18,14 +18,29 @@ use core_graphics::{
 #[cfg(target_os = "macos")]
 use objc2::MainThreadMarker;
 #[cfg(target_os = "macos")]
+use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::NSApp as ns_app;
 #[cfg(target_os = "macos")]
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSColor,
+    NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow, NSWindowButton,
+};
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSDictionary, NSString};
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use std::ptr::NonNull;
 use std::sync::Arc;
 #[cfg(windows)]
 use tauri::utils::{config::WindowEffectsConfig, WindowEffect};
 #[cfg(target_os = "macos")]
 use tauri::PhysicalPosition;
+#[cfg(target_os = "macos")]
+use tauri::LogicalPosition;
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{
@@ -54,6 +69,36 @@ fn monotonic_popup_time_ms() -> u64 {
 
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_traffic_light_tracking(window: &WebviewWindow) {
+    let window = window.clone();
+    let app = window.app_handle().clone();
+    let _ = app.run_on_main_thread(move || {
+        let Ok(handle) = window.ns_window() else {
+            return;
+        };
+        let ns_window = unsafe { &*handle.cast::<NSWindow>() };
+        ns_window.setAcceptsMouseMovedEvents(true);
+
+        for button_type in [
+            NSWindowButton::CloseButton,
+            NSWindowButton::MiniaturizeButton,
+            NSWindowButton::ZoomButton,
+        ] {
+            let Some(button) = ns_window.standardWindowButton(button_type) else {
+                continue;
+            };
+            button.updateTrackingAreas();
+            if let Some(view) = unsafe { button.superview() } {
+                view.updateTrackingAreas();
+                if let Some(container) = unsafe { view.superview() } {
+                    container.updateTrackingAreas();
+                }
+            }
+        }
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -859,6 +904,70 @@ pub async fn get_file_icon(
     Ok(file_icon_to_response(result))
 }
 
+/// Return an SF Symbol used by the macOS share window.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn get_system_symbol(app: AppHandle, name: String) -> CommandResult<String> {
+    const ALLOWED_SYMBOLS: &[&str] = &[
+        "square.and.arrow.up",
+        "lock.fill",
+        "rectangle.grid.2x2.fill",
+        "doc.text.fill",
+        "timer",
+    ];
+    if !ALLOWED_SYMBOLS.contains(&name.as_str()) {
+        return Err("Unsupported SF Symbol".to_string());
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let symbol_name = NSString::from_str(&name);
+        let point_size = unsafe {
+            NSImageSymbolConfiguration::configurationWithPointSize_weight(
+                60.0,
+                NSFontWeightSemibold,
+            )
+        };
+        let color = NSImageSymbolConfiguration::configurationWithHierarchicalColor(
+            &NSColor::whiteColor(),
+        );
+        let configuration = point_size.configurationByApplyingConfiguration(&color);
+        let result = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &symbol_name,
+            None,
+        )
+        .and_then(|image| image.imageWithSymbolConfiguration(&configuration))
+        .and_then(|image| image.TIFFRepresentation())
+        .and_then(|data| NSBitmapImageRep::imageRepWithData(&data))
+        .and_then(|representation| {
+            let properties =
+                NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+            unsafe {
+                representation.representationUsingType_properties(
+                    NSBitmapImageFileType::PNG,
+                    &properties,
+                )
+            }
+        })
+        .map(|data| {
+            let length = data.length() as usize;
+            let mut bytes = vec![0u8; length];
+            if length > 0 {
+                let buffer = NonNull::new(bytes.as_mut_ptr() as *mut c_void)
+                    .expect("non-empty image data has a buffer");
+                unsafe { data.getBytes_length(buffer, length as _) };
+            }
+            format!("data:image/png;base64,{}", BASE64.encode(bytes))
+        });
+        let _ = sender.send(result.ok_or_else(|| "SF Symbol unavailable".to_string()));
+    })
+    .map_err(|error| format!("Could not render SF Symbol: {error}"))?;
+
+    receiver
+        .await
+        .map_err(|_| "SF Symbol rendering was cancelled".to_string())?
+}
+
 /// Show or create the main window (positioned at tray center)
 pub fn show_main_window(app: &AppHandle) {
     show_main_window_at_position(app, Position::TrayCenter);
@@ -1255,6 +1364,8 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
             activate_app(app);
         }
         let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        refresh_traffic_light_tracking(&window);
         let _ = window.emit("share-target", &target);
         return;
     }
@@ -1283,8 +1394,12 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
 
     #[cfg(target_os = "macos")]
     let builder = builder
+        .decorations(true)
         .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true);
+        .hidden_title(true)
+        .minimizable(false)
+        .maximizable(false)
+        .traffic_light_position(LogicalPosition::new(16.0, 25.0));
 
     let Some(builder) = apply_default_window_icon(builder, app, "share") else {
         return;
@@ -1305,6 +1420,8 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
                 activate_app(app);
             }
             let _ = window.set_focus();
+            #[cfg(target_os = "macos")]
+            refresh_traffic_light_tracking(&window);
         }
         Err(error) => {
             tracing::error!(target: "share", error = %error, "Failed to create Share window");
@@ -1365,7 +1482,10 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
         let _ = window.unminimize();
         let _ = window.set_focus();
         #[cfg(target_os = "macos")]
-        crate::update_dock_visibility(app);
+        {
+            refresh_traffic_light_tracking(&window);
+            crate::update_dock_visibility(app);
+        }
         return;
     }
 
@@ -1392,8 +1512,12 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
     // Platform-specific: title_bar_style and hidden_title are macOS-only.
     #[cfg(target_os = "macos")]
     let builder = builder
+        .decorations(true)
         .title_bar_style(TitleBarStyle::Overlay)
-        .hidden_title(true);
+        .hidden_title(true)
+        .minimizable(false)
+        .maximizable(false)
+        .traffic_light_position(LogicalPosition::new(16.0, 25.0));
 
     let Some(builder) = apply_default_window_icon(builder, app, "add-drive") else {
         return;
@@ -1415,7 +1539,10 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
             let _ = window.show();
             let _ = window.set_focus();
             #[cfg(target_os = "macos")]
-            crate::update_dock_visibility(app);
+            {
+                refresh_traffic_light_tracking(&window);
+                crate::update_dock_visibility(app);
+            }
         }
         Err(e) => {
             tracing::error!(target: "main", error = %e, "Failed to create window: {}", title);
@@ -1438,7 +1565,10 @@ pub fn show_settings_window_impl(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.set_focus();
         #[cfg(target_os = "macos")]
-        crate::update_dock_visibility(app);
+        {
+            refresh_traffic_light_tracking(&window);
+            crate::update_dock_visibility(app);
+        }
         return;
     }
 
@@ -1467,11 +1597,15 @@ pub fn show_settings_window_impl(app: &AppHandle) {
     #[cfg(windows)]
     let builder = builder.transparent(true);
 
-    // The settings UI provides its own drag region and close button. Keeping
-    // this as a transparent, undecorated window exposes the rounded web
-    // surface without AppKit painting a rectangular overlay titlebar.
     #[cfg(target_os = "macos")]
-    let builder = builder.transparent(true);
+    let builder = builder
+        .transparent(true)
+        .decorations(true)
+        .title_bar_style(TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .minimizable(false)
+        .maximizable(false)
+        .traffic_light_position(LogicalPosition::new(16.0, 25.0));
 
     let Some(builder) = apply_default_window_icon(builder, app, "settings") else {
         return;
@@ -1493,7 +1627,10 @@ pub fn show_settings_window_impl(app: &AppHandle) {
             let _ = window.show();
             let _ = window.set_focus();
             #[cfg(target_os = "macos")]
-            crate::update_dock_visibility(app);
+            {
+                refresh_traffic_light_tracking(&window);
+                crate::update_dock_visibility(app);
+            }
         }
         Err(e) => {
             tracing::error!(target: "main", error = %e, "Failed to create settings window");
