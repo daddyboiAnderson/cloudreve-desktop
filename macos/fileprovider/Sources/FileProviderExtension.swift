@@ -252,7 +252,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         logger.notice(
                             "discarded stale mirrored create for remotely absent \(uri, privacy: .public)"
                         )
-                        completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                        completionHandler(nil, [], false, nil)
                         return
                     }
                 }
