@@ -48,6 +48,18 @@
 			<key>UTTypeIdentifier</key>
 			<string>cloudreve.desktop.dev.fileprovider.decoration.shared-v1</string>
 		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.icon-decoration.badge</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Cloudreve Locked badge</string>
+			<key>UTTypeIconFile</key>
+			<string>Locked.icns</string>
+			<key>UTTypeIdentifier</key>
+			<string>cloudreve.desktop.dev.fileprovider.decoration.locked-v1</string>
+		</dict>
 	</array>
 </dict>
 </plist>

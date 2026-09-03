@@ -34,7 +34,7 @@ mkdir -p "$APP/Contents/PlugIns"
 rm -rf "$APP/Contents/PlugIns/CloudreveFileProvider.appex"
 cp -R "$ROOT/macos/build/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
 
-for resource in KeepDownloaded.icns Shared.icns; do
+for resource in KeepDownloaded.icns Shared.icns Locked.icns; do
     badge_resource="$APP/Contents/PlugIns/CloudreveFileProvider.appex/Contents/Resources/$resource"
     if [[ ! -f "$badge_resource" ]]; then
         echo "error: $resource was not built" >&2
@@ -82,6 +82,9 @@ ensure_exported_uti \
 ensure_exported_uti \
     "cloudreve.desktop.dev.fileprovider.decoration.shared-v1" \
     "Cloudreve Shared badge" Shared.icns
+ensure_exported_uti \
+    "cloudreve.desktop.dev.fileprovider.decoration.locked-v1" \
+    "Cloudreve Locked badge" Locked.icns
 
 echo "==> Setting app and extension version to $SHORT_VERSION ($BUILD_NUMBER)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APP/Contents/Info.plist"

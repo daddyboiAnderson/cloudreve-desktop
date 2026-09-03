@@ -44,6 +44,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         NSFileProviderError(.notAuthenticated)
     }
 
+    private func recordLockConflict(
+        _ error: Error,
+        identifier: NSFileProviderItemIdentifier,
+        store: RemoteStore
+    ) {
+        guard let cloudreveError = error as? CloudreveError,
+            case let .lockConflict(path, application) = cloudreveError
+        else { return }
+        store.markLocked(identifier, uri: path)
+        logger.notice(
+            "mutation blocked by \(application ?? "another application", privacy: .public)"
+        )
+        Task { await store.signalWorkingSet() }
+    }
+
     // MARK: - Metadata
 
     func item(
@@ -311,6 +326,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     }
                 }
             } catch {
+                recordLockConflict(
+                    error, identifier: itemTemplate.parentItemIdentifier, store: store)
                 logger.error(
                     "createItem \(itemTemplate.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                 )
@@ -348,11 +365,17 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let originalURI = uri
                 let deleteGeneration = store.remoteDeleteGeneration(for: originalURI)
                 var pending = changedFields
+                let previousVersion = (item as? FileProviderItem)?.remoteVersion
 
                 // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
                     try await store.client.uploadFile(
-                        at: uri, from: newContents, overwrite: true, progress: progress)
+                        at: uri,
+                        from: newContents,
+                        overwrite: true,
+                        previousVersion: previousVersion,
+                        progress: progress)
+                    store.clearLockState(for: uri)
                     pending.remove(.contents)
                 }
 
@@ -388,6 +411,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
                     pending, false, nil)
             } catch {
+                recordLockConflict(error, identifier: item.itemIdentifier, store: store)
                 logger.error(
                     "modifyItem \(item.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                 )
@@ -428,6 +452,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 )
                 completionHandler(nil)
             } catch {
+                recordLockConflict(error, identifier: identifier, store: store)
                 logger.error(
                     "deleteItem \(identifier.rawValue, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
                 )

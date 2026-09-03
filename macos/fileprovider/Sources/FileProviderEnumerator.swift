@@ -282,6 +282,22 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return NSFileProviderError(.notAuthenticated)
         case CloudreveError.nameCollision:
             return NSFileProviderError(.filenameCollision)
+        case CloudreveError.lockConflict(_, _):
+            return NSError(
+                domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The file is locked by another application."
+                ])
+        case CloudreveError.staleVersion:
+            return NSError(
+                domain: NSFileProviderErrorDomain,
+                code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "The file changed on the server before this update was saved."
+                ])
         default:
             // File Provider only accepts Cocoa and File Provider error
             // domains. Keep implementation errors inside the extension.

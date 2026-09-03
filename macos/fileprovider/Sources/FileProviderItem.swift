@@ -10,6 +10,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let documentSize: NSNumber?
     let childItemCount: NSNumber?
     let capabilities: NSFileProviderItemCapabilities
+    private let baseCapabilities: NSFileProviderItemCapabilities
     let itemVersion: NSFileProviderItemVersion
     let creationDate: Date?
     let contentModificationDate: Date?
@@ -21,8 +22,12 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let sharedState: Bool
     /// Whether the current Cloudreve account owns the share.
     let sharedByCurrentUserState: Bool
+    /// Whether the server rejected a mutation because another app holds a lock.
+    let isLocked: Bool
     let remoteID: String?
     let remoteURI: String?
+    /// ETag sent back when Finder uploads a new version.
+    let remoteVersion: String?
     /// Unmarked metadata version used when rebuilding the item.
     let baseMetadataVersion: Data
 
@@ -30,12 +35,19 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     private static let pinnedVersionMarker = Data("#kd".utf8)
     private static let sharedVersionMarker = Data("#shared".utf8)
     private static let sharedByCurrentUserVersionMarker = Data("#shared-owner".utf8)
+    private static let lockedVersionMarker = Data("#locked".utf8)
+    private static let lockRestrictedCapabilities: NSFileProviderItemCapabilities = [
+        .allowsWriting, .allowsReparenting, .allowsRenaming, .allowsTrashing, .allowsDeleting,
+    ]
     static let keepDownloadedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.keep-downloaded-v2")
     static let sharedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.shared-v1")
+    static let lockedDecoration =
+        NSFileProviderItemDecorationIdentifier(
+            "cloudreve.desktop.dev.fileprovider.locked-v1")
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -53,8 +65,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         effectivelyPinned: Bool? = nil,
         sharedState: Bool = false,
         sharedByCurrentUserState: Bool = false,
+        locked: Bool = false,
         remoteID: String? = nil,
-        remoteURI: String? = nil
+        remoteURI: String? = nil,
+        remoteVersion: String? = nil
     ) {
         self.itemIdentifier = identifier
         self.parentItemIdentifier = parentIdentifier
@@ -62,15 +76,21 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         self.contentType = contentType
         self.documentSize = documentSize.map { NSNumber(value: $0) }
         self.childItemCount = childItemCount.map { NSNumber(value: $0) }
+        self.baseCapabilities = capabilities
         self.pinned = pinned
         let resolvedEffectivelyPinned = effectivelyPinned ?? pinned
         self.effectivelyPinned = resolvedEffectivelyPinned
         self.sharedState = sharedState
         self.sharedByCurrentUserState = sharedByCurrentUserState
+        self.isLocked = locked
         self.remoteID = remoteID
         self.remoteURI = remoteURI
-        // macOS 13+ uses contentPolicy for eviction behavior.
-        self.capabilities = capabilities
+        self.remoteVersion = remoteVersion
+        var resolvedCapabilities = capabilities
+        if locked {
+            resolvedCapabilities.subtract(Self.lockRestrictedCapabilities)
+        }
+        self.capabilities = resolvedCapabilities
         self.baseMetadataVersion = metadataVersion
         var effectiveMetadataVersion = metadataVersion
         if self.effectivelyPinned {
@@ -81,6 +101,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         }
         if self.sharedByCurrentUserState {
             effectiveMetadataVersion += Self.sharedByCurrentUserVersionMarker
+        }
+        if self.isLocked {
+            effectiveMetadataVersion += Self.lockedVersionMarker
         }
         self.itemVersion = NSFileProviderItemVersion(
             contentVersion: contentVersion,
@@ -99,6 +122,14 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
 
     var isSharedByCurrentUser: Bool { sharedByCurrentUserState }
 
+    var fileSystemFlags: NSFileProviderFileSystemFlags {
+        var flags: NSFileProviderFileSystemFlags = [.userReadable]
+        if capabilities.contains(.allowsWriting) {
+            flags.insert(.userWritable)
+        }
+        return flags
+    }
+
     /// Activation-rule values for the custom actions.
     var userInfo: [AnyHashable: Any]? {
         [
@@ -112,6 +143,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     /// Finder decorations for Keep Downloaded and sharing state.
     var decorations: [NSFileProviderItemDecorationIdentifier]? {
         var result: [NSFileProviderItemDecorationIdentifier] = []
+        if isLocked {
+            result.append(Self.lockedDecoration)
+        }
         if effectivelyPinned {
             result.append(Self.keepDownloadedDecoration)
         }
@@ -130,7 +164,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             contentType: contentType,
             documentSize: documentSize?.intValue,
             childItemCount: childItemCount?.intValue,
-            capabilities: capabilities,
+            capabilities: baseCapabilities,
             contentVersion: itemVersion.contentVersion,
             metadataVersion: baseMetadataVersion,
             creationDate: creationDate,
@@ -139,8 +173,35 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             effectivelyPinned: effectivelyPinned ?? pinned,
             sharedState: sharedState,
             sharedByCurrentUserState: sharedByCurrentUserState,
+            locked: isLocked,
             remoteID: remoteID,
-            remoteURI: remoteURI
+            remoteURI: remoteURI,
+            remoteVersion: remoteVersion
+        )
+    }
+
+    /// Copy with updated lock state.
+    func withLocked(_ locked: Bool) -> FileProviderItem {
+        FileProviderItem(
+            identifier: itemIdentifier,
+            parentIdentifier: parentItemIdentifier,
+            filename: filename,
+            contentType: contentType,
+            documentSize: documentSize?.intValue,
+            childItemCount: childItemCount?.intValue,
+            capabilities: baseCapabilities,
+            contentVersion: itemVersion.contentVersion,
+            metadataVersion: baseMetadataVersion,
+            creationDate: creationDate,
+            contentModificationDate: contentModificationDate,
+            pinned: pinned,
+            effectivelyPinned: effectivelyPinned,
+            sharedState: sharedState,
+            sharedByCurrentUserState: sharedByCurrentUserState,
+            locked: locked,
+            remoteID: remoteID,
+            remoteURI: remoteURI,
+            remoteVersion: remoteVersion
         )
     }
 }

@@ -123,12 +123,21 @@ private struct BaseEnvelope: Decodable {
     let msg: String?
 }
 
-/// Lock-conflict payloads carry the lock tokens needed to unlock.
-private struct LockEnvelope: Decodable {
-    let data: [LockInfo]?
+private struct LockConflictEnvelope: Decodable {
+    let data: [LockConflictEntry]?
 }
-private struct LockInfo: Decodable {
-    let token: String
+
+private struct LockConflictEntry: Decodable {
+    let path: String?
+    let owner: LockOwner?
+}
+
+private struct LockOwner: Decodable {
+    let application: LockApplication?
+}
+
+private struct LockApplication: Decodable {
+    let type: String?
 }
 
 /// Serializes concurrent refresh attempts so only one network call is made.
@@ -150,6 +159,8 @@ enum CloudreveError: Error, LocalizedError {
     case notAuthenticated
     case noSuchItem
     case nameCollision
+    case staleVersion
+    case lockConflict(path: String?, application: String?)
     case badResponse(String)
 
     var errorDescription: String? {
@@ -159,17 +170,31 @@ enum CloudreveError: Error, LocalizedError {
         case .notAuthenticated: return "Not authenticated"
         case .noSuchItem: return "No such item"
         case .nameCollision: return "An item with the same name already exists"
+        case .staleVersion: return "The item changed on the server before this update was saved"
+        case .lockConflict(_, let application):
+            if let application, !application.isEmpty {
+                return "The file is locked by \(application)"
+            }
+            return "The file is locked by another application"
         case .badResponse(let detail): return "Bad response: \(detail)"
         }
     }
 }
 
 /// Maps Cloudreve API error codes to typed errors.
-func mapApiError(code: Int, message: String?) -> CloudreveError {
+func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> CloudreveError {
     switch code {
     case 40004: return .nameCollision  // ObjectExisted
     case 40016, 40077, 40081: return .noSuchItem  // Entity/parent/target does not exist
     case 40020, 40089: return .notAuthenticated  // CredentialInvalid / SessionExpired
+    case 40073:
+        let detail = responseData.flatMap {
+            try? JSONDecoder().decode(LockConflictEnvelope.self, from: $0)
+        }?.data?.first
+        return .lockConflict(
+            path: detail?.path,
+            application: detail?.owner?.application?.type)
+    case 40076: return .staleVersion
     default: return .api(code: code, message: message ?? "unknown")
     }
 }
@@ -281,28 +306,21 @@ final class CloudreveClient {
     // MARK: Request plumbing
 
     /// Performs an authenticated API call and unwraps the envelope.
-    /// Retries once after a forced token refresh on 401, and once after
-    /// releasing upload-session locks on 40073 (lock conflict).
+    /// Retries once after a forced token refresh on 401.
     private func call<Req: Encodable, Res: Decodable>(
         _ method: String, _ path: String, body: Req?, query: [URLQueryItem] = [],
-        retryOnAuthError: Bool = true, retryOnLock: Bool = true
+        retryOnAuthError: Bool = true
     ) async throws -> Res {
         let (data, status) = try await rawRequest(method, path, body: body, query: query)
         if status == 401 && retryOnAuthError {
             credentials.access_token = nil  // force refresh
             return try await self.call(
                 method, path, body: body, query: query,
-                retryOnAuthError: false, retryOnLock: retryOnLock)
+                retryOnAuthError: false)
         }
         let base = try JSONDecoder().decode(BaseEnvelope.self, from: data)
         guard base.code == 0 else {
-            if base.code == 40073, retryOnLock {
-                try await unlockFromConflict(data: data)
-                return try await self.call(
-                    method, path, body: body, query: query,
-                    retryOnAuthError: retryOnAuthError, retryOnLock: false)
-            }
-            throw mapApiError(code: base.code, message: base.msg)
+            throw mapApiError(code: base.code, message: base.msg, responseData: data)
         }
         let envelope = try JSONDecoder().decode(ApiEnvelope<Res>.self, from: data)
         guard let payload = envelope.data else {
@@ -338,51 +356,20 @@ final class CloudreveClient {
         return (data, http.statusCode)
     }
 
-    /// Releases locks reported in a 40073 lock-conflict response.
-    private func unlockFromConflict(data: Data) async throws {
-        guard let tokens = try? JSONDecoder().decode(LockEnvelope.self, from: data).data,
-            !tokens.isEmpty
-        else {
-            throw CloudreveError.api(code: 40073, message: "Lock conflict")
-        }
-        logger.info("releasing \(tokens.count) upload-session lock(s)")
-        struct Body: Encodable {
-            let tokens: [String]
-        }
-        // DELETE /file/lock — raw, no retry recursion.
-        var request = URLRequest(url: baseURL.appendingPathComponent("/api/v4/file/lock"))
-        request.httpMethod = "DELETE"
-        request.setValue(
-            "Bearer \(try await validAccessToken())", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(Body(tokens: tokens.map { $0.token }))
-        let (respData, _) = try await session.data(for: request)
-        let base = try JSONDecoder().decode(BaseEnvelope.self, from: respData)
-        guard base.code == 0 else {
-            throw mapApiError(code: base.code, message: base.msg)
-        }
-    }
-
     /// Like `call`, for endpoints that return no meaningful payload.
     private func callVoid<Req: Encodable>(
         _ method: String, _ path: String, body: Req?,
-        retryOnAuthError: Bool = true, retryOnLock: Bool = true
+        retryOnAuthError: Bool = true
     ) async throws {
         let (data, status) = try await rawRequest(method, path, body: body, query: [])
         if status == 401 && retryOnAuthError {
             credentials.access_token = nil
             return try await self.callVoid(
-                method, path, body: body, retryOnAuthError: false, retryOnLock: retryOnLock)
+                method, path, body: body, retryOnAuthError: false)
         }
         let base = try JSONDecoder().decode(BaseEnvelope.self, from: data)
         guard base.code == 0 else {
-            if base.code == 40073, retryOnLock {
-                try await unlockFromConflict(data: data)
-                return try await self.callVoid(
-                    method, path, body: body,
-                    retryOnAuthError: retryOnAuthError, retryOnLock: false)
-            }
-            throw mapApiError(code: base.code, message: base.msg)
+            throw mapApiError(code: base.code, message: base.msg, responseData: data)
         }
     }
 
@@ -588,8 +575,13 @@ final class CloudreveClient {
     /// Uploads the local file to `uri`. When `overwrite` is true, the content
     /// becomes a new version of the existing file at `uri`.
     /// Works for local/relay storage policies (server-side completion).
-    func uploadFile(at uri: String, from fileURL: URL, overwrite: Bool, progress: Progress)
-        async throws
+    func uploadFile(
+        at uri: String,
+        from fileURL: URL,
+        overwrite: Bool,
+        previousVersion: String? = nil,
+        progress: Progress
+    ) async throws
     {
         let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
         guard let size = (attrs[.size] as? NSNumber)?.int64Value else {
@@ -606,6 +598,7 @@ final class CloudreveClient {
             let last_modified: Int64?
             let entity_type: String?
             let encryption_supported: [String]
+            let previous: String?
         }
         let credential: UploadCredentialPayload = try await call(
             "PUT", "/file/upload",
@@ -613,7 +606,8 @@ final class CloudreveClient {
                 uri: uri, size: size, policy_id: "",
                 last_modified: mtime,
                 entity_type: overwrite ? "version" : nil,
-                encryption_supported: [UploadEncryptor.supportedAlgorithm]))
+                encryption_supported: [UploadEncryptor.supportedAlgorithm],
+                previous: overwrite ? previousVersion : nil))
 
         let chunkSize = max(credential.chunk_size ?? 0, 1)
         let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
@@ -637,8 +631,7 @@ final class CloudreveClient {
                 if data.isEmpty { break }  // zero-byte file: single empty chunk
             }
         } catch {
-            // A failed upload leaves the session (and its file lock) on the
-            // server; cancel it so the path isn't blocked until expiry.
+            // Cancel this client's session after a failed upload.
             try? await cancelUploadSession(credential: credential, uri: uri)
             throw error
         }

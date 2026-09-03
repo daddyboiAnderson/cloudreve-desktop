@@ -72,8 +72,10 @@ final class RemoteStore {
     /// Version marker used to force a working-set refresh after policy changes.
     private static let policyMetadataVersion = "keep-downloaded-policy-v3"
     private static let metadataRefreshTTL: TimeInterval = 5
+    private static let lockStateTTL: TimeInterval = 30
     private var policyRescanPending = false
     private var metadataRefreshAt: [String: Date] = [:]
+    private var lockExpiryByURI: [String: Date] = [:]
     private var presentedContainers: [String: UInt64] = [:]
     private var presentedContainerSequence: UInt64 = 0
     private var remoteDeleteGenerationByURI: [String: UInt64] = [:]
@@ -1109,6 +1111,38 @@ final class RemoteStore {
         remoteDeleteGeneration(for: uri) != generation
     }
 
+    func markLocked(
+        _ identifier: NSFileProviderItemIdentifier, uri: String? = nil
+    ) {
+        let itemURI = Self.canonicalURI(uri ?? self.uri(for: identifier))
+        let rawIdentifier = Self.canonicalIdentifier(identifier.rawValue)
+        cacheLock.lock()
+        lockExpiryByURI[itemURI] = Date().addingTimeInterval(Self.lockStateTTL)
+        if let cached = cache[rawIdentifier], !cached.isLocked {
+            cache[rawIdentifier] = cached.withLocked(true)
+            metadataRefreshAt[rawIdentifier] = Date()
+        }
+        cacheLock.unlock()
+        logger.notice("marked item locked: \(itemURI, privacy: .public)")
+    }
+
+    func clearLockState(for uri: String) {
+        let itemURI = Self.canonicalURI(uri)
+        cacheLock.lock()
+        lockExpiryByURI.removeValue(forKey: itemURI)
+        cacheLock.unlock()
+    }
+
+    private func isLockActive(for uri: String) -> Bool {
+        let itemURI = Self.canonicalURI(uri)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let expiresAt = lockExpiryByURI[itemURI] else { return false }
+        if expiresAt > Date() { return true }
+        lockExpiryByURI.removeValue(forKey: itemURI)
+        return false
+    }
+
     /// Finder metadata files that stay local-only.
     static func isIgnored(filename: String) -> Bool {
         filename == ".DS_Store" || filename.hasPrefix("._")
@@ -1175,8 +1209,10 @@ final class RemoteStore {
         let versionBasis =
             file.metadata?["etag"] ?? file.metadata?["hash"]
             ?? "\(file.updated_at ?? "")#\(file.size)"
+        let remoteVersion = file.metadata?["etag"]
         var version = versionBasis.data(using: .utf8) ?? Data()
         if let metadataRevision { version += metadataRevision }
+        let locked = isLockActive(for: filePath)
         // Invalidate Finder's old thumbnail cache once.
         let thumbnailVersion = "\(versionBasis)#thumbnail-v1".data(using: .utf8) ?? version
 
@@ -1200,8 +1236,10 @@ final class RemoteStore {
             effectivelyPinned: isEffectivelyPinned(identifier, uri: filePath),
             sharedState: file.shared ?? false,
             sharedByCurrentUserState: file.shared == true && file.owned == true,
+            locked: locked,
             remoteID: file.id,
-            remoteURI: filePath
+            remoteURI: filePath,
+            remoteVersion: remoteVersion
         )
         cacheLock.lock()
         cache[identifier.rawValue] = item
@@ -1295,6 +1333,7 @@ final class RemoteStore {
             presentedContainers.removeValue(forKey: raw)
             pinnedIdentifiers.remove(raw)
             if let uri = uriByIdentifier.removeValue(forKey: raw) {
+                lockExpiryByURI.removeValue(forKey: uri)
                 deletedIdentityURIs[raw] = uri
                 if identifierByURI[uri] == raw {
                     identifierByURI.removeValue(forKey: uri)

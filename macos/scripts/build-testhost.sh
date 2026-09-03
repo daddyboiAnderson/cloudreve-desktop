@@ -29,6 +29,8 @@ cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/KeepDownloaded.icn
     "$APP/Contents/Resources/KeepDownloaded.icns"
 cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/Shared.icns" \
     "$APP/Contents/Resources/Shared.icns"
+cp "$BUILD_DIR/CloudreveFileProvider.appex/Contents/Resources/Locked.icns" \
+    "$APP/Contents/Resources/Locked.icns"
 
 echo "==> Signing app bundle"
 codesign --force --sign - --timestamp=none "$APP"

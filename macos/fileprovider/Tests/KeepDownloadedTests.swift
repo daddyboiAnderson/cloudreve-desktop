@@ -85,6 +85,47 @@ enum KeepDownloadedTests {
         precondition(unpinned.itemVersion.metadataVersion == base.itemVersion.metadataVersion)
         precondition(unpinned.decorations == nil)
 
+        let editable = FileProviderItem(
+            identifier: base.itemIdentifier,
+            parentIdentifier: base.parentItemIdentifier,
+            filename: base.filename,
+            contentType: base.contentType,
+            documentSize: base.documentSize?.intValue,
+            childItemCount: base.childItemCount?.intValue,
+            capabilities: [
+                .allowsReading, .allowsWriting, .allowsReparenting,
+                .allowsRenaming, .allowsDeleting,
+            ],
+            contentVersion: base.itemVersion.contentVersion,
+            metadataVersion: base.baseMetadataVersion,
+            creationDate: base.creationDate,
+            contentModificationDate: base.contentModificationDate,
+            pinned: false,
+            remoteVersion: "etag-1")
+        let locked = FileProviderItem(
+            identifier: editable.itemIdentifier,
+            parentIdentifier: editable.parentItemIdentifier,
+            filename: editable.filename,
+            contentType: editable.contentType,
+            documentSize: editable.documentSize?.intValue,
+            childItemCount: editable.childItemCount?.intValue,
+            capabilities: editable.capabilities,
+            contentVersion: editable.itemVersion.contentVersion,
+            metadataVersion: editable.baseMetadataVersion,
+            creationDate: editable.creationDate,
+            contentModificationDate: editable.contentModificationDate,
+            pinned: false,
+            locked: true,
+            remoteVersion: editable.remoteVersion)
+        precondition(locked.isLocked)
+        precondition(!locked.capabilities.contains(.allowsWriting))
+        precondition(!locked.fileSystemFlags.contains(.userWritable))
+        precondition(locked.fileSystemFlags.contains(.userReadable))
+        precondition(
+            locked.decorations?.contains(FileProviderItem.lockedDecoration) == true)
+        precondition(locked.itemVersion.metadataVersion != editable.itemVersion.metadataVersion)
+        precondition(locked.withLocked(false).capabilities.contains(.allowsWriting))
+
         let root = FileProviderItem(
             identifier: .rootContainer,
             parentIdentifier: .rootContainer,

@@ -59,6 +59,8 @@ bash "$ROOT/macos/scripts/build-keep-downloaded-badge.sh" \
     "$APPEX/Contents/Resources"
 bash "$ROOT/macos/scripts/build-shared-badge.sh" \
     "$APPEX/Contents/Resources"
+bash "$ROOT/macos/scripts/build-lock-badge.sh" \
+    "$APPEX/Contents/Resources"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$APPEX/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION" "$APPEX/Contents/Info.plist"
 
