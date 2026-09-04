@@ -48,11 +48,6 @@ export default function ConflictItem({
     setError(null);
     setResolvingAction(action);
     try {
-      // These action identifiers intentionally match the Rust ConflictAction
-      // parser and the Windows shell/toast actions:
-      // - keep_remote: discard the local conflicted copy and sync remote state
-      // - overwrite_remote: force-upload the local file over the remote version
-      // - save_as_new: keep both by renaming the local file before resyncing
       await invoke("resolve_conflict", {
         driveId: conflict.drive_id,
         fileId: conflict.id,

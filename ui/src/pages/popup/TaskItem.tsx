@@ -12,6 +12,7 @@ import {
   Error as ErrorIcon,
   CloudUpload as UploadIcon,
   CloudDownload as DownloadIcon,
+  ExpandMore as ExpandMoreIcon,
 } from "@mui/icons-material";
 import { invoke } from "@tauri-apps/api/core";
 import TimeAgo from "react-timeago";
@@ -23,9 +24,20 @@ import FileIcon from "./FileIcon";
 interface TaskItemProps {
   task: TaskWithProgress | TaskRecord;
   isActive?: boolean;
+  historyCount?: number;
+  historyExpanded?: boolean;
+  isHistoryEntry?: boolean;
+  onToggleHistory?: () => void;
 }
 
-export default function TaskItem({ task, isActive = false }: TaskItemProps) {
+export default function TaskItem({
+  task,
+  isActive = false,
+  historyCount = 1,
+  historyExpanded = false,
+  isHistoryEntry = false,
+  onToggleHistory,
+}: TaskItemProps) {
   const { t } = useTranslation();
   const activeTask = task as TaskWithProgress;
   const liveProgress = activeTask.live_progress;
@@ -34,6 +46,32 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
   const fileName = getFileName(task.local_path);
   const parentFolderName = getParentFolderName(task.local_path);
   const isFailed = task.status === "Failed";
+
+  const activityLabel = (() => {
+    if (isActive) {
+      if (task.status === "Pending") {
+        return isUpload
+          ? t("popup.uploadWaiting", "Upload waiting")
+          : t("popup.downloadWaiting", "Download waiting");
+      }
+      return isUpload
+        ? t("popup.uploading", "Uploading")
+        : t("popup.downloading", "Downloading");
+    }
+    if (task.status === "Completed") {
+      return isUpload
+        ? t("popup.uploaded", "Uploaded")
+        : t("popup.downloaded", "Downloaded");
+    }
+    if (task.status === "Cancelled") {
+      return isUpload
+        ? t("popup.uploadCancelled", "Upload cancelled")
+        : t("popup.downloadCancelled", "Download cancelled");
+    }
+    return isUpload
+      ? t("popup.uploadFailed", "Upload failed")
+      : t("popup.downloadFailed", "Download failed");
+  })();
 
   const timeAgoFormatter = (
     value: number,
@@ -72,38 +110,65 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
     }
   };
 
-  const getSecondaryText = () => {
+  const getProgressText = () => {
     if (isActive && liveProgress) {
       const processed = formatBytes(liveProgress.processed_bytes ?? 0);
       const total = formatBytes(liveProgress.total_bytes ?? 0);
       const speed = formatBytes(liveProgress.speed_bytes_per_sec);
       return `${processed} / ${total} - ${speed}/s`;
     }
-    if (isActive) {
-      return task.status === "Pending"
-        ? t("popup.waiting", "Waiting...")
-        : t("popup.processing", "Processing...");
-    }
     return null;
   };
 
   const statusBadge = getStatusBadge();
-  const secondaryText = getSecondaryText();
+  const progressText = getProgressText();
+  const canExpand = historyCount > 1 && Boolean(onToggleHistory);
+
+  const toggleOnKeyboard = (event: React.KeyboardEvent) => {
+    if (!canExpand || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    onToggleHistory?.();
+  };
 
   return (
     <ListItem
+      role={canExpand ? "button" : undefined}
+      tabIndex={canExpand ? 0 : undefined}
+      onClick={canExpand ? onToggleHistory : undefined}
+      onKeyDown={toggleOnKeyboard}
       sx={{
-        px: 2,
-        py: 1,
+        pl: isHistoryEntry ? 7 : 2,
+        pr: 2,
+        py: isHistoryEntry ? 0.75 : 1,
+        cursor: canExpand ? "pointer" : "default",
         "&:hover": {
           bgcolor: "action.hover",
         },
       }}
     >
-      <ListItemIcon sx={{ minWidth: 40 }}>
+      <ListItemIcon sx={{ minWidth: isHistoryEntry ? 30 : 40 }}>
         <Box sx={{ position: "relative", width: 28, height: 28 }}>
-          <FileIcon path={task.local_path} size={28} />
-          {statusBadge && (
+          {isHistoryEntry ? (
+            <Box
+              sx={{
+                width: 28,
+                height: 28,
+                display: "grid",
+                placeItems: "center",
+                color:
+                  task.status === "Completed"
+                    ? "success.main"
+                    : task.status === "Failed" || task.status === "Cancelled"
+                      ? "error.main"
+                      : "primary.main",
+              }}
+            >
+              {isUpload ? <UploadIcon fontSize="small" /> : <DownloadIcon fontSize="small" />}
+            </Box>
+          ) : (
+            <FileIcon path={task.local_path} size={28} />
+          )}
+          {statusBadge && !isHistoryEntry && (
             <Box
               sx={{
                 position: "absolute",
@@ -126,26 +191,24 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
       <ListItemText
         primary={
           <Typography variant="body2" noWrap sx={{ fontWeight: 500 }}>
-            {fileName}
+            {isHistoryEntry ? activityLabel : fileName}
           </Typography>
         }
         secondary={
           <Box>
             {isFailed && task.error ? (
               <Typography variant="caption" color="error" component="span">
-                {task.error}
+                {activityLabel}: {task.error}
               </Typography>
             ) : (
               <Typography variant="caption" color="text.secondary" component="span">
-                {secondaryText ?? (
-                  <TimeAgo
-                    date={task.updated_at * 1000}
-                    formatter={timeAgoFormatter}
-                  />
+                {!isHistoryEntry && <>{activityLabel}{" · "}</>}
+                {progressText ?? (
+                  <TimeAgo date={task.updated_at * 1000} formatter={timeAgoFormatter} />
                 )}
               </Typography>
             )}
-            {!isActive && (
+            {!isActive && !isHistoryEntry && (
               <>
                 <Typography variant="caption" color="text.secondary" component="span">
                   {" · "}
@@ -173,6 +236,29 @@ export default function TaskItem({ task, isActive = false }: TaskItemProps) {
           </Box>
         }
       />
+      {canExpand && (
+        <Box
+          sx={{
+            ml: 1,
+            display: "flex",
+            alignItems: "center",
+            gap: 0.25,
+            color: "text.secondary",
+            flexShrink: 0,
+          }}
+        >
+          <Typography variant="caption">
+            {t("popup.activityCount", "{{count}} actions", { count: historyCount })}
+          </Typography>
+          <ExpandMoreIcon
+            sx={{
+              fontSize: 20,
+              transform: historyExpanded ? "rotate(180deg)" : "none",
+              transition: "transform 150ms ease",
+            }}
+          />
+        </Box>
+      )}
     </ListItem>
   );
 }

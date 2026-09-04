@@ -51,6 +51,24 @@ export interface StatusSummary {
   pending_conflicts: PendingConflict[];
 }
 
+export interface FileProviderIssue {
+  id: string;
+  drive_id: string;
+  drive_name: string;
+  item_identifier: string;
+  filename: string;
+  is_folder: boolean;
+  operation: "upload" | "download";
+  source: "pending" | "upload_conflict";
+  kind?: "locked" | "stale" | "unverified";
+  application?: string;
+  message: string;
+  error_domain?: string;
+  error_code?: number;
+  conflict_id?: string;
+  updated_at: number;
+}
+
 export interface FileIconResponse {
   data: string; // Base64 encoded RGBA pixel data
   width: number;

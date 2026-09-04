@@ -19,14 +19,18 @@ import { type as platformType } from "@tauri-apps/plugin-os";
 import { useTranslation } from "react-i18next";
 import Settings from "../../common/icons/Settings";
 import CloudreveLogo from "../../common/CloudreveLogo";
-import type { StatusSummary } from "./types";
+import type { FileProviderIssue, StatusSummary } from "./types";
 import DriveChips from "./DriveChips";
 import TaskItem from "./TaskItem";
+import TaskHistoryGroup from "./TaskHistoryGroup";
+import { groupRecentTasks } from "./activity";
 import ConflictItem from "./ConflictItem";
+import FileProviderIssueItem from "./FileProviderIssueItem";
 
 export default function Popup() {
   const { t } = useTranslation();
   const [summary, setSummary] = useState<StatusSummary | null>(null);
+  const [fileProviderIssues, setFileProviderIssues] = useState<FileProviderIssue[]>([]);
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const isFetchingRef = useRef(false);
@@ -88,13 +92,23 @@ export default function Popup() {
         driveId: selectedDrive,
       });
       setSummary(result);
+      if (isMacOS) {
+        try {
+          const issues = await invoke<FileProviderIssue[]>("list_file_provider_issues", {
+            driveId: selectedDrive,
+          });
+          setFileProviderIssues(issues);
+        } catch (error) {
+          console.error("Failed to fetch Finder issues:", error);
+        }
+      }
     } catch (error) {
       console.error("Failed to fetch status summary:", error);
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
     }
-  }, [selectedDrive]);
+  }, [isMacOS, selectedDrive]);
 
   // Initial fetch and polling
   useEffect(() => {
@@ -147,6 +161,11 @@ export default function Popup() {
     summary?.finished_tasks && summary.finished_tasks.length > 0;
   const hasPendingConflicts =
     summary?.pending_conflicts && summary.pending_conflicts.length > 0;
+  const hasFileProviderIssues = fileProviderIssues.length > 0;
+  const hasAnyConflicts = hasPendingConflicts || hasFileProviderIssues;
+  const conflictCount =
+    (summary?.pending_conflicts.length ?? 0) + fileProviderIssues.length;
+  const recentTaskGroups = groupRecentTasks(summary?.finished_tasks ?? []);
 
   return (
     <Box
@@ -215,7 +234,7 @@ export default function Popup() {
               {t("popup.loading", "Loading...")}
             </Typography>
           </Box>
-        ) : !hasPendingConflicts && !hasActiveTasks && !hasFinishedTasks ? (
+        ) : !hasAnyConflicts && !hasActiveTasks && !hasFinishedTasks ? (
           <Box
             sx={{
               display: "flex",
@@ -234,7 +253,7 @@ export default function Popup() {
         ) : (
           <List disablePadding>
             {/* Pending Conflicts */}
-            {hasPendingConflicts && (
+            {hasAnyConflicts && (
               <>
                 <Box
                   sx={{
@@ -251,17 +270,26 @@ export default function Popup() {
                     color="warning.main"
                     sx={{ fontWeight: 700, textTransform: "uppercase" }}
                   >
-                    {t("popup.conflicts", "Conflicts")}
+                    {t("popup.syncConflicts", "Sync conflicts")}
                   </Typography>
-                  <ButtonGroup size="small" variant="text" color="warning">
-                    <Button onClick={() => handleResolveAll("keep_remote")}>
-                      {t("popup.keepAllRemote", "Keep all remote")}
-                    </Button>
-                    <Button onClick={() => handleResolveAll("overwrite_remote")}>
-                      {t("popup.overwriteAllRemote", "Overwrite all remote")}
-                    </Button>
-                  </ButtonGroup>
+                  {hasPendingConflicts && (
+                    <ButtonGroup size="small" variant="text" color="warning">
+                      <Button onClick={() => handleResolveAll("keep_remote")}>
+                        {t("popup.keepAllRemote", "Keep all remote")}
+                      </Button>
+                      <Button onClick={() => handleResolveAll("overwrite_remote")}>
+                        {t("popup.overwriteAllRemote", "Overwrite all remote")}
+                      </Button>
+                    </ButtonGroup>
+                  )}
                 </Box>
+                {fileProviderIssues.map((issue) => (
+                  <FileProviderIssueItem
+                    key={issue.id}
+                    issue={issue}
+                    onResolved={fetchSummary}
+                  />
+                ))}
                 {summary?.pending_conflicts.map((conflict) => (
                   <ConflictItem
                     key={conflict.id}
@@ -273,7 +301,7 @@ export default function Popup() {
             )}
 
             {/* Divider between conflicts and tasks */}
-            {hasPendingConflicts && (hasActiveTasks || hasFinishedTasks) && (
+            {hasAnyConflicts && (hasActiveTasks || hasFinishedTasks) && (
               <Divider sx={{ my: 1 }} />
             )}
 
@@ -322,8 +350,8 @@ export default function Popup() {
                 >
                   {t("popup.recent", "Recent")}
                 </Typography>
-                {summary?.finished_tasks.map((task) => (
-                  <TaskItem key={task.id} task={task} />
+                {recentTaskGroups.map((tasks) => (
+                  <TaskHistoryGroup key={tasks[0].id} tasks={tasks} />
                 ))}
               </>
             )}
@@ -355,7 +383,7 @@ export default function Popup() {
               },
             }}
           />
-        ) : hasPendingConflicts ? (
+        ) : hasAnyConflicts ? (
           <FolderIcon sx={{ fontSize: 18, color: "warning.main" }} />
         ) : (
           <CheckCircleIcon
@@ -367,9 +395,9 @@ export default function Popup() {
             ? t("popup.syncingStatus", "Syncing {{count}} file(s)...", {
                 count: summary?.active_tasks.length ?? 0,
               })
-            : hasPendingConflicts
+            : hasAnyConflicts
               ? t("popup.conflictStatus", "{{count}} conflict(s) need attention", {
-                  count: summary?.pending_conflicts.length ?? 0,
+                  count: conflictCount,
                 })
             : t("popup.upToDate", "Your files are up to date")}
         </Typography>

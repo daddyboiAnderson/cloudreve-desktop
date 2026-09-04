@@ -20,6 +20,7 @@ import AddDrive from "./pages/AddDrive";
 import Popup from "./pages/popup";
 import Share from "./pages/share";
 import Settings from "./pages/settings";
+import UploadConflict from "./pages/UploadConflict";
 
 function LoadingFallback() {
   return (
@@ -70,6 +71,7 @@ function App() {
     platformType() === "macos" &&
     (window.location.hash.startsWith("#/popup") ||
       window.location.hash.startsWith("#/share") ||
+      window.location.hash.startsWith("#/upload-conflict") ||
       window.location.hash.startsWith("#/settings") ||
       window.location.hash.startsWith("#/add-drive") ||
       window.location.hash.startsWith("#/reauthorize"));
@@ -112,6 +114,7 @@ function App() {
               <Route path="/reauthorize/:driveId/:siteUrl/:driveName" element={<AddDrive mode="reauthorize" />} />
               <Route path="/popup" element={<Popup />} />
               <Route path="/share" element={<Share />} />
+              <Route path="/upload-conflict" element={<UploadConflict />} />
               <Route path="/settings" element={<Settings />} />
             </Routes>
           </HashRouter>
