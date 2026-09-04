@@ -4,19 +4,21 @@ use crate::{
     cfapi::placeholder::LocalFileInfo,
     drive::{commands::MountCommand, sync::SyncMode},
 };
-use anyhow::Result;
 #[cfg(not(target_os = "macos"))]
 use anyhow::Context;
+use anyhow::Result;
 #[cfg(target_os = "macos")]
 use cloudreve_api::api::explorer::ExplorerApi;
-#[cfg(target_os = "macos")]
-use cloudreve_api::models::explorer::file_type;
 #[cfg(not(target_os = "macos"))]
 use cloudreve_api::api::explorer::FileEventsApi;
+#[cfg(target_os = "macos")]
+use cloudreve_api::models::explorer::file_type;
 use cloudreve_api::models::explorer::{FileEvent, FileEventData, FileEventType};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
 #[cfg(not(target_os = "macos"))]
 use std::{collections::HashMap, path::Path};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 const INITIAL_BACKOFF_SECS: u64 = 1;
 const MAX_BACKOFF_SECS: u64 = 32;
@@ -124,7 +126,7 @@ impl Mount {
                 return ListenResult::Error {
                     error: e.into(),
                     was_connected: false,
-                }
+                };
             }
         };
         let mut was_connected = false;
@@ -248,6 +250,7 @@ impl Mount {
             // create/modify events; bogus ones trigger a full rescan instead.
             let mut verified_events: Vec<&FileEventData> = Vec::new();
             let mut content_refresh_candidates = Vec::new();
+            let mut local_upload_echo_paths = HashSet::new();
             let mut needs_rescan = false;
             for e in &events {
                 match e.event_type {
@@ -256,13 +259,32 @@ impl Mount {
                         let info = self
                             .cr_client
                             .get_file_info(&cloudreve_api::models::explorer::GetFileInfoService {
-                                uri: Some(uri),
+                                uri: Some(uri.clone()),
                                 ..Default::default()
                             })
                             .await;
                         match info {
                             Ok(info) => {
-                                if e.event_type == FileEventType::Modify
+                                let local_upload_echo = if info.file_type == file_type::FILE {
+                                    match crate::fileprovider::consume_upload_receipt(
+                                        &drive_id, &uri,
+                                    ) {
+                                        Ok(consumed) => consumed,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                target: "drive::remote_events",
+                                                error = %error,
+                                                "Failed to match File Provider upload receipt"
+                                            );
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
+                                if local_upload_echo {
+                                    local_upload_echo_paths.insert(e.from.clone());
+                                } else if e.event_type == FileEventType::Modify
                                     && info.file_type == file_type::FILE
                                 {
                                     content_refresh_candidates
@@ -285,8 +307,11 @@ impl Mount {
             let events_to_log: Vec<FileEventData> =
                 verified_events.iter().map(|e| (*e).clone()).collect();
             if !events_to_log.is_empty() {
-                if let Err(e) = crate::fileprovider::append_domain_events(&drive_id, &events_to_log)
-                {
+                if let Err(e) = crate::fileprovider::append_domain_events(
+                    &drive_id,
+                    &events_to_log,
+                    &local_upload_echo_paths,
+                ) {
                     tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP domain events");
                 } else {
                     for event in &events_to_log {
@@ -324,6 +349,11 @@ impl Mount {
                 }
             }
             for e in &events_to_log {
+                if local_upload_echo_paths.contains(&e.from)
+                    || (!e.to.is_empty() && local_upload_echo_paths.contains(&e.to))
+                {
+                    continue;
+                }
                 let rel = if e.to.is_empty() { &e.from } else { &e.to };
                 if rel
                     .rsplit('/')
@@ -334,13 +364,23 @@ impl Mount {
                     continue; // Finder metadata, not real activity
                 }
                 let local_path = match &fp_root {
-                    Some(root) => format!("{}{}", root.trim_end_matches('/'), rel),
+                    Some(root) => format!(
+                        "{}/{}",
+                        root.trim_end_matches('/'),
+                        rel.trim_start_matches('/')
+                    ),
                     None => rel.clone(),
+                };
+                let activity_type = match e.event_type {
+                    FileEventType::Create => "sync_create",
+                    FileEventType::Modify => "sync_modify",
+                    FileEventType::Rename => "sync_rename",
+                    FileEventType::Delete => "sync_delete",
                 };
                 let mut record = crate::inventory::NewTaskRecord::new(
                     format!("fp-{}", uuid::Uuid::new_v4()),
                     drive_id.clone(),
-                    "download",
+                    activity_type,
                     local_path,
                 );
                 record.status = crate::inventory::TaskStatus::Completed;
@@ -362,11 +402,13 @@ impl Mount {
                 &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
             );
             for (item_identifier, local_path) in materialized_updates {
-                tokio::spawn(crate::fileprovider::refresh_materialized_item_after_remote_update(
-                    domain_id.clone(),
-                    item_identifier,
-                    local_path,
-                ));
+                tokio::spawn(
+                    crate::fileprovider::refresh_materialized_item_after_remote_update(
+                        domain_id.clone(),
+                        item_identifier,
+                        local_path,
+                    ),
+                );
             }
             return Ok(());
         }

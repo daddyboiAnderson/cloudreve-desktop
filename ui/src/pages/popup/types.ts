@@ -26,6 +26,10 @@ export interface TaskRecord {
   progress: number;
   total_bytes: number;
   processed_bytes: number;
+  custom_state?: {
+    file_provider_item_identifier?: string;
+    remote_uri?: string;
+  };
   error?: string;
   created_at: number;
   updated_at: number;

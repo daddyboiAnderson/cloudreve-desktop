@@ -580,7 +580,8 @@ final class CloudreveClient {
         from fileURL: URL,
         overwrite: Bool,
         previousVersion: String? = nil,
-        progress: Progress
+        progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)? = nil
     ) async throws
     {
         let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
@@ -612,6 +613,7 @@ final class CloudreveClient {
         let chunkSize = max(credential.chunk_size ?? 0, 1)
         let encryptor = try credential.encrypt_metadata.map(UploadEncryptor.init(metadata:))
         progress.totalUnitCount = size
+        onProgress?(0, size)
 
         do {
             let handle = try FileHandle(forReadingFrom: fileURL)
@@ -626,6 +628,7 @@ final class CloudreveClient {
                 let uploadData = try encryptor?.encrypt(data, at: byteOffset) ?? data
                 try await uploadChunk(credential: credential, index: index, data: uploadData)
                 progress.completedUnitCount += Int64(data.count)
+                onProgress?(progress.completedUnitCount, size)
                 byteOffset += UInt64(data.count)
                 index += 1
                 if data.isEmpty { break }  // zero-byte file: single empty chunk
@@ -704,9 +707,17 @@ final class CloudreveClient {
 
     /// Downloads `sourceURL` to `dest`, reporting into `progress`.
     func download(
-        _ sourceURL: URL, to dest: URL, itemSize: Int64, progress: Progress
+        _ sourceURL: URL,
+        to dest: URL,
+        itemSize: Int64,
+        progress: Progress,
+        onProgress: ((Int64, Int64) -> Void)? = nil
     ) async throws {
-        let delegate = DownloadDelegate(dest: dest, progress: progress, expectedSize: itemSize)
+        let delegate = DownloadDelegate(
+            dest: dest,
+            progress: progress,
+            expectedSize: itemSize,
+            onProgress: onProgress)
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         try await withTaskCancellationHandler {
@@ -726,14 +737,21 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     let dest: URL
     let progress: Progress
     let expectedSize: Int64
+    let onProgress: ((Int64, Int64) -> Void)?
     var continuation: CheckedContinuation<Void, Error>?
     private let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "download")
 
-    init(dest: URL, progress: Progress, expectedSize: Int64) {
+    init(
+        dest: URL,
+        progress: Progress,
+        expectedSize: Int64,
+        onProgress: ((Int64, Int64) -> Void)?
+    ) {
         self.dest = dest
         self.progress = progress
         self.expectedSize = expectedSize
+        self.onProgress = onProgress
     }
 
     func urlSession(
@@ -744,6 +762,7 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
         let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : expectedSize
         if total > 0 { progress.totalUnitCount = total }
         progress.completedUnitCount = totalBytesWritten
+        onProgress?(totalBytesWritten, total)
     }
 
     func urlSession(

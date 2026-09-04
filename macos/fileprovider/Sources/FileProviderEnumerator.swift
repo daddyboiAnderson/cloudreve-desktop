@@ -142,7 +142,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 var downloadedContentUpdates: [NSFileProviderItemIdentifier] = []
                 for change in changes {
                     if let identifier = try await apply(change: change, to: observer) {
-                        downloadedContentUpdates.append(identifier)
+                        if change.localEcho != true {
+                            downloadedContentUpdates.append(identifier)
+                        }
                     }
                 }
                 // Deliver queued Keep Downloaded policy changes.

@@ -11,6 +11,7 @@
 #![cfg(target_os = "macos")]
 
 use std::{
+    collections::HashMap,
     ffi::CString,
     fs::File,
     io::Read,
@@ -20,15 +21,14 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{class, msg_send, AllocAnyThread};
+use objc2::{AllocAnyThread, class, msg_send};
 use objc2_file_provider::NSFileProviderDomain;
 use objc2_foundation::{
-    NSArray, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSRange, NSString,
-    NSURL,
+    NSArray, NSError, NSFileCoordinator, NSFileCoordinatorReadingOptions, NSRange, NSString, NSURL,
 };
 use tokio::sync::oneshot;
 
@@ -38,6 +38,84 @@ use crate::{DriveConfig, FileProviderStatus};
 /// domains registered by other providers (iCloud, Nextcloud, ...).
 const DOMAIN_PREFIX: &str = "cloudreve.drive.";
 const DOWNLOAD_RETRY_DIRECTORY: &str = "fileprovider-download-retries";
+const ACTIVITY_DIRECTORY: &str = "fileprovider-activity";
+const UPLOAD_RECEIPT_DIRECTORY: &str = "fileprovider-upload-receipts";
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FileProviderActivityRecord {
+    pub id: String,
+    pub drive_id: String,
+    pub operation: String,
+    pub uri: String,
+    pub item_identifier: String,
+    pub filename: String,
+    pub status: String,
+    pub total_bytes: i64,
+    pub processed_bytes: i64,
+    pub speed_bytes_per_sec: i64,
+    pub eta_seconds: Option<i64>,
+    pub error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn read_activity(drive_id: &str) -> Result<Vec<FileProviderActivityRecord>> {
+    let home = dirs::home_dir().context("Failed to get user home directory")?;
+    let path = home
+        .join(".cloudreve")
+        .join(ACTIVITY_DIRECTORY)
+        .join(format!("{drive_id}.json"));
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("Failed to read File Provider activity"),
+    };
+    let records: Vec<FileProviderActivityRecord> =
+        serde_json::from_slice(&data).context("Failed to parse File Provider activity")?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.drive_id == drive_id)
+        .collect())
+}
+
+#[derive(serde::Deserialize)]
+struct FileProviderUploadReceipt {
+    drive_id: String,
+    uri: String,
+    completed_at: i64,
+}
+
+pub fn consume_upload_receipt(drive_id: &str, uri: &str) -> Result<bool> {
+    static RECEIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = RECEIPT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let home = dirs::home_dir().context("Failed to get user home directory")?;
+    let directory = home.join(".cloudreve").join(UPLOAD_RECEIPT_DIRECTORY);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("Failed to read File Provider upload receipts"),
+    };
+    let now = chrono::Utc::now().timestamp();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(receipt) = serde_json::from_slice::<FileProviderUploadReceipt>(&data) else {
+            continue;
+        };
+        let age = now.saturating_sub(receipt.completed_at);
+        if age > 5 * 60 {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        if age >= -10 && receipt.drive_id == drive_id && receipt.uri == uri {
+            std::fs::remove_file(path).context("Failed to consume File Provider upload receipt")?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 pub fn domain_identifier(drive_id: &str) -> String {
     format!("{DOMAIN_PREFIX}{drive_id}")
@@ -99,7 +177,25 @@ pub async fn user_visible_item_url(
 }
 
 pub async fn user_visible_url(domain_id: &str, display_name: &str) -> Option<String> {
-    user_visible_item_url(domain_id, display_name, ROOT_CONTAINER).await
+    static ROOT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let key = format!("{domain_id}\0{display_name}");
+    if let Some(path) = ROOT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&key)
+        .cloned()
+    {
+        return Some(path);
+    }
+
+    let path = user_visible_item_url(domain_id, display_name, ROOT_CONTAINER).await?;
+    ROOT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key, path.clone());
+    Some(path)
 }
 
 const SF_DATALESS: u32 = 0x4000_0000;
@@ -272,6 +368,8 @@ pub struct FpEventRecord {
     pub from: String,
     #[serde(default)]
     pub to: String,
+    #[serde(default)]
+    pub local_echo: bool,
 }
 
 static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -328,6 +426,7 @@ pub fn request_local_state_reset(drive_id: &str) -> Result<()> {
 pub fn append_domain_events(
     drive_id: &str,
     events: &[cloudreve_api::models::explorer::FileEventData],
+    local_echo_paths: &std::collections::HashSet<String>,
 ) -> Result<()> {
     use std::io::Write;
     let _guard = EVENT_LOG_LOCK
@@ -347,6 +446,8 @@ pub fn append_domain_events(
             event_type: format!("{:?}", e.event_type).to_lowercase(),
             from: e.from.clone(),
             to: e.to.clone(),
+            local_echo: local_echo_paths.contains(&e.from)
+                || (!e.to.is_empty() && local_echo_paths.contains(&e.to)),
         };
         lines.push_str(&serde_json::to_string(&record)?);
         lines.push('\n');
@@ -380,6 +481,7 @@ pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
         event_type: "rescan".to_string(),
         from: String::new(),
         to: String::new(),
+        local_echo: false,
     };
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -407,6 +509,7 @@ pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<
             event_type: "metadata_rescan".to_string(),
             from: String::new(),
             to: String::new(),
+            local_echo: false,
         };
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -436,6 +539,7 @@ pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<
             event_type: "metadata".to_string(),
             from: source_uri.clone(),
             to: String::new(),
+            local_echo: false,
         };
         writeln!(file, "{}", serde_json::to_string(&record)?)?;
     }
@@ -468,6 +572,7 @@ pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<(
             event_type: "metadata_name".to_string(),
             from: name.clone(),
             to: String::new(),
+            local_echo: false,
         };
         writeln!(file, "{}", serde_json::to_string(&record)?)?;
     }

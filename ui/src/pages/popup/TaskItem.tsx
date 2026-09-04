@@ -12,6 +12,10 @@ import {
   Error as ErrorIcon,
   CloudUpload as UploadIcon,
   CloudDownload as DownloadIcon,
+  AddCircleOutline as AddIcon,
+  Sync as SyncIcon,
+  DriveFileRenameOutline as RenameIcon,
+  DeleteOutline as DeleteIcon,
   ExpandMore as ExpandMoreIcon,
 } from "@mui/icons-material";
 import { invoke } from "@tauri-apps/api/core";
@@ -43,6 +47,13 @@ export default function TaskItem({
   const liveProgress = activeTask.live_progress;
   const progress = liveProgress?.progress ?? task.progress;
   const isUpload = task.task_type === "upload";
+  const isLegacyMacSync =
+    task.task_type === "download" &&
+    task.id.startsWith("fp-") &&
+    !task.id.startsWith("fp-transfer-") &&
+    task.total_bytes === 0 &&
+    task.processed_bytes === 0;
+  const isDownload = task.task_type === "download" && !isLegacyMacSync;
   const fileName = getFileName(task.local_path);
   const parentFolderName = getParentFolderName(task.local_path);
   const isFailed = task.status === "Failed";
@@ -59,18 +70,33 @@ export default function TaskItem({
         : t("popup.downloading", "Downloading");
     }
     if (task.status === "Completed") {
-      return isUpload
-        ? t("popup.uploaded", "Uploaded")
-        : t("popup.downloaded", "Downloaded");
+      switch (task.task_type) {
+        case "upload":
+          return t("popup.uploaded", "Uploaded");
+        case "download":
+          return isLegacyMacSync
+            ? t("popup.synced", "Synced")
+            : t("popup.downloaded", "Downloaded");
+        case "sync_create":
+          return t("popup.itemAdded", "Added");
+        case "sync_modify":
+          return t("popup.itemUpdated", "Updated");
+        case "sync_rename":
+          return t("popup.itemRenamed", "Renamed");
+        case "sync_delete":
+          return t("popup.itemDeleted", "Deleted");
+        default:
+          return t("popup.synced", "Synced");
+      }
     }
     if (task.status === "Cancelled") {
       return isUpload
         ? t("popup.uploadCancelled", "Upload cancelled")
         : t("popup.downloadCancelled", "Download cancelled");
     }
-    return isUpload
-      ? t("popup.uploadFailed", "Upload failed")
-      : t("popup.downloadFailed", "Download failed");
+    if (isUpload) return t("popup.uploadFailed", "Upload failed");
+    if (isDownload) return t("popup.downloadFailed", "Download failed");
+    return t("popup.syncFailed", "Sync failed");
   })();
 
   const timeAgoFormatter = (
@@ -124,6 +150,29 @@ export default function TaskItem({
   const progressText = getProgressText();
   const canExpand = historyCount > 1 && Boolean(onToggleHistory);
 
+  const historyIcon = (() => {
+    switch (task.task_type) {
+      case "upload":
+        return <UploadIcon fontSize="small" />;
+      case "download":
+        return isLegacyMacSync ? (
+          <SyncIcon fontSize="small" />
+        ) : (
+          <DownloadIcon fontSize="small" />
+        );
+      case "sync_create":
+        return <AddIcon fontSize="small" />;
+      case "sync_modify":
+        return <SyncIcon fontSize="small" />;
+      case "sync_rename":
+        return <RenameIcon fontSize="small" />;
+      case "sync_delete":
+        return <DeleteIcon fontSize="small" />;
+      default:
+        return <SyncIcon fontSize="small" />;
+    }
+  })();
+
   const toggleOnKeyboard = (event: React.KeyboardEvent) => {
     if (!canExpand || (event.key !== "Enter" && event.key !== " ")) return;
     event.preventDefault();
@@ -163,7 +212,7 @@ export default function TaskItem({
                       : "primary.main",
               }}
             >
-              {isUpload ? <UploadIcon fontSize="small" /> : <DownloadIcon fontSize="small" />}
+              {historyIcon}
             </Box>
           ) : (
             <FileIcon path={task.local_path} size={28} />

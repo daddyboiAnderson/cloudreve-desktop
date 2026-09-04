@@ -7,8 +7,8 @@ pub use types::*;
 use crate::EventBroadcaster;
 use crate::drive::commands::ManagerCommand;
 use crate::drive::mounts::{Credentials, DriveConfig, Mount};
-use crate::inventory::InventoryDb;
-use crate::tasks::TaskProgress;
+use crate::inventory::{InventoryDb, TaskRecord, TaskStatus};
+use crate::tasks::{TaskKind, TaskProgress};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
@@ -602,7 +602,7 @@ impl DriveManager {
         }
 
         // Merge progress info into active tasks
-        let active_tasks: Vec<TaskWithProgress> = recent_tasks
+        let mut active_tasks: Vec<TaskWithProgress> = recent_tasks
             .active
             .into_iter()
             .map(|task| {
@@ -614,10 +614,113 @@ impl DriveManager {
             })
             .collect();
 
+        let mut finished_tasks = recent_tasks.finished;
+
+        #[cfg(target_os = "macos")]
+        for drive in drives
+            .iter()
+            .filter(|drive| drive_id.map_or(true, |filter| drive.id == filter))
+        {
+            let records = match crate::fileprovider::read_activity(&drive.id) {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "fileprovider",
+                        drive_id = %drive.id,
+                        error = %error,
+                        "Failed to read File Provider transfer activity"
+                    );
+                    continue;
+                }
+            };
+            if records.is_empty() {
+                continue;
+            }
+
+            let domain_id = crate::fileprovider::domain_identifier(&drive.id);
+            let visible_root = crate::fileprovider::user_visible_url(&domain_id, &drive.name).await;
+            for record in records {
+                let Some(kind) = TaskKind::from_str(&record.operation) else {
+                    continue;
+                };
+                let status = match record.status.as_str() {
+                    "running" => TaskStatus::Running,
+                    "completed" => TaskStatus::Completed,
+                    "failed" => TaskStatus::Failed,
+                    "cancelled" => TaskStatus::Cancelled,
+                    _ => continue,
+                };
+                let relative_path = record
+                    .uri
+                    .strip_prefix(drive.remote_path.trim_end_matches('/'))
+                    .unwrap_or(&record.uri)
+                    .trim_start_matches('/')
+                    .to_string();
+                let local_path = visible_root
+                    .as_ref()
+                    .map(|root| format!("{}/{}", root.trim_end_matches('/'), relative_path))
+                    .unwrap_or_else(|| record.uri.clone());
+                let progress = if record.total_bytes > 0 {
+                    (record.processed_bytes as f64 / record.total_bytes as f64).clamp(0.0, 1.0)
+                } else if status == TaskStatus::Completed {
+                    1.0
+                } else {
+                    0.0
+                };
+                let custom_state = Some(serde_json::json!({
+                    "file_provider_item_identifier": record.item_identifier,
+                    "remote_uri": record.uri,
+                }));
+                let task = TaskRecord {
+                    id: record.id,
+                    drive_id: record.drive_id,
+                    task_type: record.operation,
+                    local_path: if relative_path.is_empty() {
+                        visible_root.clone().unwrap_or(record.filename)
+                    } else {
+                        local_path
+                    },
+                    status,
+                    progress,
+                    total_bytes: record.total_bytes,
+                    processed_bytes: record.processed_bytes,
+                    priority: 0,
+                    custom_state: custom_state.clone(),
+                    error: record.error,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                };
+
+                if status.is_active() {
+                    active_tasks.push(TaskWithProgress {
+                        live_progress: Some(TaskProgress {
+                            task_id: task.id.clone(),
+                            kind,
+                            local_path: task.local_path.clone(),
+                            progress,
+                            processed_bytes: Some(task.processed_bytes),
+                            total_bytes: Some(task.total_bytes),
+                            speed_bytes_per_sec: record.speed_bytes_per_sec.max(0) as u64,
+                            eta_seconds: record.eta_seconds.and_then(|value| value.try_into().ok()),
+                            custom_state,
+                        }),
+                        task,
+                    });
+                } else {
+                    finished_tasks.push(task);
+                }
+            }
+        }
+
+        active_tasks.sort_by(|left, right| right.task.updated_at.cmp(&left.task.updated_at));
+        active_tasks.truncate(25);
+        finished_tasks.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        finished_tasks.truncate(25);
+
         Ok(StatusSummary {
             drives,
             active_tasks,
-            finished_tasks: recent_tasks.finished,
+            finished_tasks,
             pending_conflicts,
         })
     }

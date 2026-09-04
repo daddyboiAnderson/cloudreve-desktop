@@ -95,6 +95,12 @@ final class RemoteStore {
         let type: String  // create | modify | metadata | rename | delete
         let from: String  // path relative to drive root, or an absolute URI
         let to: String?
+        let localEcho: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case ts, type, from, to
+            case localEcho = "local_echo"
+        }
     }
 
     private var eventsFileURL: URL {

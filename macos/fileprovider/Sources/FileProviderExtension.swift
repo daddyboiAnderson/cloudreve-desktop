@@ -21,6 +21,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             ? String(domain.identifier.rawValue.dropFirst(Self.domainPrefix.count))
             : domain.identifier.rawValue
         if let drive = DriveStore.loadDrive(driveID: driveID) {
+            FileProviderActivityStore.markInterruptedActivitiesFailed(driveID: drive.id)
             self.store = RemoteStore(drive: drive, domain: domain)
             self.pendingMonitor = FileProviderPendingMonitor(drive: drive, domain: domain)
             logger.notice(
@@ -181,10 +182,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 at: createdAt,
                 collisionIndex: index)
             do {
-                try await store.client.uploadFile(
+                try await uploadFile(
                     at: parent + "/" + copyName,
                     from: contents,
                     overwrite: false,
+                    itemIdentifier: item.itemIdentifier,
+                    filename: copyName,
+                    store: store,
                     progress: progress)
                 return
             } catch CloudreveError.nameCollision {
@@ -192,6 +196,42 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         }
         throw CloudreveError.nameCollision
+    }
+
+    private func uploadFile(
+        at uri: String,
+        from contents: URL,
+        overwrite: Bool,
+        previousVersion: String? = nil,
+        itemIdentifier: NSFileProviderItemIdentifier,
+        filename: String,
+        store: RemoteStore,
+        progress: Progress
+    ) async throws {
+        let size = ((try? FileManager.default.attributesOfItem(atPath: contents.path)[.size])
+            as? NSNumber)?.int64Value ?? 0
+        let activity = FileProviderActivity(
+            driveID: store.drive.id,
+            operation: "upload",
+            uri: uri,
+            itemIdentifier: itemIdentifier.rawValue,
+            filename: filename,
+            totalBytes: size)
+        do {
+            try await store.client.uploadFile(
+                at: uri,
+                from: contents,
+                overwrite: overwrite,
+                previousVersion: previousVersion,
+                progress: progress,
+                onProgress: { processed, total in
+                    activity.update(processedBytes: processed, totalBytes: total)
+                })
+            activity.complete()
+        } catch {
+            activity.fail(error)
+            throw error
+        }
     }
 
     // MARK: - Metadata
@@ -290,6 +330,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             return progress
         }
         let task = Task {
+            var activity: FileProviderActivity?
             do {
                 let uri = store.uri(for: itemIdentifier)
                 let needsConflictRefresh = UploadConflictStore.needsContentRefresh(
@@ -319,8 +360,21 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let tmp = FileManager.default.temporaryDirectory
                     .appendingPathComponent("cloudreve-fp-\(UUID().uuidString)")
                 let size = item.documentSize?.int64Value ?? 0
+                activity = FileProviderActivity(
+                    driveID: store.drive.id,
+                    operation: "download",
+                    uri: uri,
+                    itemIdentifier: itemIdentifier.rawValue,
+                    filename: item.filename,
+                    totalBytes: size)
                 try await store.client.download(
-                    downloadURL, to: tmp, itemSize: size, progress: progress)
+                    downloadURL,
+                    to: tmp,
+                    itemSize: size,
+                    progress: progress,
+                    onProgress: { processed, total in
+                        activity?.update(processedBytes: processed, totalBytes: total)
+                    })
                 if shouldCancelSystemDownload(
                     request: request,
                     itemIdentifier: itemIdentifier,
@@ -330,6 +384,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     isExplicitRetry: isExplicitRetry)
                 {
                     try? FileManager.default.removeItem(at: tmp)
+                    activity?.fail(CocoaError(.userCancelled))
                     logger.notice(
                         "discarded blocked system download for \(itemIdentifier.rawValue, privacy: .public)"
                     )
@@ -338,6 +393,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 }
                 logger.notice(
                     "served contents of \(item.filename, privacy: .public) (\(size) bytes)")
+                activity?.complete()
                 if needsConflictRefresh {
                     UploadConflictStore.finishContentRefresh(
                         driveID: store.drive.id, uri: uri)
@@ -349,6 +405,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 }
                 completionHandler(tmp, item, nil)
             } catch {
+                activity?.fail(error)
                 logger.error(
                     "fetchContents failed for \(itemIdentifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                 )
@@ -453,8 +510,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: true)
                 } else if let contentURL = url {
                     // Upload files with supplied content.
-                    try await store.client.uploadFile(
-                        at: uri, from: contentURL, overwrite: false, progress: progress)
+                    try await uploadFile(
+                        at: uri,
+                        from: contentURL,
+                        overwrite: false,
+                        itemIdentifier: itemTemplate.itemIdentifier,
+                        filename: itemTemplate.filename,
+                        store: store,
+                        progress: progress)
                     file = try await store.client.fileInfoWithShareState(uri: uri)
                 } else {
                     file = try await store.client.createFileOrFolder(uri: uri, isFolder: false)
@@ -622,11 +685,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         return
                     }
 
-                    try await store.client.uploadFile(
+                    try await uploadFile(
                         at: uri,
                         from: newContents,
                         overwrite: true,
                         previousVersion: previousVersion,
+                        itemIdentifier: item.itemIdentifier,
+                        filename: item.filename,
+                        store: store,
                         progress: progress)
                     UploadConflictStore.remove(
                         id: UploadConflictStore.identifier(
