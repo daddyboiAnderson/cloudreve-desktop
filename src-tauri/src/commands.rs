@@ -16,9 +16,9 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 #[cfg(target_os = "macos")]
-use objc2::MainThreadMarker;
-#[cfg(target_os = "macos")]
 use objc2::runtime::AnyObject;
+#[cfg(target_os = "macos")]
+use objc2::MainThreadMarker;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::NSApp as ns_app;
 #[cfg(target_os = "macos")]
@@ -27,20 +27,20 @@ use objc2_app_kit::{
     NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow, NSWindowButton,
 };
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSString};
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 #[cfg(target_os = "macos")]
 use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 #[cfg(windows)]
 use tauri::utils::{config::WindowEffectsConfig, WindowEffect};
 #[cfg(target_os = "macos")]
-use tauri::PhysicalPosition;
-#[cfg(target_os = "macos")]
 use tauri::LogicalPosition;
+#[cfg(target_os = "macos")]
+use tauri::PhysicalPosition;
 #[cfg(target_os = "macos")]
 use tauri::TitleBarStyle;
 use tauri::{
@@ -815,6 +815,151 @@ pub async fn resolve_all_conflicts(
     Ok((total_success, total_failed))
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn get_upload_conflict(
+    state: State<'_, AppStateHandle>,
+    id: String,
+) -> CommandResult<crate::upload_conflict::UploadConflictRecord> {
+    let mut conflict = crate::upload_conflict::get(&id).map_err(|error| error.to_string())?;
+    if let Some(owner_id) = conflict.owner_id.as_deref() {
+        if let Ok((mount, _)) = get_share_mount(&state, &conflict.drive_id).await {
+            if let Ok(user) = mount.cr_client.get_user_info(owner_id).await {
+                conflict.owner_name = Some(user.nickname);
+            }
+        }
+    }
+    Ok(conflict)
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn resolve_upload_conflict(id: String, action: String) -> CommandResult<()> {
+    let record =
+        crate::upload_conflict::set_action(&id, &action).map_err(|error| error.to_string())?;
+    let domain_id = cloudreve_sync::fileprovider::domain_identifier(&record.drive_id);
+    cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(&domain_id, &record.drive_name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+async fn file_provider_issues(
+    state: &State<'_, AppStateHandle>,
+) -> CommandResult<(
+    Vec<DriveConfig>,
+    Vec<crate::file_provider_issue::FileProviderIssue>,
+)> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let drives = app_state.drive_manager.list_drives().await;
+    let drive_ids = drives
+        .iter()
+        .map(|drive| drive.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let issues = crate::file_provider_issue::list(&drive_ids).map_err(|error| error.to_string())?;
+    Ok((drives, issues))
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn list_file_provider_issues(
+    state: State<'_, AppStateHandle>,
+    drive_id: Option<String>,
+) -> CommandResult<Vec<crate::file_provider_issue::FileProviderIssue>> {
+    let (_, mut issues) = file_provider_issues(&state).await?;
+    if let Some(drive_id) = drive_id {
+        issues.retain(|issue| issue.drive_id == drive_id);
+    }
+    Ok(issues)
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn resolve_file_provider_issue(
+    state: State<'_, AppStateHandle>,
+    issue_id: String,
+    action: String,
+) -> CommandResult<()> {
+    let (drives, issues) = file_provider_issues(&state).await?;
+    let issue = issues
+        .into_iter()
+        .find(|issue| issue.id == issue_id)
+        .ok_or_else(|| "This Finder issue is no longer available".to_string())?;
+    let drive = drives
+        .into_iter()
+        .find(|drive| drive.id == issue.drive_id)
+        .ok_or_else(|| "Drive is no longer available".to_string())?;
+    let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+
+    if issue.source == "upload_conflict" {
+        let conflict_id = issue
+            .conflict_id
+            .ok_or_else(|| "Upload conflict is no longer available".to_string())?;
+        crate::upload_conflict::set_action(&conflict_id, &action)
+            .map_err(|error| error.to_string())?;
+        return cloudreve_sync::fileprovider::signal_cannot_synchronize_resolved(
+            &domain_id,
+            &drive.name,
+        )
+        .await
+        .map_err(|error| error.to_string());
+    }
+
+    if action != "retry" {
+        return Err("Only retry is available for this Finder issue".to_string());
+    }
+    match issue.operation.as_str() {
+        "upload" => cloudreve_sync::fileprovider::retry_item_upload(
+            &domain_id,
+            &drive.name,
+            &issue.item_identifier,
+            issue.error_domain.as_deref(),
+            issue.error_code,
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        "download" => cloudreve_sync::fileprovider::retry_item_download(
+            &domain_id,
+            &drive.name,
+            &issue.item_identifier,
+            issue.error_domain.as_deref(),
+            issue.error_code,
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        _ => Err("Unknown Finder operation".to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn reveal_file_provider_issue(
+    state: State<'_, AppStateHandle>,
+    issue_id: String,
+) -> CommandResult<()> {
+    let (drives, issues) = file_provider_issues(&state).await?;
+    let issue = issues
+        .into_iter()
+        .find(|issue| issue.id == issue_id)
+        .ok_or_else(|| "This Finder issue is no longer available".to_string())?;
+    let drive = drives
+        .into_iter()
+        .find(|drive| drive.id == issue.drive_id)
+        .ok_or_else(|| "Drive is no longer available".to_string())?;
+    let domain_id = cloudreve_sync::fileprovider::domain_identifier(&drive.id);
+    let path = cloudreve_sync::fileprovider::user_visible_item_url(
+        &domain_id,
+        &drive.name,
+        &issue.item_identifier,
+    )
+    .await
+    .ok_or_else(|| "Finder could not locate this item".to_string())?;
+    showfile::show_path_in_file_manager(path);
+    Ok(())
+}
+
 /// Get all drives with their status information for the settings UI
 #[tauri::command]
 pub async fn get_drives_info(state: State<'_, AppStateHandle>) -> CommandResult<Vec<DriveInfo>> {
@@ -928,37 +1073,33 @@ pub async fn get_system_symbol(app: AppHandle, name: String) -> CommandResult<St
                 NSFontWeightSemibold,
             )
         };
-        let color = NSImageSymbolConfiguration::configurationWithHierarchicalColor(
-            &NSColor::whiteColor(),
-        );
+        let color =
+            NSImageSymbolConfiguration::configurationWithHierarchicalColor(&NSColor::whiteColor());
         let configuration = point_size.configurationByApplyingConfiguration(&color);
-        let result = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &symbol_name,
-            None,
-        )
-        .and_then(|image| image.imageWithSymbolConfiguration(&configuration))
-        .and_then(|image| image.TIFFRepresentation())
-        .and_then(|data| NSBitmapImageRep::imageRepWithData(&data))
-        .and_then(|representation| {
-            let properties =
-                NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
-            unsafe {
-                representation.representationUsingType_properties(
-                    NSBitmapImageFileType::PNG,
-                    &properties,
-                )
-            }
-        })
-        .map(|data| {
-            let length = data.length() as usize;
-            let mut bytes = vec![0u8; length];
-            if length > 0 {
-                let buffer = NonNull::new(bytes.as_mut_ptr() as *mut c_void)
-                    .expect("non-empty image data has a buffer");
-                unsafe { data.getBytes_length(buffer, length as _) };
-            }
-            format!("data:image/png;base64,{}", BASE64.encode(bytes))
-        });
+        let result =
+            NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol_name, None)
+                .and_then(|image| image.imageWithSymbolConfiguration(&configuration))
+                .and_then(|image| image.TIFFRepresentation())
+                .and_then(|data| NSBitmapImageRep::imageRepWithData(&data))
+                .and_then(|representation| {
+                    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, AnyObject>::new();
+                    unsafe {
+                        representation.representationUsingType_properties(
+                            NSBitmapImageFileType::PNG,
+                            &properties,
+                        )
+                    }
+                })
+                .map(|data| {
+                    let length = data.length() as usize;
+                    let mut bytes = vec![0u8; length];
+                    if length > 0 {
+                        let buffer = NonNull::new(bytes.as_mut_ptr() as *mut c_void)
+                            .expect("non-empty image data has a buffer");
+                        unsafe { data.getBytes_length(buffer, length as _) };
+                    }
+                    format!("data:image/png;base64,{}", BASE64.encode(bytes))
+                });
         let _ = sender.send(result.ok_or_else(|| "SF Symbol unavailable".to_string()));
     })
     .map_err(|error| format!("Could not render SF Symbol: {error}"))?;
@@ -1225,28 +1366,24 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
 
             // Hide the popup on close or focus loss.
             let window_for_events = window.clone();
-            window.on_window_event(move |event| {
-                match event {
-                    tauri::WindowEvent::CloseRequested { api, .. } => {
-                        if ConfigManager::get().fast_popup_launch() {
-                            api.prevent_close();
-                            let _ = window_for_events.hide();
-                            #[cfg(target_os = "macos")]
-                            crate::schedule_update_dock_visibility(
-                                &window_for_events.app_handle().clone(),
-                            );
-                        }
-                    }
-                    #[cfg(target_os = "macos")]
-                    tauri::WindowEvent::Focused(false) => {
-                        record_main_popup_focus_loss();
+            window.on_window_event(move |event| match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if ConfigManager::get().fast_popup_launch() {
+                        api.prevent_close();
                         let _ = window_for_events.hide();
+                        #[cfg(target_os = "macos")]
                         crate::schedule_update_dock_visibility(
                             &window_for_events.app_handle().clone(),
                         );
                     }
-                    _ => {}
                 }
+                #[cfg(target_os = "macos")]
+                tauri::WindowEvent::Focused(false) => {
+                    record_main_popup_focus_loss();
+                    let _ = window_for_events.hide();
+                    crate::schedule_update_dock_visibility(&window_for_events.app_handle().clone());
+                }
+                _ => {}
             });
 
             // Show once before positioning so AppKit assigns a monitor.
@@ -1300,10 +1437,95 @@ pub fn handle_deep_link(app: &AppHandle, raw_url: &str) {
             tracing::warn!(target: "share", "Ignoring share deep link without drive_id or uri");
             return;
         }
+
+        #[cfg(target_os = "macos")]
+        {
+            let is_upload_conflict = url.scheme() == "cloudreve"
+                && (url.host_str() == Some("upload-conflict")
+                    || url.path().trim_matches('/') == "upload-conflict");
+            if is_upload_conflict {
+                if let Some(id) = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "id")
+                    .map(|(_, value)| value.into_owned())
+                {
+                    show_upload_conflict_window_impl(app, &id);
+                    return;
+                }
+                tracing::warn!(target: "upload_conflict", "Ignoring conflict deep link without id");
+                return;
+            }
+        }
     }
 
     let _ = app.emit("deeplink", raw_url.to_string());
     show_add_drive_window_impl(app);
+}
+
+#[cfg(target_os = "macos")]
+pub fn show_upload_conflict_window_impl(app: &AppHandle, id: &str) {
+    if let Ok(record) = crate::upload_conflict::get(id) {
+        // Failed modifications need a separate metadata event for Finder's badge.
+        cloudreve_sync::fileprovider::signal_metadata_refresh(
+            &record.drive_id,
+            &record.drive_name,
+            std::slice::from_ref(&record.uri),
+        );
+    }
+
+    if let Some(window) = app.get_webview_window("upload-conflict") {
+        let _ = app.show();
+        let _ = window.show();
+        let _ = window.unminimize();
+        crate::update_dock_visibility(app);
+        activate_app(app);
+        let _ = window.set_focus();
+        refresh_traffic_light_tracking(&window);
+        let _ = window.emit("upload-conflict-target", id.to_string());
+        return;
+    }
+
+    let url_path = format!(
+        "index.html/#/upload-conflict?id={}",
+        urlencoding::encode(id)
+    );
+    let builder = WebviewWindowBuilder::new(
+        app,
+        "upload-conflict",
+        WebviewUrl::App(get_url_with_lang(&url_path).into()),
+    )
+    .title("Upload Conflict")
+    .inner_size(500.0, 500.0)
+    .min_inner_size(460.0, 460.0)
+    .resizable(false)
+    .visible(false)
+    .decorations(true)
+    .title_bar_style(TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .skip_taskbar(true)
+    .minimizable(false)
+    .maximizable(false)
+    .transparent(true)
+    .traffic_light_position(LogicalPosition::new(16.0, 25.0));
+
+    let Some(builder) = apply_default_window_icon(builder, app, "upload-conflict") else {
+        return;
+    };
+    match builder.build() {
+        Ok(window) => {
+            update_dock_on_window_close(&window);
+            move_window_safely(&window, Position::Center, "upload-conflict");
+            let _ = app.show();
+            let _ = window.show();
+            crate::update_dock_visibility(app);
+            activate_app(app);
+            let _ = window.set_focus();
+            refresh_traffic_light_tracking(&window);
+        }
+        Err(error) => {
+            tracing::error!(target: "upload_conflict", error = %error, "Failed to create upload conflict window");
+        }
+    }
 }
 
 /// Show or create the Share window for a Finder item.

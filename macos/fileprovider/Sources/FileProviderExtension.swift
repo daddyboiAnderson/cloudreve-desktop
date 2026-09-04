@@ -13,6 +13,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
     private let domain: NSFileProviderDomain
     private let store: RemoteStore?
+    private let pendingMonitor: FileProviderPendingMonitor?
 
     required init(domain: NSFileProviderDomain) {
         self.domain = domain
@@ -21,6 +22,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             : domain.identifier.rawValue
         if let drive = DriveStore.loadDrive(driveID: driveID) {
             self.store = RemoteStore(drive: drive, domain: domain)
+            self.pendingMonitor = FileProviderPendingMonitor(drive: drive, domain: domain)
             logger.notice(
                 "FileProviderExtension started for domain \(domain.displayName, privacy: .public), drive \(drive.name, privacy: .public) @ \(drive.instance_url, privacy: .public)"
             )
@@ -30,14 +32,24 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             }
         } else {
             self.store = nil
+            self.pendingMonitor = nil
             logger.error(
                 "no drive config found for domain \(domain.identifier.rawValue, privacy: .public)")
         }
         super.init()
+        pendingMonitor?.refresh()
     }
 
     func invalidate() {
         logger.notice("FileProviderExtension invalidated")
+    }
+
+    func pendingItemsDidChange(completionHandler: @escaping () -> Void) {
+        guard let pendingMonitor else {
+            completionHandler()
+            return
+        }
+        pendingMonitor.refresh(completion: completionHandler)
     }
 
     private var unavailableError: Error {
@@ -50,13 +62,136 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         store: RemoteStore
     ) {
         guard let cloudreveError = error as? CloudreveError,
-            case let .lockConflict(path, application) = cloudreveError
+            case let .lockConflict(path, application, _) = cloudreveError
         else { return }
         store.markLocked(identifier, uri: path)
         logger.notice(
             "mutation blocked by \(application ?? "another application", privacy: .public)"
         )
         Task { await store.signalWorkingSet() }
+    }
+
+    private func versionToken(
+        for item: NSFileProviderItem, baseVersion: NSFileProviderItemVersion
+    ) -> String? {
+        if let token = (item as? FileProviderItem)?.remoteVersion, !token.isEmpty {
+            return token
+        }
+        guard var value = String(data: baseVersion.contentVersion, encoding: .utf8) else {
+            return nil
+        }
+        if value.hasSuffix("#thumbnail-v1") {
+            value.removeLast("#thumbnail-v1".count)
+        }
+        guard value.hasPrefix("entity:") else { return nil }
+        let token = String(value.dropFirst("entity:".count))
+        return token.isEmpty ? nil : token
+    }
+
+    private func uploadConflictError(_ record: UploadConflictRecord) -> Error {
+        let description: String
+        switch record.kind {
+        case .locked:
+            description = "Someone has this file open online. Choose how to handle your local changes."
+        case .stale:
+            description = "The online file changed before your edit could be uploaded."
+        case .unverified:
+            description = "Cloudreve could not verify which online version you edited."
+        }
+        return NSError(
+            domain: NSFileProviderErrorDomain,
+            code: NSFileProviderError.Code.cannotSynchronize.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: description])
+    }
+
+    @discardableResult
+    private func presentUploadConflict(_ record: UploadConflictRecord, force: Bool = false) -> Bool {
+        guard let claimed = UploadConflictStore.claimPresentation(id: record.id, force: force)
+        else { return true }
+        var components = URLComponents()
+        components.scheme = "cloudreve"
+        components.host = "upload-conflict"
+        components.queryItems = [URLQueryItem(name: "id", value: claimed.id)]
+        guard let url = components.url, NSWorkspace.shared.open(url) else {
+            logger.error("could not open upload conflict window")
+            return false
+        }
+        return true
+    }
+
+    private func pauseUpload(
+        for error: Error,
+        item: NSFileProviderItem,
+        uri: String,
+        previousVersion: String?,
+        store: RemoteStore,
+        forcePresentation: Bool = false
+    ) -> Error? {
+        let kind: UploadConflictKind
+        let application: String?
+        let ownerID: String?
+        switch error {
+        case CloudreveError.lockConflict(_, let owner, let lockingUserID):
+            kind = .locked
+            application = owner
+            ownerID = lockingUserID
+            store.markLocked(item.itemIdentifier, uri: uri)
+        case CloudreveError.staleVersion:
+            kind = .stale
+            application = nil
+            ownerID = nil
+        default:
+            return nil
+        }
+
+        do {
+            let record = try UploadConflictStore.saveConflict(
+                drive: store.drive,
+                uri: uri,
+                itemIdentifier: item.itemIdentifier,
+                filename: item.filename,
+                kind: kind,
+                application: application,
+                ownerID: ownerID,
+                previousVersion: previousVersion)
+            presentUploadConflict(record, force: forcePresentation)
+            Task { await store.signalWorkingSet() }
+            return uploadConflictError(record)
+        } catch {
+            logger.error(
+                "failed to record upload conflict: \(error.localizedDescription, privacy: .public)"
+            )
+            return FileProviderEnumerator.mapError(error)
+        }
+    }
+
+    private func uploadLocalCopy(
+        item: NSFileProviderItem,
+        contents: URL,
+        originalURI: String,
+        store: RemoteStore,
+        progress: Progress
+    ) async throws {
+        let parent = Self.parentURI(of: originalURI)
+        let createdAt = Date()
+
+        for index in 0..<100 {
+            let copyName = ConflictCopyNaming.make(
+                originalName: item.filename,
+                at: createdAt,
+                collisionIndex: index)
+            do {
+                try await store.client.uploadFile(
+                    at: parent + "/" + copyName,
+                    from: contents,
+                    overwrite: false,
+                    progress: progress)
+                return
+            } catch CloudreveError.nameCollision {
+                continue
+            }
+        }
+        throw CloudreveError.nameCollision
     }
 
     // MARK: - Metadata
@@ -156,39 +291,62 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         let task = Task {
             do {
+                let uri = store.uri(for: itemIdentifier)
+                let needsConflictRefresh = UploadConflictStore.needsContentRefresh(
+                    driveID: store.drive.id, uri: uri)
+                let isExplicitRetry = FileProviderDownloadRetryStore.isRequested(
+                    driveID: store.drive.id,
+                    itemIdentifier: itemIdentifier.rawValue)
                 // Refresh metadata before serving content.
                 let item = try await store.item(
                     for: itemIdentifier, displayName: domain.displayName)
-                if request.isSystemRequest,
-                    !store.isEffectivelyPinned(
-                        itemIdentifier, uri: store.uri(for: itemIdentifier))
+                if shouldCancelSystemDownload(
+                    request: request,
+                    itemIdentifier: itemIdentifier,
+                    uri: uri,
+                    store: store,
+                    needsConflictRefresh: needsConflictRefresh,
+                    isExplicitRetry: isExplicitRetry)
                 {
                     logger.notice(
-                        "cancelled stale system download for \(itemIdentifier.rawValue, privacy: .public)"
+                        "cancelled blocked system download for \(itemIdentifier.rawValue, privacy: .public)"
                     )
                     completionHandler(nil, nil, CocoaError(.userCancelled))
                     return
                 }
                 let downloadURL = try await store.client.downloadURL(
-                    for: store.uri(for: itemIdentifier))
+                    for: uri)
                 let tmp = FileManager.default.temporaryDirectory
                     .appendingPathComponent("cloudreve-fp-\(UUID().uuidString)")
                 let size = item.documentSize?.int64Value ?? 0
                 try await store.client.download(
                     downloadURL, to: tmp, itemSize: size, progress: progress)
-                if request.isSystemRequest,
-                    !store.isEffectivelyPinned(
-                        itemIdentifier, uri: store.uri(for: itemIdentifier))
+                if shouldCancelSystemDownload(
+                    request: request,
+                    itemIdentifier: itemIdentifier,
+                    uri: uri,
+                    store: store,
+                    needsConflictRefresh: needsConflictRefresh,
+                    isExplicitRetry: isExplicitRetry)
                 {
                     try? FileManager.default.removeItem(at: tmp)
                     logger.notice(
-                        "discarded stale system download for \(itemIdentifier.rawValue, privacy: .public)"
+                        "discarded blocked system download for \(itemIdentifier.rawValue, privacy: .public)"
                     )
                     completionHandler(nil, nil, CocoaError(.userCancelled))
                     return
                 }
                 logger.notice(
                     "served contents of \(item.filename, privacy: .public) (\(size) bytes)")
+                if needsConflictRefresh {
+                    UploadConflictStore.finishContentRefresh(
+                        driveID: store.drive.id, uri: uri)
+                }
+                if isExplicitRetry {
+                    FileProviderDownloadRetryStore.finish(
+                        driveID: store.drive.id,
+                        itemIdentifier: itemIdentifier.rawValue)
+                }
                 completionHandler(tmp, item, nil)
             } catch {
                 logger.error(
@@ -199,6 +357,24 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
         progress.cancellationHandler = { task.cancel() }
         return progress
+    }
+
+    private func shouldCancelSystemDownload(
+        request: NSFileProviderRequest,
+        itemIdentifier: NSFileProviderItemIdentifier,
+        uri: String,
+        store: RemoteStore,
+        needsConflictRefresh: Bool,
+        isExplicitRetry: Bool
+    ) -> Bool {
+        guard request.isSystemRequest, !needsConflictRefresh else { return false }
+        if UploadConflictStore.load(driveID: store.drive.id, uri: uri) != nil {
+            return true
+        }
+        return !isExplicitRetry
+            && !store.isEffectivelyPinned(itemIdentifier, uri: uri)
+            && FileProviderDownloadSuppressionStore.contains(
+                driveID: store.drive.id, uri: uri)
     }
 
     // MARK: - Mutations
@@ -360,21 +536,101 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         }
 
         Task {
+            var attemptedConflictAction: UploadConflictAction?
             do {
                 var uri = store.uri(for: item.itemIdentifier)
                 let originalURI = uri
                 let deleteGeneration = store.remoteDeleteGeneration(for: originalURI)
                 var pending = changedFields
-                let previousVersion = (item as? FileProviderItem)?.remoteVersion
+                pending.remove(.lastUsedDate)
+                pending.remove(.tagData)
+                pending.remove(.favoriteRank)
+                pending.remove(.creationDate)
+                pending.remove(.contentModificationDate)
+                pending.remove(.fileSystemFlags)
+                pending.remove(.extendedAttributes)
+                pending.remove(.typeAndCreator)
+                let existingConflict = UploadConflictStore.load(
+                    driveID: store.drive.id, uri: originalURI)
+                let conflictAction = try existingConflict.flatMap {
+                    try UploadConflictStore.consumeAction(id: $0.id)
+                }
+                attemptedConflictAction = conflictAction
+                let previousVersion = existingConflict?.previousVersion
+                    ?? versionToken(for: item, baseVersion: version)
 
                 // Apply supported content, name, and parent changes.
                 if changedFields.contains(.contents), let newContents {
+                    if let existingConflict, conflictAction == nil {
+                        completionHandler(
+                            nil, [], false, uploadConflictError(existingConflict))
+                        return
+                    }
+
+                    if conflictAction == .discard {
+                        let fresh = try await store.client.fileInfoWithShareState(uri: uri)
+                        try UploadConflictStore.requestContentRefresh(
+                            driveID: store.drive.id, uri: originalURI)
+                        UploadConflictStore.remove(
+                            id: UploadConflictStore.identifier(
+                                driveID: store.drive.id, uri: originalURI))
+                        store.clearLockState(for: uri)
+                        pending.remove(.contents)
+                        await store.signalWorkingSet()
+                        completionHandler(
+                            store.makeItem(
+                                fresh, preservingIdentifier: item.itemIdentifier),
+                            pending, true, nil)
+                        return
+                    }
+
+                    if conflictAction == .saveCopy {
+                        try await uploadLocalCopy(
+                            item: item,
+                            contents: newContents,
+                            originalURI: originalURI,
+                            store: store,
+                            progress: progress)
+                        let fresh = try await store.client.fileInfoWithShareState(uri: uri)
+                        try UploadConflictStore.requestContentRefresh(
+                            driveID: store.drive.id, uri: originalURI)
+                        UploadConflictStore.remove(
+                            id: UploadConflictStore.identifier(
+                                driveID: store.drive.id, uri: originalURI))
+                        store.clearLockState(for: uri)
+                        pending.remove(.contents)
+                        await store.signalWorkingSet()
+                        completionHandler(
+                            store.makeItem(
+                                fresh, preservingIdentifier: item.itemIdentifier),
+                            pending, true, nil)
+                        return
+                    }
+
+                    guard let previousVersion, !previousVersion.isEmpty else {
+                        let record = try UploadConflictStore.saveConflict(
+                            drive: store.drive,
+                            uri: originalURI,
+                            itemIdentifier: item.itemIdentifier,
+                            filename: item.filename,
+                            kind: .unverified,
+                            application: nil,
+                            ownerID: nil,
+                            previousVersion: nil)
+                        presentUploadConflict(record)
+                        completionHandler(nil, [], false, uploadConflictError(record))
+                        return
+                    }
+
                     try await store.client.uploadFile(
                         at: uri,
                         from: newContents,
                         overwrite: true,
                         previousVersion: previousVersion,
                         progress: progress)
+                    UploadConflictStore.remove(
+                        id: UploadConflictStore.identifier(
+                            driveID: store.drive.id, uri: originalURI))
                     store.clearLockState(for: uri)
                     pending.remove(.contents)
                 }
@@ -406,11 +662,38 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
 
                 // Read back fresh metadata so the system records the new version.
                 let fresh = try await store.client.fileInfoWithShareState(uri: uri)
+                let freshItem = store.makeItem(
+                    fresh, preservingIdentifier: item.itemIdentifier)
+                let shouldFetchContent = newContents == nil
+                    && freshItem.itemVersion.contentVersion != version.contentVersion
+                if shouldFetchContent {
+                    logger.notice(
+                        "remote content changed during metadata update for \(uri, privacy: .public); requesting fresh content"
+                    )
+                }
                 logger.notice("modified \(uri, privacy: .public) (fields: \(changedFields.rawValue))")
                 completionHandler(
-                    store.makeItem(fresh, preservingIdentifier: item.itemIdentifier),
-                    pending, false, nil)
+                    freshItem, pending, shouldFetchContent, nil)
             } catch {
+                let originalURI = store.uri(for: item.itemIdentifier)
+                let previousVersion = UploadConflictStore.load(
+                    driveID: store.drive.id, uri: originalURI)?.previousVersion
+                    ?? versionToken(for: item, baseVersion: version)
+                if changedFields.contains(.contents),
+                    let conflictError = pauseUpload(
+                        for: error,
+                        item: item,
+                        uri: originalURI,
+                        previousVersion: previousVersion,
+                        store: store,
+                        forcePresentation: attemptedConflictAction == .retry)
+                {
+                    logger.notice(
+                        "upload paused for \(item.filename, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                    completionHandler(nil, [], false, conflictError)
+                    return
+                }
                 recordLockConflict(error, identifier: item.itemIdentifier, store: store)
                 logger.error(
                     "modifyItem \(item.filename, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
@@ -472,6 +755,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         "cloudreve.desktop.dev.fileprovider.Share"
     private static let openInBrowserAction =
         "cloudreve.desktop.dev.fileprovider.OpenInBrowser"
+    private static let resolveUploadConflictAction =
+        "cloudreve.desktop.dev.fileprovider.ResolveUploadConflict"
 
     /// Handles Finder actions and forwards Share targets to the main app.
     func performAction(
@@ -480,6 +765,32 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: Int64(itemIdentifiers.count))
+
+        if actionIdentifier.rawValue == Self.resolveUploadConflictAction {
+            guard let store, itemIdentifiers.count == 1 else {
+                completionHandler(unavailableError)
+                return progress
+            }
+            let uri = store.uri(for: itemIdentifiers[0])
+            guard let record = UploadConflictStore.load(driveID: store.drive.id, uri: uri) else {
+                completionHandler(NSFileProviderError(.noSuchItem))
+                return progress
+            }
+            guard presentUploadConflict(record, force: true) else {
+                completionHandler(
+                    NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFeatureUnsupportedError,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Cloudreve is not available to resolve this conflict."
+                        ]))
+                return progress
+            }
+            progress.completedUnitCount = 1
+            completionHandler(nil)
+            return progress
+        }
 
         if actionIdentifier.rawValue == Self.openInBrowserAction {
             guard let store else {
@@ -637,6 +948,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         // Update the desired state immediately so a newer opposite action can
         // stop an older download or eviction while it is still running.
         for identifier in itemIdentifiers {
+            if !pin {
+                FileProviderDownloadSuppressionStore.begin(
+                    driveID: store.drive.id, uri: store.uri(for: identifier))
+            }
             store.setPinned(pin, for: identifier)
         }
 
@@ -645,6 +960,13 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             for (index, identifier) in itemIdentifiers.enumerated() {
                 if Task.isCancelled || progress.isCancelled {
                     firstError = CocoaError(.userCancelled)
+                    if !pin {
+                        for pendingIdentifier in itemIdentifiers[index...] {
+                            FileProviderDownloadSuppressionStore.end(
+                                driveID: store.drive.id,
+                                uri: store.uri(for: pendingIdentifier))
+                        }
+                    }
                     break
                 }
                 do {
@@ -656,6 +978,10 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                             progress: itemProgresses[index])
                     }
                 } catch {
+                    if !pin {
+                        FileProviderDownloadSuppressionStore.end(
+                            driveID: store.drive.id, uri: store.uri(for: identifier))
+                    }
                     logger.error(
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                     )
@@ -684,6 +1010,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         manager: NSFileProviderManager,
         progress: Progress
     ) async {
+        var releaseSuppressionWhenDone = !pin
+        let selectedURI = store.uri(for: identifier)
+        defer {
+            if releaseSuppressionWhenDone {
+                FileProviderDownloadSuppressionStore.end(
+                    driveID: store.drive.id, uri: selectedURI)
+            }
+        }
         let isFolder =
             identifier == .rootContainer || item.contentType.conforms(to: .folder)
 
@@ -819,7 +1153,14 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 logger.notice(
                     "deferring eviction while downloads settle for \(identifiers, privacy: .public)"
                 )
-                store.retryEvictionsWhenUnpinned(failedEvictions, manager: manager)
+                releaseSuppressionWhenDone = false
+                store.retryEvictionsWhenUnpinned(
+                    failedEvictions,
+                    manager: manager,
+                    completion: {
+                        FileProviderDownloadSuppressionStore.end(
+                            driveID: store.drive.id, uri: selectedURI)
+                    })
             }
         }
         if descendantFiles.isEmpty || !isFolder {

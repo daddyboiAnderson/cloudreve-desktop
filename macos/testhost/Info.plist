@@ -54,11 +54,11 @@
 				<string>com.apple.icon-decoration.badge</string>
 			</array>
 			<key>UTTypeDescription</key>
-			<string>Cloudreve Locked badge</string>
+			<string>Cloudreve Upload Conflict badge</string>
 			<key>UTTypeIconFile</key>
-			<string>Locked.icns</string>
+			<string>UploadConflict.icns</string>
 			<key>UTTypeIdentifier</key>
-			<string>cloudreve.desktop.dev.fileprovider.decoration.locked-v1</string>
+			<string>cloudreve.desktop.dev.fileprovider.decoration.upload-conflict-v1</string>
 		</dict>
 	</array>
 </dict>

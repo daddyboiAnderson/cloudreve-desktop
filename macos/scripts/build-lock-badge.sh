@@ -27,4 +27,4 @@ if [[ ! -x "$GENERATOR" || "$ROOT/macos/scripts/LockBadge.swift" -nt "$GENERATOR
         "$ROOT/macos/scripts/LockBadge.swift"
 fi
 
-"$GENERATOR" "$OUTPUT_DIR/Locked.icns"
+"$GENERATOR" "$OUTPUT_DIR/UploadConflict.icns"

@@ -72,6 +72,7 @@ struct RemoteFile: Decodable {
     let metadata: [String: String]?
     let shared: Bool?
     let owned: Bool?
+    let primary_entity: String?
 
     var isFolder: Bool { type == 1 }
 }
@@ -133,6 +134,7 @@ private struct LockConflictEntry: Decodable {
 }
 
 private struct LockOwner: Decodable {
+    let owner: String?
     let application: LockApplication?
 }
 
@@ -160,7 +162,7 @@ enum CloudreveError: Error, LocalizedError {
     case noSuchItem
     case nameCollision
     case staleVersion
-    case lockConflict(path: String?, application: String?)
+    case lockConflict(path: String?, application: String?, ownerID: String?)
     case badResponse(String)
 
     var errorDescription: String? {
@@ -171,11 +173,8 @@ enum CloudreveError: Error, LocalizedError {
         case .noSuchItem: return "No such item"
         case .nameCollision: return "An item with the same name already exists"
         case .staleVersion: return "The item changed on the server before this update was saved"
-        case .lockConflict(_, let application):
-            if let application, !application.isEmpty {
-                return "The file is locked by \(application)"
-            }
-            return "The file is locked by another application"
+        case .lockConflict:
+            return "Someone has this file open online"
         case .badResponse(let detail): return "Bad response: \(detail)"
         }
     }
@@ -193,7 +192,8 @@ func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> Clou
         }?.data?.first
         return .lockConflict(
             path: detail?.path,
-            application: detail?.owner?.application?.type)
+            application: detail?.owner?.application?.type,
+            ownerID: detail?.owner?.owner)
     case 40076: return .staleVersion
     default: return .api(code: code, message: message ?? "unknown")
     }

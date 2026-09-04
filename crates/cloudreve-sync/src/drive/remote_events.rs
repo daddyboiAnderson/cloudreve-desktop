@@ -9,6 +9,8 @@ use anyhow::Result;
 use anyhow::Context;
 #[cfg(target_os = "macos")]
 use cloudreve_api::api::explorer::ExplorerApi;
+#[cfg(target_os = "macos")]
+use cloudreve_api::models::explorer::file_type;
 #[cfg(not(target_os = "macos"))]
 use cloudreve_api::api::explorer::FileEventsApi;
 use cloudreve_api::models::explorer::{FileEvent, FileEventData, FileEventType};
@@ -245,6 +247,7 @@ impl Mount {
             // whose paths don't exist (e.g. internal storage UUIDs). Verify
             // create/modify events; bogus ones trigger a full rescan instead.
             let mut verified_events: Vec<&FileEventData> = Vec::new();
+            let mut content_refresh_candidates = Vec::new();
             let mut needs_rescan = false;
             for e in &events {
                 match e.event_type {
@@ -257,10 +260,17 @@ impl Mount {
                                 ..Default::default()
                             })
                             .await;
-                        if info.is_ok() {
-                            verified_events.push(e);
-                        } else {
-                            needs_rescan = true;
+                        match info {
+                            Ok(info) => {
+                                if e.event_type == FileEventType::Modify
+                                    && info.file_type == file_type::FILE
+                                {
+                                    content_refresh_candidates
+                                        .push(format!("cloudreve-item:/{}", info.id));
+                                }
+                                verified_events.push(e);
+                            }
+                            Err(_) => needs_rescan = true,
                         }
                     }
                     _ => verified_events.push(e),
@@ -298,6 +308,21 @@ impl Mount {
                 &drive_name,
             )
             .await;
+            let domain_id = crate::fileprovider::domain_identifier(&drive_id);
+            let mut materialized_updates = Vec::new();
+            for item_identifier in content_refresh_candidates {
+                if let Some(local_path) = crate::fileprovider::user_visible_item_url(
+                    &domain_id,
+                    &drive_name,
+                    &item_identifier,
+                )
+                .await
+                {
+                    if crate::fileprovider::is_materialized(&local_path) {
+                        materialized_updates.push((item_identifier, local_path));
+                    }
+                }
+            }
             for e in &events_to_log {
                 let rel = if e.to.is_empty() { &e.from } else { &e.to };
                 if rel
@@ -332,10 +357,17 @@ impl Mount {
                 "Signaling File Provider working set for remote changes"
             );
             crate::fileprovider::signal_containers(
-                &crate::fileprovider::domain_identifier(&drive_id),
+                &domain_id,
                 &drive_name,
                 &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
             );
+            for (item_identifier, local_path) in materialized_updates {
+                tokio::spawn(crate::fileprovider::refresh_materialized_item_after_remote_update(
+                    domain_id.clone(),
+                    item_identifier,
+                    local_path,
+                ));
+            }
             return Ok(());
         }
 

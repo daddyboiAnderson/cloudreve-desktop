@@ -18,5 +18,11 @@
 		<string>/.cloudreve/drives.json</string>
 		<string>/.cloudreve/fp-events/</string>
 	</array>
+	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+	<array>
+		<string>/.cloudreve/fileprovider-download-retries/</string>
+		<string>/.cloudreve/fileprovider-pending/</string>
+		<string>/.cloudreve/upload-conflicts/</string>
+	</array>
 </dict>
 </plist>

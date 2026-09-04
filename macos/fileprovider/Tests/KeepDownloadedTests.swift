@@ -19,7 +19,7 @@ enum KeepDownloadedTests {
             contentModificationDate: nil,
             pinned: false)
 
-        precondition(base.contentPolicy == .inherited)
+        precondition(base.contentPolicy == .downloadLazily)
         precondition(base.userInfo?["displayKeepDownloaded"] as? NSNumber == 1)
         precondition(base.userInfo?["displayShare"] as? NSNumber == 1)
 
@@ -81,7 +81,7 @@ enum KeepDownloadedTests {
         let unpinned = inherited.withPinned(false, effectivelyPinned: false)
         precondition(!unpinned.pinned)
         precondition(!unpinned.effectivelyPinned)
-        precondition(unpinned.contentPolicy == .inherited)
+        precondition(unpinned.contentPolicy == .downloadLazily)
         precondition(unpinned.itemVersion.metadataVersion == base.itemVersion.metadataVersion)
         precondition(unpinned.decorations == nil)
 

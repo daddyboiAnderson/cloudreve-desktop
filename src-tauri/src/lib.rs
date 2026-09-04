@@ -24,6 +24,10 @@ use crate::commands::{
 };
 mod commands;
 mod event_handler;
+#[cfg(target_os = "macos")]
+mod file_provider_issue;
+#[cfg(target_os = "macos")]
+mod upload_conflict;
 
 #[macro_use]
 extern crate rust_i18n;
@@ -496,6 +500,16 @@ pub fn run() {
             commands::get_status_summary,
             commands::resolve_conflict,
             commands::resolve_all_conflicts,
+            #[cfg(target_os = "macos")]
+            commands::get_upload_conflict,
+            #[cfg(target_os = "macos")]
+            commands::resolve_upload_conflict,
+            #[cfg(target_os = "macos")]
+            commands::list_file_provider_issues,
+            #[cfg(target_os = "macos")]
+            commands::resolve_file_provider_issue,
+            #[cfg(target_os = "macos")]
+            commands::reveal_file_provider_issue,
             commands::get_drives_info,
             #[cfg(target_os = "macos")]
             commands::reset_file_provider,

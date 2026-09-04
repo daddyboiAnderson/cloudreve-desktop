@@ -139,8 +139,11 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                         upTo: reconciliationAnchor, moreComing: false)
                     return
                 }
+                var downloadedContentUpdates: [NSFileProviderItemIdentifier] = []
                 for change in changes {
-                    try await apply(change: change, to: observer)
+                    if let identifier = try await apply(change: change, to: observer) {
+                        downloadedContentUpdates.append(identifier)
+                    }
                 }
                 // Deliver queued Keep Downloaded policy changes.
                 if containerIdentifier == .workingSet {
@@ -186,6 +189,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     }
                 }
                 observer.finishEnumeratingChanges(upTo: newAnchor, moreComing: false)
+                if !downloadedContentUpdates.isEmpty {
+                    await store.refreshDownloadedContent(downloadedContentUpdates)
+                }
             } catch let error as NSFileProviderError where error.code == .syncAnchorExpired {
                 logger.info(
                     "anchor expired for \(self.containerIdentifier.rawValue, privacy: .public); system will re-enumerate"
@@ -209,19 +215,19 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
     private func apply(
         change: RemoteStore.FpEvent, to observer: NSFileProviderChangeObserver
-    ) async throws {
+    ) async throws -> NSFileProviderItemIdentifier? {
         if change.type == "metadata_rescan" {
             let items = await store.refreshPresentedShareMetadata()
             if !items.isEmpty {
                 logger.notice("refreshing share metadata for \(items.count) presented item(s)")
                 observer.didUpdate(items)
             }
-            return
+            return nil
         }
         if change.type == "metadata_name" {
             let items = await store.refreshShareMetadata(named: change.from)
             if !items.isEmpty { observer.didUpdate(items) }
-            return
+            return nil
         }
         let fromURI = store.uri(forEventPath: change.from)
         logger.notice(
@@ -232,10 +238,19 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             // Refresh metadata; a disappeared item becomes a delete.
             do {
                 let file = try await store.client.fileInfoWithShareState(uri: fromURI)
+                let item = store.makeItem(file)
+                var refreshContent = false
+                if containerIdentifier == .workingSet && change.type == "modify"
+                    && !file.isFolder
+                {
+                    refreshContent = await store.prepareDownloadedContentForRemoteUpdate(
+                        item.itemIdentifier)
+                }
                 logger.notice(
                     "refreshed \(fromURI, privacy: .public), shared: \(file.shared == true, privacy: .public)"
                 )
-                observer.didUpdate([store.makeItem(file)])
+                observer.didUpdate([item])
+                return refreshContent ? item.itemIdentifier : nil
             } catch CloudreveError.noSuchItem {
                 let identifier = store.identifier(forURI: fromURI)
                 store.evictCachedItems(withIdentifiers: [identifier])
@@ -266,6 +281,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         default:
             break
         }
+        return nil
     }
 
     func currentSyncAnchor(
@@ -282,13 +298,13 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return NSFileProviderError(.notAuthenticated)
         case CloudreveError.nameCollision:
             return NSFileProviderError(.filenameCollision)
-        case CloudreveError.lockConflict(_, _):
+        case CloudreveError.lockConflict(_, _, _):
             return NSError(
                 domain: NSFileProviderErrorDomain,
                 code: NSFileProviderError.Code.cannotSynchronize.rawValue,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "The file is locked by another application."
+                        "Someone has this file open online."
                 ])
         case CloudreveError.staleVersion:
             return NSError(

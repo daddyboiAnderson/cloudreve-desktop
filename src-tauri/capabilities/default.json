@@ -7,7 +7,8 @@
     "add-drive",
     "main_popup",
     "settings",
-    "share"
+    "share",
+    "upload-conflict"
   ],
   "permissions": [
     "core:default",

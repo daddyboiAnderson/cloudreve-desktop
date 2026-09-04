@@ -1,4 +1,5 @@
 import FileProvider
+import Darwin
 import OSLog
 import UniformTypeIdentifiers
 
@@ -598,6 +599,157 @@ final class RemoteStore {
         return false
     }
 
+    private enum LocalContentState {
+        case downloaded
+        case dataless
+        case unavailable
+    }
+
+    private func localContentState(
+        _ identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager
+    ) async -> LocalContentState {
+        do {
+            let url = try await withManagerCall {
+                try await manager.getUserVisibleURL(for: identifier)
+            }
+            var info = stat()
+            let result = url.path.withCString { lstat($0, &info) }
+            guard result == 0 else {
+                logger.error(
+                    "could not inspect local content for \(identifier.rawValue, privacy: .public): errno \(errno)"
+                )
+                return .unavailable
+            }
+            return (info.st_flags & UInt32(SF_DATALESS)) == 0 ? .downloaded : .dataless
+        } catch {
+            logger.error(
+                "could not inspect local content for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return .unavailable
+        }
+    }
+
+    func hasDownloadedContent(_ identifier: NSFileProviderItemIdentifier) async -> Bool {
+        guard let manager = NSFileProviderManager(for: domain) else { return false }
+        let state = await localContentState(identifier, manager: manager)
+        logger.notice(
+            "local content state for \(identifier.rawValue, privacy: .public): \(state == .downloaded ? "downloaded" : "dataless", privacy: .public)"
+        )
+        return state == .downloaded
+    }
+
+    /// Evict materialized content before publishing a newer remote generation.
+    func prepareDownloadedContentForRemoteUpdate(
+        _ identifier: NSFileProviderItemIdentifier
+    ) async -> Bool {
+        guard let manager = NSFileProviderManager(for: domain) else { return false }
+        guard await localContentState(identifier, manager: manager) == .downloaded else {
+            return false
+        }
+
+        do {
+            try await withManagerCall {
+                try await manager.evictItem(identifier: identifier)
+            }
+            logger.notice(
+                "evicted previous content generation for \(identifier.rawValue, privacy: .public)"
+            )
+        } catch {
+            // The post-update refresh retries after open descriptors are released.
+            logger.error(
+                "could not evict previous content generation for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
+        return true
+    }
+
+    func refreshDownloadedContent(_ identifiers: [NSFileProviderItemIdentifier]) async {
+        guard let manager = NSFileProviderManager(for: domain) else { return }
+
+        var seen = Set<String>()
+        for identifier in identifiers where seen.insert(identifier.rawValue).inserted {
+            if Task.isCancelled { return }
+            let uri = uri(for: identifier)
+            if FileProviderDownloadSuppressionStore.contains(driveID: drive.id, uri: uri) {
+                continue
+            }
+
+            // Materialize only after File Provider commits the remote version.
+            let settleDeadline = Date().addingTimeInterval(2)
+            var state = await localContentState(identifier, manager: manager)
+            while state == .downloaded && Date() < settleDeadline {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if Task.isCancelled { return }
+                state = await localContentState(identifier, manager: manager)
+            }
+            if state == .downloaded {
+                do {
+                    try await withManagerCall {
+                        try await manager.evictItem(identifier: identifier)
+                    }
+                    logger.notice(
+                        "evicted previous content generation for \(identifier.rawValue, privacy: .public) after publishing the remote update"
+                    )
+                    state = await localContentState(identifier, manager: manager)
+                } catch {
+                    logger.error(
+                        "remote content refresh could not evict \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+            if state == .dataless {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                state = await localContentState(identifier, manager: manager)
+            }
+            if state == .downloaded {
+                logger.notice(
+                    "materialized current remote content for \(identifier.rawValue, privacy: .public) from content policy"
+                )
+                continue
+            }
+
+            let verificationDelays: [UInt64] = [500_000_000, 1_000_000_000, 2_000_000_000]
+            var refreshed = false
+            for (index, delay) in verificationDelays.enumerated() {
+                if Task.isCancelled { return }
+                do {
+                    try await withManagerCall {
+                        try await manager.requestDownloadForItem(withIdentifier: identifier)
+                    }
+                    logger.notice(
+                        "requested current remote content for \(identifier.rawValue, privacy: .public) on attempt \(index + 1)"
+                    )
+                } catch {
+                    logger.error(
+                        "remote content refresh attempt \(index + 1) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+
+                let deadline = Date().addingTimeInterval(Double(delay) / 1_000_000_000)
+                repeat {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    if Task.isCancelled { return }
+                    if await localContentState(identifier, manager: manager) == .downloaded {
+                        refreshed = true
+                        break
+                    }
+                } while Date() < deadline
+                if refreshed { break }
+            }
+
+            if refreshed {
+                logger.notice(
+                    "materialized current remote content for \(identifier.rawValue, privacy: .public)"
+                )
+            } else {
+                logger.error(
+                    "current remote content remained dataless for \(identifier.rawValue, privacy: .public)"
+                )
+            }
+        }
+    }
+
     /// Evict local content, retrying while the new policy is ingested.
     func evictWhenAllowed(
         _ identifier: NSFileProviderItemIdentifier,
@@ -680,13 +832,15 @@ final class RemoteStore {
     /// Retry evictions that were blocked by an in-progress system download.
     func retryEvictionsWhenUnpinned(
         _ identifiers: [NSFileProviderItemIdentifier],
-        manager: NSFileProviderManager
+        manager: NSFileProviderManager,
+        completion: @escaping () -> Void = {}
     ) {
         let uniqueIdentifiers = identifiers.reduce(into: [String: NSFileProviderItemIdentifier]()) {
             $0[$1.rawValue] = $1
         }.values
 
         Task { [weak self] in
+            defer { completion() }
             guard let self else { return }
             var remaining = Array(uniqueIdentifiers)
             for attempt in 0..<12 {
@@ -1205,14 +1359,16 @@ final class RemoteStore {
             ? .rootContainer
             : self.identifier(forURI: parentPath)
 
-        // Prefer a remote content hash for change detection.
+        // Cloudreve uses primary_entity as the optimistic upload version.
+        let remoteVersion = file.primary_entity
         let versionBasis =
-            file.metadata?["etag"] ?? file.metadata?["hash"]
+            remoteVersion.map { "entity:\($0)" }
+            ?? file.metadata?["etag"] ?? file.metadata?["hash"]
             ?? "\(file.updated_at ?? "")#\(file.size)"
-        let remoteVersion = file.metadata?["etag"]
         var version = versionBasis.data(using: .utf8) ?? Data()
         if let metadataRevision { version += metadataRevision }
         let locked = isLockActive(for: filePath)
+            || UploadConflictStore.load(driveID: drive.id, uri: filePath) != nil
         // Invalidate Finder's old thumbnail cache once.
         let thumbnailVersion = "\(versionBasis)#thumbnail-v1".data(using: .utf8) ?? version
 

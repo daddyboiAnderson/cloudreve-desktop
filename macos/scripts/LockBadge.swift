@@ -26,29 +26,19 @@ func makeBadge(size: Int) -> CGImage? {
 
     let scale = CGFloat(size)
     context.clear(CGRect(x: 0, y: 0, width: scale, height: scale))
-    context.setFillColor(CGColor(red: 0.54, green: 0.54, blue: 0.57, alpha: 1))
+    context.setFillColor(CGColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1))
     context.fillEllipse(in: CGRect(x: scale * 0.06, y: scale * 0.06,
                                    width: scale * 0.88, height: scale * 0.88))
 
     context.setStrokeColor(CGColor(gray: 1, alpha: 1))
     context.setFillColor(CGColor(gray: 1, alpha: 1))
-    context.setLineWidth(max(2, scale * 0.09))
+    context.setLineWidth(max(2, scale * 0.105))
     context.setLineCap(.round)
-    context.setLineJoin(.round)
-    let shackle = CGMutablePath()
-    shackle.move(to: CGPoint(x: scale * 0.34, y: scale * 0.48))
-    shackle.addArc(
-        center: CGPoint(x: scale * 0.5, y: scale * 0.48),
-        radius: scale * 0.16,
-        startAngle: .pi,
-        endAngle: 0,
-        clockwise: false)
-    context.addPath(shackle)
+    context.move(to: CGPoint(x: scale * 0.5, y: scale * 0.69))
+    context.addLine(to: CGPoint(x: scale * 0.5, y: scale * 0.43))
     context.strokePath()
-    context.fill(CGRect(x: scale * 0.28, y: scale * 0.43,
-                        width: scale * 0.44, height: scale * 0.31))
-    context.fillEllipse(in: CGRect(x: scale * 0.47, y: scale * 0.53,
-                                   width: scale * 0.06, height: scale * 0.10))
+    context.fillEllipse(in: CGRect(x: scale * 0.445, y: scale * 0.24,
+                                   width: scale * 0.11, height: scale * 0.11))
     return context.makeImage()
 }
 

@@ -26,7 +26,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let isLocked: Bool
     let remoteID: String?
     let remoteURI: String?
-    /// ETag sent back when Finder uploads a new version.
+    /// Cloudreve entity version sent back when Finder uploads a new version.
     let remoteVersion: String?
     /// Unmarked metadata version used when rebuilding the item.
     let baseMetadataVersion: Data
@@ -35,7 +35,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     private static let pinnedVersionMarker = Data("#kd".utf8)
     private static let sharedVersionMarker = Data("#shared".utf8)
     private static let sharedByCurrentUserVersionMarker = Data("#shared-owner".utf8)
-    private static let lockedVersionMarker = Data("#locked".utf8)
+    private static let lockedVersionMarker = Data("#upload-conflict-v2".utf8)
     private static let lockRestrictedCapabilities: NSFileProviderItemCapabilities = [
         .allowsWriting, .allowsReparenting, .allowsRenaming, .allowsTrashing, .allowsDeleting,
     ]
@@ -47,7 +47,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             "cloudreve.desktop.dev.fileprovider.shared-v1")
     static let lockedDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.locked-v1")
+            "cloudreve.desktop.dev.fileprovider.upload-conflict-v1")
 
     init(
         identifier: NSFileProviderItemIdentifier,
@@ -115,7 +115,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
 
     /// Download and eviction policy shown to File Provider.
     var contentPolicy: NSFileProviderContentPolicy {
-        effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .inherited
+        effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .downloadLazily
     }
 
     var isShared: Bool { sharedState }
@@ -137,6 +137,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             "displayRemoveKeepDownloaded": NSNumber(value: pinned),
             "displayOpenInBrowser": NSNumber(value: true),
             "displayShare": NSNumber(value: itemIdentifier != .rootContainer),
+            "displayResolveUploadConflict": NSNumber(value: isLocked),
         ]
     }
 
