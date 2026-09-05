@@ -10,7 +10,7 @@
 #
 # Env overrides:
 #   FP_SIGN_IDENTITY  codesign identity ("-" = ad-hoc, default)
-#   FP_BUILD_NUMBER   shared app/extension CFBundleVersion (default: 4)
+#   FP_BUILD_NUMBER   shared app/extension CFBundleVersion (default: 5)
 #   FP_SHORT_VERSION  shared release version (default: 0.2.0)
 #   FP_REGISTER_EXTENSION  set to 0 when packaging without local registration
 set -euo pipefail
@@ -18,7 +18,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 APP="${1:-$ROOT/target/release/bundle/macos/Cloudreve.app}"
 IDENTITY="${FP_SIGN_IDENTITY:--}"
-BUILD_NUMBER="${FP_BUILD_NUMBER:-4}"
+BUILD_NUMBER="${FP_BUILD_NUMBER:-5}"
 SHORT_VERSION="${FP_SHORT_VERSION:-0.2.0}"
 REGISTER_EXTENSION="${FP_REGISTER_EXTENSION:-1}"
 

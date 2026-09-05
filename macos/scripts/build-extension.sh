@@ -5,7 +5,7 @@
 # Env overrides:
 #   FP_SIGN_IDENTITY  codesign identity ("-" = ad-hoc, default)
 #   FP_CONFIGURATION  Debug (default) | Release
-#   FP_BUILD_NUMBER   numeric CFBundleVersion (default: 4)
+#   FP_BUILD_NUMBER   numeric CFBundleVersion (default: 5)
 #   FP_SHORT_VERSION  release version (default: 0.2.0)
 set -euo pipefail
 
@@ -18,7 +18,7 @@ MODULE_CACHE="${FP_MODULE_CACHE_PATH:-$BUILD_DIR/ModuleCache}"
 
 IDENTITY="${FP_SIGN_IDENTITY:--}"
 CONFIG="${FP_CONFIGURATION:-Debug}"
-BUILD_NUMBER="${FP_BUILD_NUMBER:-4}"
+BUILD_NUMBER="${FP_BUILD_NUMBER:-5}"
 SHORT_VERSION="${FP_SHORT_VERSION:-0.2.0}"
 if [[ -n "${FP_SDK_PATH:-}" ]]; then
     SDK="$FP_SDK_PATH"
