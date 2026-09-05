@@ -485,23 +485,48 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 let isFolder = itemTemplate.contentType?.conforms(to: .folder) ?? false
                 let deleteGeneration = store.remoteDeleteGeneration(for: uri)
 
-                // Ignore replayed creates for known items.
-                if store.isKnownIdentity(itemTemplate.itemIdentifier, forURI: uri) {
+                let knownIdentity = store.isKnownIdentity(itemTemplate.itemIdentifier, forURI: uri)
+                if knownIdentity || options.contains(.mayAlreadyExist) {
                     do {
                         let existing = try await store.client.fileInfoWithShareState(uri: uri)
+                        guard existing.isFolder == isFolder else {
+                            throw CloudreveError.nameCollision
+                        }
+                        if let contentURL = url, !isFolder {
+                            let matches = try await ReimportContent.matches(
+                                local: contentURL, remoteSize: existing.size
+                            ) { temporary in
+                                let source = try await store.client.downloadURL(for: uri)
+                                try await store.client.download(
+                                    source, to: temporary, itemSize: existing.size, progress: progress)
+                            }
+                            guard matches else { throw CloudreveError.nameCollision }
+                            let current = try await store.client.fileInfoWithShareState(uri: uri)
+                            guard current.id == existing.id,
+                                current.primary_entity == existing.primary_entity,
+                                current.updated_at == existing.updated_at else {
+                                throw CloudreveError.badResponse("File changed during reimport; retrying")
+                            }
+                        }
+                        logger.notice("reconnected existing item \(uri, privacy: .public)")
                         completionHandler(
                             store.makeItem(
                                 existing, preservingIdentifier: itemTemplate.itemIdentifier),
                             [], false, nil)
                         return
                     } catch CloudreveError.noSuchItem {
-                        store.evictCachedItems(
-                            withIdentifiers: [itemTemplate.itemIdentifier])
-                        logger.notice(
-                            "discarded stale mirrored create for remotely absent \(uri, privacy: .public)"
-                        )
-                        completionHandler(nil, [], false, nil)
-                        return
+                        if knownIdentity && !options.contains(.deletionConflicted) {
+                            guard url == nil else {
+                                throw CloudreveError.badResponse(
+                                    "Remote file was deleted; local content requires recovery")
+                            }
+                            store.evictCachedItems(withIdentifiers: [itemTemplate.itemIdentifier])
+                            logger.notice(
+                                "discarded stale mirrored create for remotely absent \(uri, privacy: .public)"
+                            )
+                            completionHandler(nil, [], false, nil)
+                            return
+                        }
                     }
                 }
 
@@ -1038,8 +1063,8 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                 do {
                     let item = try await store.refreshItem(
                         for: identifier, displayName: domain.displayName)
-                    await store.withActionLock {
-                        await setPinned(
+                    try await store.withActionLock {
+                        try await setPinned(
                             pin, for: identifier, item: item, store: store, manager: manager,
                             progress: itemProgresses[index])
                     }
@@ -1052,10 +1077,6 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                         "\(actionIdentifier.rawValue, privacy: .public) failed for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
                     )
                     firstError = firstError ?? error
-                    if !Task.isCancelled {
-                        itemProgresses[index].completedUnitCount =
-                            itemProgresses[index].totalUnitCount
-                    }
                 }
             }
             logger.notice(
@@ -1075,7 +1096,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         store: RemoteStore,
         manager: NSFileProviderManager,
         progress: Progress
-    ) async {
+    ) async throws {
         var releaseSuppressionWhenDone = !pin
         let selectedURI = store.uri(for: identifier)
         defer {
@@ -1141,7 +1162,9 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
         if pin && !isFolder {
             // Use the same path as Finder's Download Now action.
             if store.isEffectivelyPinned(identifier, uri: store.uri(for: identifier)) {
-                _ = await store.requestDownloadWhenKnown(identifier, manager: manager)
+                guard await store.requestDownloadWhenKnown(identifier, manager: manager) else {
+                    throw CloudreveError.badResponse("The pinned file has not finished downloading")
+                }
                 progress.fileCompletedCount = progress.fileTotalCount
             }
         } else if pin && isFolder {
@@ -1152,7 +1175,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             for start in stride(from: 0, to: descendantFiles.count, by: 8) {
                 if Task.isCancelled { return }
                 let end = min(start + 8, descendantFiles.count)
-                await withTaskGroup(of: Bool.self) { group in
+                let downloaded = await withTaskGroup(of: Bool.self) { group in
                     for descendant in descendantFiles[start..<end] {
                         group.addTask {
                             guard store.isEffectivelyPinned(
@@ -1163,7 +1186,12 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                                 descendant.itemIdentifier, manager: manager)
                         }
                     }
-                    await group.waitForAll()
+                    var succeeded = true
+                    for await result in group { succeeded = result && succeeded }
+                    return succeeded
+                }
+                guard downloaded else {
+                    throw CloudreveError.badResponse("Some pinned files have not finished downloading")
                 }
             }
             await trackFolderDownloads(

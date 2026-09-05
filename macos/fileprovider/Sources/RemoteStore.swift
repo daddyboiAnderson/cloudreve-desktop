@@ -566,7 +566,7 @@ final class RemoteStore {
         return pending.sorted()
     }
 
-    /// Request a download, retrying while the item is ingested.
+    /// Retry until the requested content is available locally.
     func requestDownloadWhenKnown(
         _ identifier: NSFileProviderItemIdentifier,
         manager: NSFileProviderManager? = nil
@@ -587,10 +587,23 @@ final class RemoteStore {
                 try await withManagerCall {
                     try await manager.requestDownloadForItem(withIdentifier: identifier)
                 }
+                if attempt == 1 {
+                    try await materializePinnedContent(identifier, manager: manager)
+                }
                 logger.notice(
                     "download request accepted for \(identifier.rawValue, privacy: .public) on attempt \(attempt + 1)"
                 )
-                return true
+                let deadline = Date().addingTimeInterval(Double(attempt + 1))
+                repeat {
+                    if Task.isCancelled { return false }
+                    if !isEffectivelyPinned(identifier, uri: uri(for: identifier)) {
+                        return true
+                    }
+                    if await localContentState(identifier, manager: manager) == .downloaded {
+                        return true
+                    }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                } while Date() < deadline
             } catch {
                 lastError = error
                 logger.error(
@@ -600,9 +613,27 @@ final class RemoteStore {
             }
         }
         logger.error(
-            "download request failed for \(identifier.rawValue, privacy: .public) after 5 attempts: \(lastError?.localizedDescription ?? "unknown error", privacy: .public)"
+            "download incomplete for \(identifier.rawValue, privacy: .public) after 5 attempts: \(lastError?.localizedDescription ?? "content is still unavailable", privacy: .public)"
         )
         return false
+    }
+
+    /// Coordinated reads also download files previously evicted by the user.
+    private func materializePinnedContent(
+        _ identifier: NSFileProviderItemIdentifier,
+        manager: NSFileProviderManager
+    ) async throws {
+        let url = try await withManagerCall {
+            try await manager.getUserVisibleURL(for: identifier)
+        }
+        guard isEffectivelyPinned(identifier, uri: uri(for: identifier)) else { return }
+        try await Task.detached(priority: .utility) {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            var error: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &error) { _ in }
+            if let error { throw error }
+        }.value
     }
 
     private enum LocalContentState {
@@ -799,39 +830,45 @@ final class RemoteStore {
 
     /// Resume downloads for persisted pins.
     func requestDownloadsForPinnedItems() async {
-        await withActionLock {
-            await requestDownloadsForPinnedItemsUnlocked()
-        }
-    }
-
-    private func requestDownloadsForPinnedItemsUnlocked() async {
         let pinned = pinnedIdentifiersSnapshot()
         guard !pinned.isEmpty else { return }
-        do {
-            let items = try await workingSetItems()
-            let files = items.filter {
-                !$0.contentType.conforms(to: .folder)
-                    && isEffectivelyPinned($0.itemIdentifier, uri: uri(for: $0.itemIdentifier))
-            }
-            for start in stride(from: 0, to: files.count, by: 8) {
-                if Task.isCancelled { return }
-                let end = min(start + 8, files.count)
-                await withTaskGroup(of: Void.self) { group in
-                    for file in files[start..<end] {
-                        group.addTask {
-                            guard self.isEffectivelyPinned(
-                                file.itemIdentifier,
-                                uri: self.uri(for: file.itemIdentifier)
-                            ) else { return }
-                            _ = await self.requestDownloadWhenKnown(file.itemIdentifier)
+        var pending = pinned.map { NSFileProviderItemIdentifier($0) }
+        var visited: Set<String> = []
+        while let identifier = pending.popLast() {
+            if Task.isCancelled { return }
+            guard visited.insert(identifier.rawValue).inserted,
+                isEffectivelyPinned(identifier, uri: uri(for: identifier)) else { continue }
+            do {
+                let selected = try await item(for: identifier, displayName: domain.displayName)
+                let items = selected.contentType.conforms(to: .folder)
+                    ? try await allChildren(of: identifier) : [selected]
+                pending.append(contentsOf: items.filter {
+                    $0.contentType.conforms(to: .folder)
+                }.map { $0.itemIdentifier })
+                let files = items.filter {
+                    !$0.contentType.conforms(to: .folder)
+                        && isEffectivelyPinned($0.itemIdentifier, uri: uri(for: $0.itemIdentifier))
+                }
+                for start in stride(from: 0, to: files.count, by: 8) {
+                    if Task.isCancelled { return }
+                    let end = min(start + 8, files.count)
+                    await withTaskGroup(of: Void.self) { group in
+                        for file in files[start..<end] {
+                            group.addTask {
+                                guard self.isEffectivelyPinned(
+                                    file.itemIdentifier,
+                                    uri: self.uri(for: file.itemIdentifier)
+                                ) else { return }
+                                _ = await self.requestDownloadWhenKnown(file.itemIdentifier)
+                            }
                         }
                     }
                 }
+            } catch {
+                logger.error(
+                    "failed to resume pinned downloads for \(identifier.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
             }
-        } catch {
-            logger.error(
-                "failed to resume pinned downloads: \(error.localizedDescription, privacy: .public)"
-            )
         }
     }
 
