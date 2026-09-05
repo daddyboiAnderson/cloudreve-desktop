@@ -228,8 +228,35 @@ pub struct NavigatorProps {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
     pub max_page_size: i32,
+    #[serde(default, deserialize_with = "super::share::deserialize_null_default")]
     pub order_by_options: Vec<String>,
+    #[serde(default, deserialize_with = "super::share::deserialize_null_default")]
     pub order_direction_options: Vec<String>,
+}
+
+#[cfg(test)]
+mod navigator_tests {
+    use super::ListResponse;
+
+    #[test]
+    fn search_results_accept_null_sort_options() {
+        let response: ListResponse = serde_json::from_value(serde_json::json!({
+            "files": [],
+            "pagination": {"page": 0, "page_size": 0, "is_cursor": true},
+            "props": {"max_page_size": 2000, "order_by_options": null, "order_direction_options": null}
+        })).unwrap();
+        assert!(response.props.order_by_options.is_empty());
+        assert!(response.props.order_direction_options.is_empty());
+    }
+
+    #[test]
+    fn preserves_available_sort_options() {
+        let props: super::NavigatorProps = serde_json::from_value(serde_json::json!({
+            "max_page_size": 100, "order_by_options": ["name"], "order_direction_options": ["asc", "desc"]
+        })).unwrap();
+        assert_eq!(props.order_by_options, ["name"]);
+        assert_eq!(props.order_direction_options, ["asc", "desc"]);
+    }
 }
 
 /// Explorer view settings

@@ -74,6 +74,25 @@ struct RemoteFile: Decodable {
     let owned: Bool?
     let primary_entity: String?
 
+    struct ShareDetails: Decodable {
+        struct Link: Decodable {
+            struct Owner: Decodable { let id: String }
+            let id: String
+            let owner: Owner
+        }
+        let shares: [Link]?
+    }
+    var extended_info: ShareDetails? = nil
+    var sharingContextURI: String? = nil
+
+    func hasOwnShare(currentUserID: String?) -> Bool {
+        guard let currentUserID, !currentUserID.isEmpty else { return false }
+        let incoming = URLComponents(string: metadata?["sys:shared_redirect"] ?? sharingContextURI ?? path)?.user
+        return extended_info?.shares?.contains {
+            $0.owner.id == currentUserID && $0.id != incoming
+        } ?? (shared == true && owned == true)
+    }
+
     var presentationIdentity: String?
 
     func isSharedWithMe(currentUserID: String?) -> Bool {
@@ -95,6 +114,8 @@ struct RemoteFile: Decodable {
             shared: shared, owned: owned, primary_entity: primary_entity)
         // Keep each shortcut as a separate Finder item.
         file.presentationIdentity = uri
+        file.extended_info = extended_info
+        file.sharingContextURI = sharingContextURI ?? path
         return file
     }
 
@@ -108,6 +129,8 @@ struct RemoteFile: Decodable {
             metadata: (target.metadata ?? [:]).merging(metadata ?? [:]) { content, _ in content },
             shared: shared, owned: owned, primary_entity: target.primary_entity)
         file.presentationIdentity = presentationIdentity
+        file.extended_info = extended_info
+        file.sharingContextURI = sharingContextURI
         return file
     }
 }
@@ -459,7 +482,11 @@ final class CloudreveClient {
         var hydrated = files
         for index in hydrated.indices {
             do {
-                hydrated[index] = try await fileShortcutContent(hydrated[index])
+                if hydrated[index].shared == true && hydrated[index].owned != true {
+                    hydrated[index] = try await fileInfoWithShareState(uri: hydrated[index].path)
+                } else {
+                    hydrated[index] = try await fileShortcutContent(hydrated[index])
+                }
             } catch {
                 // A broken shortcut should not hide its siblings.
                 logger.notice("file shortcut target is unavailable: \(error.localizedDescription, privacy: .public)")

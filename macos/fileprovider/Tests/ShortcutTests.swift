@@ -68,6 +68,13 @@ private final class MockProtocol: URLProtocol {
 @main
 enum ShortcutTests {
     static func main() async throws {
+        let received = try JSONDecoder().decode(RemoteFile.self, from: Data(#"{"type":0,"id":"file","name":"report.txt","path":"cloudreve://incoming@share/report.txt","size":1,"owned":false,"extended_info":{"shares":[{"id":"outgoing","owner":{"id":"me"}}]}}"#.utf8))
+        precondition(received.hasOwnShare(currentUserID: "me"))
+        precondition(!received.hasOwnShare(currentUserID: "someone-else"))
+        precondition(received.presented(at: "cloudreve://my/Received/report.txt").hasOwnShare(currentUserID: "me"))
+        let incomingOnly = try JSONDecoder().decode(RemoteFile.self, from: Data(#"{"type":0,"id":"file","name":"report.txt","path":"cloudreve://incoming@share/report.txt","size":1,"extended_info":{"shares":[{"id":"incoming","owner":{"id":"me"}}]}}"#.utf8))
+        precondition(!incomingOnly.hasOwnShare(currentUserID: "me"))
+        precondition(!incomingOnly.presented(at: "cloudreve://my/Received/report.txt").hasOwnShare(currentUserID: "me"))
         let receivedMetadata = Data("""
             {"type":1,"id":"shortcut","name":"Test Delt Mappe","path":"cloudreve://my/Test Delt Mappe",
              "size":0,"owned":true,"metadata":{"sys:shared_owner":"other-user","sys:shared_redirect":"cloudreve://share@shared_with_me/"}}

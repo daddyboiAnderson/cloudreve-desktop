@@ -6,6 +6,8 @@ import {
   List,
   Typography,
   Divider,
+  ToggleButton,
+  ToggleButtonGroup,
 } from "@mui/material";
 import {
   Folder as FolderIcon,
@@ -26,6 +28,7 @@ import TaskHistoryGroup from "./TaskHistoryGroup";
 import { groupRecentTasks } from "./activity";
 import ConflictItem from "./ConflictItem";
 import FileProviderIssueItem from "./FileProviderIssueItem";
+import SavedItems from "./SavedItems";
 
 export default function Popup() {
   const { t } = useTranslation();
@@ -33,6 +36,7 @@ export default function Popup() {
   const [fileProviderIssues, setFileProviderIssues] = useState<FileProviderIssue[]>([]);
   const [selectedDrive, setSelectedDrive] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<"recent" | "pinned" | "shared">("recent");
   const isFetchingRef = useRef(false);
   const suppressBlurCloseUntilRef = useRef(0);
   const isMacOS = platformType() === "macos";
@@ -217,11 +221,22 @@ export default function Popup() {
           onDriveSelect={handleDriveSelect}
           onAddDrive={handleAddDrive}
         />
+        <ToggleButtonGroup exclusive fullWidth size="small" value={view}
+          onChange={(_, next) => { if (next) setView(next); }}
+          aria-label="Item overview" sx={{ mt: 1.5, bgcolor: "action.hover", borderRadius: "999px", p: 0.5, gap: 0.5,
+            "& .MuiToggleButtonGroup-grouped": { m: 0, border: 0, borderRadius: "999px !important" },
+            "& .MuiToggleButton-root": { textTransform: "none", fontSize: 12, fontWeight: 500, py: 0.65, px: 1, whiteSpace: "nowrap", color: "text.secondary", transition: "background-color 150ms, color 150ms", boxShadow: "none" },
+            "& .MuiToggleButton-root.Mui-selected, & .MuiToggleButton-root.Mui-selected:hover": { bgcolor: "background.paper", color: "text.primary", fontWeight: 600, boxShadow: "none" },
+            "& .MuiToggleButton-root.Mui-focusVisible": { outline: "2px solid", outlineColor: "primary.main", outlineOffset: -2, boxShadow: "none" } }}>
+          <ToggleButton value="recent">{t("popup.recent", "Recent")}{conflictCount > 0 ? ` · ${conflictCount}` : ""}</ToggleButton>
+          {isMacOS && <ToggleButton value="pinned">{t("popup.keepDownloaded", "Keep Downloaded")}</ToggleButton>}
+          <ToggleButton value="shared">{t("popup.sharedByMe", "Shared by me")}</ToggleButton>
+        </ToggleButtonGroup>
       </Box>
 
       {/* Task List */}
       <Box sx={{ flex: 1, overflow: "auto" }}>
-        {loading ? (
+        {view !== "recent" ? <SavedItems kind={view} drives={summary?.drives ?? []} selectedDrive={selectedDrive} /> : loading ? (
           <Box
             sx={{
               display: "flex",

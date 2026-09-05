@@ -1152,7 +1152,36 @@ final class RemoteStore {
         try await allChildren(of: identifier)
     }
 
-    /// Toggle and persist pin state, then refresh cached policies.
+    /// Apply menu-app requests without evicting downloaded contents.
+    func applyPinRequests() async {
+        await withActionLock {
+            struct Request: Decodable { let drive_id: String; let uri: String }
+            let directory = DriveStore.drivesURL.deletingLastPathComponent()
+                .appendingPathComponent("pin-requests")
+            let urls = (try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)) ?? []
+            for url in urls where url.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: url),
+                    let request = try? JSONDecoder().decode(Request.self, from: data),
+                    request.drive_id == self.drive.id else { continue }
+                let uri = Self.canonicalURI(request.uri)
+                let root = Self.canonicalURI(self.rootPath).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                guard uri == root || uri.hasPrefix(root + "/") else { continue }
+                let matches = self.pinnedIdentifiersSnapshot().filter {
+                    Self.canonicalURI(self.uri(for: NSFileProviderItemIdentifier($0))) == uri
+                }
+                for raw in matches { self.setPinned(false, for: NSFileProviderItemIdentifier(raw)) }
+                self.recordPendingItemUpdates(uris: [uri])
+                // Acknowledge only after the persisted selection is updated.
+                if let saved = try? Data(contentsOf: self.pinnedFileURL),
+                    let pins = try? JSONDecoder().decode([String].self, from: saved),
+                    Set(pins).isDisjoint(with: matches) {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
+    }
+
     func setPinned(_ pinned: Bool, for identifier: NSFileProviderItemIdentifier) {
         cacheLock.lock()
         if pinned {
@@ -1434,8 +1463,10 @@ final class RemoteStore {
             pinned: isPinned(identifier),
             effectivelyPinned: isEffectivelyPinned(identifier, uri: filePath),
             sharedState: file.shared ?? false,
-            sharedByCurrentUserState: file.shared == true && file.owned == true,
-            sharedWithMeState: file.isSharedWithMe(currentUserID: drive.user_id),
+            sharedByCurrentUserState: file.hasOwnShare(currentUserID: drive.user_id),
+            sharedWithMeState: file.isSharedWithMe(currentUserID: drive.user_id)
+                && (file.metadata?["sys:shared_redirect"] != nil
+                    || !file.hasOwnShare(currentUserID: drive.user_id)),
             locked: locked,
             remoteID: file.id,
             remoteURI: filePath,

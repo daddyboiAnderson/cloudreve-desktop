@@ -34,7 +34,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
 
     /// Forces File Provider to notice a policy-only metadata change.
     private static let pinnedVersionMarker = Data("#kd".utf8)
-    private static let sharedVersionMarker = Data("#shared-by-me-label-v2".utf8)
+    private static let sharedVersionMarker = Data("#shared-by-me-label-v4".utf8)
     private static let sharedByCurrentUserVersionMarker = Data("#shared-owner".utf8)
     private static let lockedVersionMarker = Data("#upload-conflict-v2".utf8)
     private static let lockRestrictedCapabilities: NSFileProviderItemCapabilities = [
@@ -45,10 +45,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             "cloudreve.desktop.dev.fileprovider.keep-downloaded-v2")
     static let sharedDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.shared-v1")
+            "cloudreve.desktop.dev.fileprovider.shared-v2")
     static let sharedWithMeDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.shared-with-me-v1")
+            "cloudreve.desktop.dev.fileprovider.shared-with-me-v2")
     static let lockedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.upload-conflict-v1")
@@ -109,7 +109,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             effectiveMetadataVersion += Self.sharedByCurrentUserVersionMarker
         }
         if self.sharedWithMeState {
-            effectiveMetadataVersion += Data("#shared-with-me-native-label-v3".utf8)
+            effectiveMetadataVersion += Data("#shared-with-me-native-label-v5".utf8)
         }
         if self.isLocked {
             effectiveMetadataVersion += Self.lockedVersionMarker
@@ -127,10 +127,17 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .downloadLazily
     }
 
-    // Let Finder render the native shared-item icon.
-    var isShared: Bool { sharedState || sharedWithMeState }
+    // Finder's shared flag supplies the native embossed folder icon.
+    var isShared: Bool {
+        contentType.conforms(to: .folder) && (sharedState || sharedWithMeState)
+    }
 
     var isSharedByCurrentUser: Bool { sharedByCurrentUserState }
+
+    var ownerNameComponents: PersonNameComponents? {
+        guard sharedWithMeState else { return nil }
+        return PersonNameComponents()
+    }
 
     var fileSystemFlags: NSFileProviderFileSystemFlags {
         var flags: NSFileProviderFileSystemFlags = [.userReadable]

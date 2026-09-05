@@ -25,6 +25,7 @@ use objc2_app_kit::NSApp as ns_app;
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSColor,
     NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow, NSWindowButton,
+    NSWindowCollectionBehavior,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSString};
@@ -180,7 +181,7 @@ pub struct ShareWindowTarget {
     pub uri: String,
 }
 
-async fn get_share_mount(
+pub(crate) async fn get_share_mount(
     state: &State<'_, AppStateHandle>,
     drive_id: &str,
 ) -> CommandResult<(Arc<cloudreve_sync::drive::mounts::Mount>, DriveConfig)> {
@@ -196,7 +197,7 @@ async fn get_share_mount(
     Ok((mount, config))
 }
 
-fn validate_share_uri(
+pub(crate) fn validate_share_uri(
     uri: &str,
     remote_path: &str,
     current_user_id: &str,
@@ -1228,9 +1229,8 @@ fn position_main_window_at_click(window: &WebviewWindow, click: PhysicalPosition
     let min_y = monitor_position.y;
     let max_y = monitor_position.y + monitor_size.height as i32 - window_size.height as i32;
     let x = (click.x.round() as i32 - window_size.width as i32 / 2).clamp(min_x, max_x);
-    // A menu-bar click is normally at the vertical center of its icon. Half a
-    // standard 24-point menu bar places the popup immediately below it.
-    let y = (click.y.round() as i32 + (12.0 * scale).round() as i32).clamp(min_y, max_y);
+    // Half the menu-bar height plus an eight-point gap.
+    let y = (click.y.round() as i32 + (20.0 * scale).round() as i32).clamp(min_y, max_y);
 
     if let Err(err) = window.set_position(PhysicalPosition::new(x, y)) {
         tracing::warn!(
@@ -1685,18 +1685,46 @@ pub fn show_reauthorize_window_impl(
     show_drive_window_internal(app, "Reauthorize Drive", &get_url_with_lang(&url_path));
 }
 
-/// Internal function to show or create the add-drive/reauthorize window
-fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
-    // Check if window already exists
-    if let Some(window) = app.get_webview_window("add-drive") {
+/// Activate the drive window on the current desktop.
+fn focus_drive_window(window: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    {
+        let window = window.clone();
+        let app = window.app_handle().clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let Ok(handle) = window.ns_window() else { return };
+            let native = unsafe { &*handle.cast::<NSWindow>() };
+            // Bring the login window to the Space where the browser is open.
+            let behavior = native.collectionBehavior()
+                .difference(NSWindowCollectionBehavior::CanJoinAllSpaces)
+                | NSWindowCollectionBehavior::MoveToActiveSpace;
+            native.setCollectionBehavior(behavior);
+            let _ = window.app_handle().show();
+            let _ = window.unminimize();
+            native.makeKeyAndOrderFront(None);
+            crate::update_dock_visibility(window.app_handle());
+            #[allow(deprecated)]
+            ns_app(mtm).activateIgnoringOtherApps(true);
+            native.makeKeyAndOrderFront(None);
+            refresh_traffic_light_tracking(&window);
+        }) {
+            tracing::warn!(target: "main", error = %error, "Failed to focus the drive window");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        #[cfg(target_os = "macos")]
-        {
-            refresh_traffic_light_tracking(&window);
-            crate::update_dock_visibility(app);
-        }
+    }
+}
+
+/// Show or create the add-drive/reauthorize window.
+fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
+    // Check if window already exists
+    if let Some(window) = app.get_webview_window("add-drive") {
+        focus_drive_window(&window);
         return;
     }
 
@@ -1747,13 +1775,7 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
             move_window_safely(&window, Position::Center, "add-drive");
             #[cfg(windows)]
             let _ = window.create_overlay_titlebar();
-            let _ = window.show();
-            let _ = window.set_focus();
-            #[cfg(target_os = "macos")]
-            {
-                refresh_traffic_light_tracking(&window);
-                crate::update_dock_visibility(app);
-            }
+            focus_drive_window(&window);
         }
         Err(e) => {
             tracing::error!(target: "main", error = %e, "Failed to create window: {}", title);

@@ -1,4 +1,5 @@
 use anyhow::Context;
+mod saved_items;
 use cloudreve_sync::{
     shellext::shell_service::ServiceHandle, ConfigManager, DriveManager, EventBroadcaster,
     LogConfig, LogGuard,
@@ -497,6 +498,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::is_dir_empty,
             commands::list_drives,
+            saved_items::list_saved_items,
+            saved_items::reveal_saved_item,
+            saved_items::remove_saved_pin,
             commands::add_drive,
             commands::remove_drive,
             commands::get_ignore_patterns,

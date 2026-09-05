@@ -2,7 +2,7 @@ use crate::models::common::PaginationResults;
 use crate::models::explorer::{PermissionSettingReq, Share};
 use serde::{de::Deserializer, Deserialize, Serialize};
 
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de> + Default,

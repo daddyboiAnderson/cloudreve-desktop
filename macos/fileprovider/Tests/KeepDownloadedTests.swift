@@ -48,7 +48,7 @@ enum KeepDownloadedTests {
             pinned: true,
             sharedState: true,
             sharedByCurrentUserState: true)
-        precondition(sharedAndPinned.isShared)
+        precondition(!sharedAndPinned.isShared)
         precondition(sharedAndPinned.isSharedByCurrentUser)
         precondition(
             sharedAndPinned.itemVersion.metadataVersion != pinned.itemVersion.metadataVersion)
@@ -58,7 +58,7 @@ enum KeepDownloadedTests {
             sharedAndPinned.decorations?.contains(FileProviderItem.sharedDecoration) == true)
 
         let sharedAfterPin = sharedAndPinned.withPinned(true)
-        precondition(sharedAfterPin.isShared)
+        precondition(!sharedAfterPin.isShared)
 
         let received = FileProviderItem(
             identifier: base.itemIdentifier,
@@ -76,7 +76,7 @@ enum KeepDownloadedTests {
             sharedState: true,
             sharedByCurrentUserState: true,
             sharedWithMeState: true)
-        precondition(received.isShared && !received.isSharedByCurrentUser)
+        precondition(!received.isShared && !received.isSharedByCurrentUser)
         // Resharing a received file must not replace its incoming label.
         precondition(received.decorations == [FileProviderItem.sharedWithMeDecoration])
         precondition(received.itemVersion.metadataVersion != sharedAndPinned.withPinned(false).itemVersion.metadataVersion)
@@ -108,7 +108,7 @@ enum KeepDownloadedTests {
             sharedAfterPin.decorations?.contains(FileProviderItem.sharedDecoration) == true)
         let sharedAfterUnpin = sharedAfterPin.withPinned(false, effectivelyPinned: false)
         precondition(!sharedAfterUnpin.effectivelyPinned)
-        precondition(sharedAfterUnpin.isShared)
+        precondition(!sharedAfterUnpin.isShared)
         precondition(sharedAfterUnpin.decorations == [FileProviderItem.sharedDecoration])
         precondition(
             sharedAfterUnpin.itemVersion.metadataVersion != base.itemVersion.metadataVersion)
