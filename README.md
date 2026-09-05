@@ -97,7 +97,7 @@ cd ..
 npx --yes @tauri-apps/cli@2.11.4 build --bundles app
 
 # Build and embed the native File Provider extension
-FP_CONFIGURATION=Release FP_BUILD_NUMBER=5 ./macos/scripts/embed-into-app.sh \
+FP_CONFIGURATION=Release FP_BUILD_NUMBER=5.1 ./macos/scripts/embed-into-app.sh \
   target/release/bundle/macos/Cloudreve.app
 ```
 

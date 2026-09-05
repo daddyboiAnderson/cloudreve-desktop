@@ -1,5 +1,16 @@
 # Changelog
 
+## Cloudreve Desktop 0.2.0 for macOS — Build 5.1
+
+Build 5.1 is a maintenance update for the Keep Downloaded controls and transfer progress introduced in Build 5.
+
+### Changed in Build 5.1
+
+- Fixed Remove Keep Downloaded from the menu-bar overview timing out and requiring Cloudreve to be restarted.
+- Added the missing File Provider permission used to apply menu-bar Keep Downloaded changes.
+- Made transfer progress refresh twice per second and animate more smoothly, which makes completion clearer on slower Macs.
+- Prevented late transfer callbacks from changing a completed download back to an unfinished state.
+
 ## Cloudreve Desktop 0.2.0 for macOS — Build 5
 
 Build 5 is a major update to Finder integration, conflict safety, sharing, and the menu-bar experience.
