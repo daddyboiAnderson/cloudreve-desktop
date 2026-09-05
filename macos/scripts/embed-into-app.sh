@@ -27,12 +27,21 @@ if [[ ! -d "$APP" ]]; then
     exit 1
 fi
 
+bash "$ROOT/macos/scripts/build-app-icon.sh"
 "$ROOT/macos/scripts/build-extension.sh"
 
 echo "==> Embedding into $APP"
 mkdir -p "$APP/Contents/PlugIns"
 rm -rf "$APP/Contents/PlugIns/CloudreveFileProvider.appex"
 cp -R "$ROOT/macos/build/CloudreveFileProvider.appex" "$APP/Contents/PlugIns/"
+
+cp "$ROOT/macos/build/AppIcon/Assets.car" "$APP/Contents/Resources/Assets.car"
+cp "$ROOT/macos/build/AppIcon/Cloudreve.icns" "$APP/Contents/Resources/Cloudreve.icns"
+for icon_key in CFBundleIconFile CFBundleIconName; do
+    /usr/libexec/PlistBuddy -c "Delete :$icon_key" "$APP/Contents/Info.plist" 2>/dev/null || true
+done
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Cloudreve.icns" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string Cloudreve" "$APP/Contents/Info.plist"
 
 for resource in KeepDownloaded.icns Shared.icns UploadConflict.icns; do
     badge_resource="$APP/Contents/PlugIns/CloudreveFileProvider.appex/Contents/Resources/$resource"

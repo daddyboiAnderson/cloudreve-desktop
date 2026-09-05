@@ -54,7 +54,11 @@ swiftc -swift-version 5 \
 
 echo "==> Assembling bundle"
 cp "$SUPPORT_DIR/Info.plist" "$APPEX/Contents/Info.plist"
-cp "$ROOT/src-tauri/icons/icon.icns" "$APPEX/Contents/Resources/Cloudreve.icns"
+APP_ICON="$ROOT/macos/build/AppIcon/Cloudreve.icns"
+if [[ ! -f "$APP_ICON" ]]; then
+    APP_ICON="$ROOT/src-tauri/icons/icon.icns"
+fi
+cp "$APP_ICON" "$APPEX/Contents/Resources/Cloudreve.icns"
 bash "$ROOT/macos/scripts/build-keep-downloaded-badge.sh" \
     "$APPEX/Contents/Resources"
 bash "$ROOT/macos/scripts/build-shared-badge.sh" \
