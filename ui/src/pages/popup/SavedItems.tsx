@@ -76,6 +76,12 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
     return () => { requests.current++; window.removeEventListener("focus", onFocus); };
   }, [refresh]);
 
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(""), 3000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   const action = async (item: SavedItem, command: "reveal" | "copy" | "share" | "unpin") => {
     setMenu(null);
     setBusy(true);
@@ -90,7 +96,7 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
           driveId: item.drive.id, uri: item.uri,
         });
         if (command === "unpin") {
-          setNotice(t("popup.pinRemoved", "Keep Downloaded removed. Existing downloads stay on this Mac."));
+          setNotice(t("popup.pinRemoved", "Keep Downloaded removed from “{{name}}”. Existing downloads stay on this Mac.", { name: item.name }));
           await refresh();
         }
       }
