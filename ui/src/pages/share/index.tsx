@@ -30,13 +30,14 @@ import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import GroupOutlinedIcon from "@mui/icons-material/GroupOutlined";
-import IosShareOutlinedIcon from "@mui/icons-material/IosShareOutlined";
 import LinkIcon from "@mui/icons-material/Link";
 import PublicIcon from "@mui/icons-material/Public";
 import SettingsIcon from "@mui/icons-material/Settings";
 import LockOutlinedIcon from "@mui/icons-material/LockOutlined";
 import DashboardOutlinedIcon from "@mui/icons-material/DashboardOutlined";
 import DescriptionOutlinedIcon from "@mui/icons-material/DescriptionOutlined";
+import FolderOutlinedIcon from "@mui/icons-material/FolderOutlined";
+import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, ReactNode } from "react";
@@ -45,6 +46,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type as platformType } from "@tauri-apps/plugin-os";
 import { useSearchParams } from "react-router-dom";
+import { ConflictFilename } from "../UploadConflict";
 
 type PermissionKey = "read" | "create" | "update" | "delete";
 type PermissionState = Record<PermissionKey, boolean>;
@@ -390,14 +392,12 @@ function shareAccessLabel(share: ShareLink): string {
 
 export default function Share() {
   const isMacOS = platformType() === "macos";
-  const [systemShareSymbol, setSystemShareSymbol] = useState<string | null>(null);
   const [advancedSymbols, setAdvancedSymbols] = useState<Record<string, string>>({});
   const [searchParams] = useSearchParams();
 
   useEffect(() => {
     if (!isMacOS) return;
     const symbols = [
-      "square.and.arrow.up",
       "lock.fill",
       "rectangle.grid.2x2.fill",
       "doc.text.fill",
@@ -411,11 +411,9 @@ export default function Share() {
     )
       .then((entries) => {
         const rendered = Object.fromEntries(entries);
-        setSystemShareSymbol(rendered["square.and.arrow.up"]);
         setAdvancedSymbols(rendered);
       })
       .catch(() => {
-        setSystemShareSymbol(null);
         setAdvancedSymbols({});
       });
   }, [isMacOS]);
@@ -1029,75 +1027,27 @@ export default function Share() {
         flexDirection: "column",
         bgcolor: "background.paper",
         borderRadius: "14px",
-        border: "1px solid",
-        borderColor: (theme) =>
-          theme.palette.mode === "dark"
-            ? "rgba(255, 255, 255, 0.12)"
-            : "rgba(0, 0, 0, 0.08)",
-        boxShadow: (theme) =>
-          theme.palette.mode === "dark"
-            ? "0 3px 14px rgba(0, 0, 0, 0.24)"
-            : "0 3px 14px rgba(0, 0, 0, 0.08)",
         boxSizing: "border-box",
         overflow: "hidden",
       }}
     >
       <Box
+        data-tauri-drag-region
         sx={{
+          height: 46,
+          flexShrink: 0,
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
           px: 2,
           pl: isMacOS ? "91px" : 2,
-          py: 1.25,
           borderBottom: 1,
           borderColor: "divider",
         }}
       >
-        <Stack
-          direction="row"
-          spacing={isMacOS ? 1.25 : 1}
-          alignItems="center"
-          sx={{ flex: 1, minWidth: 0, overflow: "hidden", transform: isMacOS ? "translateY(-2px)" : undefined }}
-        >
-          {systemShareSymbol ? (
-            <Box
-              component="img"
-              src={systemShareSymbol}
-              alt=""
-              sx={{
-                width: 20,
-                height: 20,
-                flexShrink: 0,
-                objectFit: "contain",
-                filter: (theme) => theme.palette.mode === "light" ? "invert(1)" : "none",
-                transform: "translateY(-1px)",
-              }}
-            />
-          ) : (
-            <IosShareOutlinedIcon
-              sx={{ flexShrink: 0, fontSize: 20, color: isMacOS ? "text.primary" : "primary.main", transform: isMacOS ? "translateY(-1px)" : undefined }}
-            />
-          )}
-          <Stack
-            direction="row"
-            spacing={0.75}
-            alignItems="baseline"
-            sx={{ flex: 1, minWidth: 0, overflow: "hidden", transform: isMacOS ? "translateY(1px)" : undefined }}
-          >
-            <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ flexShrink: 0 }}>
-              Share
-            </Typography>
-            <Typography
-              variant="body2"
-              color="text.secondary"
-              noWrap
-              sx={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}
-            >
-              {target?.name ?? "Cloudreve item"}
-            </Typography>
-          </Stack>
-        </Stack>
+        <Typography variant="subtitle1" fontWeight={700} noWrap>
+          Share Options
+        </Typography>
         {!isMacOS && (
           <IconButton size="small" onClick={closeWindow} aria-label="Close" sx={{ flexShrink: 0, ml: 1 }}>
             <CloseIcon fontSize="small" />
@@ -1113,7 +1063,7 @@ export default function Share() {
           overflowY: "auto",
           overflowX: "hidden",
           overscrollBehavior: "contain",
-          p: 2,
+          p: 2.5,
         }}
       >
         {loading ? (
@@ -1125,13 +1075,38 @@ export default function Share() {
           </Stack>
         ) : error && !target ? (
           <Stack spacing={2}>
-            <Alert severity="error">{error}</Alert>
-            <Button variant="outlined" onClick={() => routeTarget && loadTarget(routeTarget)}>
-              Try again
-            </Button>
+            <Stack direction="row" spacing={1.5} alignItems="center">
+              <Avatar sx={{ width: 42, height: 42, bgcolor: "error.main" }}>
+                <LockOutlinedIcon />
+              </Avatar>
+              <Box>
+                <Typography fontWeight={700}>Sharing is unavailable</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  We couldn’t load sharing settings for this item.
+                </Typography>
+              </Box>
+            </Stack>
+            <Typography variant="body2" color="text.secondary">
+              If this item belongs to someone else, your access must allow sharing it.
+              You can also try again if the connection was interrupted.
+            </Typography>
+            <Alert severity="error" sx={{ borderRadius: 2, "& .MuiAlert-message": { overflowWrap: "anywhere" } }}>
+              {error}
+            </Alert>
           </Stack>
         ) : target ? (
           <Stack spacing={2}>
+            <Stack direction="row" spacing={1.5} alignItems="center">
+              <Avatar sx={{ width: 42, height: 42, bgcolor: "primary.main", color: "primary.contrastText" }}>
+                {target.is_folder ? <FolderOutlinedIcon /> : <DescriptionOutlinedIcon />}
+              </Avatar>
+              <Box sx={{ minWidth: 0, flex: 1 }}>
+                <ConflictFilename filename={target.name} />
+                <Typography variant="body2" color="text.secondary">
+                  Choose who can access this {target.is_folder ? "folder" : "file"} and what they can do.
+                </Typography>
+              </Box>
+            </Stack>
             {error && (
               <Alert severity="error" onClose={() => setError("")}>
                 {error}
@@ -1741,13 +1716,23 @@ export default function Share() {
         ) : null}
       </Box>
 
+      {!target && !loading && (
+        <Stack direction="row" justifyContent="flex-end" spacing={1}
+          sx={{ px: 2.5, py: 2, borderTop: 1, borderColor: "divider" }}>
+          <Button onClick={closeWindow}>Close</Button>
+          <Button variant="contained" startIcon={<RefreshRoundedIcon />}
+            onClick={() => routeTarget && loadTarget(routeTarget)}>
+            Try Again
+          </Button>
+        </Stack>
+      )}
       {target && (
         <Box
           sx={{
             position: "relative",
             flexShrink: 0,
-            px: 2,
-            py: 1.25,
+            px: 2.5,
+            py: 2,
             borderTop: 1,
             borderColor: "divider",
             bgcolor: "background.paper",

@@ -23,6 +23,9 @@ use crate::commands::{
     handle_deep_link, show_add_drive_window_impl, show_main_window, show_settings_window_impl,
 };
 mod commands;
+mod share_shortcuts;
+#[cfg(target_os = "macos")]
+mod received_folder_icons;
 mod event_handler;
 #[cfg(target_os = "macos")]
 mod file_provider_issue;
@@ -204,6 +207,8 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
 
     // Store in Tauri's managed state as well for commands
     app.manage(AppStateHandle);
+    #[cfg(target_os = "macos")]
+    received_folder_icons::start(app.clone());
 
     if has_no_drives {
         event_broadcaster.no_drive();

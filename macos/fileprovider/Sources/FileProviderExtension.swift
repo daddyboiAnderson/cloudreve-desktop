@@ -339,7 +339,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
                     driveID: store.drive.id,
                     itemIdentifier: itemIdentifier.rawValue)
                 // Refresh metadata before serving content.
-                let item = try await store.item(
+                let item = try await store.refreshItem(
                     for: itemIdentifier, displayName: domain.displayName)
                 if shouldCancelSystemDownload(
                     request: request,

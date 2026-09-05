@@ -22,6 +22,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     let sharedState: Bool
     /// Whether the current Cloudreve account owns the share.
     let sharedByCurrentUserState: Bool
+    let sharedWithMeState: Bool
     /// Whether the server rejected a mutation because another app holds a lock.
     let isLocked: Bool
     let remoteID: String?
@@ -33,7 +34,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
 
     /// Forces File Provider to notice a policy-only metadata change.
     private static let pinnedVersionMarker = Data("#kd".utf8)
-    private static let sharedVersionMarker = Data("#shared".utf8)
+    private static let sharedVersionMarker = Data("#shared-by-me-label-v2".utf8)
     private static let sharedByCurrentUserVersionMarker = Data("#shared-owner".utf8)
     private static let lockedVersionMarker = Data("#upload-conflict-v2".utf8)
     private static let lockRestrictedCapabilities: NSFileProviderItemCapabilities = [
@@ -45,6 +46,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     static let sharedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.shared-v1")
+    static let sharedWithMeDecoration =
+        NSFileProviderItemDecorationIdentifier(
+            "cloudreve.desktop.dev.fileprovider.shared-with-me-v1")
     static let lockedDecoration =
         NSFileProviderItemDecorationIdentifier(
             "cloudreve.desktop.dev.fileprovider.upload-conflict-v1")
@@ -65,6 +69,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         effectivelyPinned: Bool? = nil,
         sharedState: Bool = false,
         sharedByCurrentUserState: Bool = false,
+        sharedWithMeState: Bool = false,
         locked: Bool = false,
         remoteID: String? = nil,
         remoteURI: String? = nil,
@@ -81,7 +86,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         let resolvedEffectivelyPinned = effectivelyPinned ?? pinned
         self.effectivelyPinned = resolvedEffectivelyPinned
         self.sharedState = sharedState
-        self.sharedByCurrentUserState = sharedByCurrentUserState
+        self.sharedByCurrentUserState = sharedByCurrentUserState && !sharedWithMeState
+        self.sharedWithMeState = sharedWithMeState
         self.isLocked = locked
         self.remoteID = remoteID
         self.remoteURI = remoteURI
@@ -102,6 +108,9 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         if self.sharedByCurrentUserState {
             effectiveMetadataVersion += Self.sharedByCurrentUserVersionMarker
         }
+        if self.sharedWithMeState {
+            effectiveMetadataVersion += Data("#shared-with-me-native-label-v3".utf8)
+        }
         if self.isLocked {
             effectiveMetadataVersion += Self.lockedVersionMarker
         }
@@ -118,7 +127,8 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         effectivelyPinned ? .downloadEagerlyAndKeepDownloaded : .downloadLazily
     }
 
-    var isShared: Bool { sharedState }
+    // Let Finder render the native shared-item icon.
+    var isShared: Bool { sharedState || sharedWithMeState }
 
     var isSharedByCurrentUser: Bool { sharedByCurrentUserState }
 
@@ -150,7 +160,10 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
         if effectivelyPinned {
             result.append(Self.keepDownloadedDecoration)
         }
-        if sharedState {
+        // Keep the incoming label after the recipient reshares the item.
+        if sharedWithMeState {
+            result.append(Self.sharedWithMeDecoration)
+        } else if sharedByCurrentUserState {
             result.append(Self.sharedDecoration)
         }
         return result.isEmpty ? nil : result
@@ -174,6 +187,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             effectivelyPinned: effectivelyPinned ?? pinned,
             sharedState: sharedState,
             sharedByCurrentUserState: sharedByCurrentUserState,
+            sharedWithMeState: sharedWithMeState,
             locked: isLocked,
             remoteID: remoteID,
             remoteURI: remoteURI,
@@ -199,6 +213,7 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
             effectivelyPinned: effectivelyPinned,
             sharedState: sharedState,
             sharedByCurrentUserState: sharedByCurrentUserState,
+            sharedWithMeState: sharedWithMeState,
             locked: locked,
             remoteID: remoteID,
             remoteURI: remoteURI,

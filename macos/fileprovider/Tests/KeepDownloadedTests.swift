@@ -59,13 +59,57 @@ enum KeepDownloadedTests {
 
         let sharedAfterPin = sharedAndPinned.withPinned(true)
         precondition(sharedAfterPin.isShared)
+
+        let received = FileProviderItem(
+            identifier: base.itemIdentifier,
+            parentIdentifier: base.parentItemIdentifier,
+            filename: base.filename,
+            contentType: base.contentType,
+            documentSize: 42,
+            childItemCount: nil,
+            capabilities: [.allowsReading, .allowsWriting],
+            contentVersion: base.itemVersion.contentVersion,
+            metadataVersion: base.baseMetadataVersion,
+            creationDate: nil,
+            contentModificationDate: nil,
+            pinned: false,
+            sharedState: true,
+            sharedByCurrentUserState: true,
+            sharedWithMeState: true)
+        precondition(received.isShared && !received.isSharedByCurrentUser)
+        // Resharing a received file must not replace its incoming label.
+        precondition(received.decorations == [FileProviderItem.sharedWithMeDecoration])
+        precondition(received.itemVersion.metadataVersion != sharedAndPinned.withPinned(false).itemVersion.metadataVersion)
+        let receivedPinned = received.withPinned(true)
+        precondition(receivedPinned.decorations == [
+            FileProviderItem.keepDownloadedDecoration, FileProviderItem.sharedWithMeDecoration])
+        precondition(receivedPinned.itemVersion.contentVersion == received.itemVersion.contentVersion)
+        let receivedLocked = receivedPinned.withLocked(true)
+        precondition(receivedLocked.decorations == [
+            FileProviderItem.lockedDecoration, FileProviderItem.keepDownloadedDecoration,
+            FileProviderItem.sharedWithMeDecoration])
+        precondition(!receivedLocked.capabilities.contains(.allowsWriting))
+        precondition(receivedLocked.withLocked(false).withPinned(false).decorations == received.decorations)
+        precondition(received.withPinned(false, effectivelyPinned: true).decorations == receivedPinned.decorations)
+        let receivedFolder = FileProviderItem(
+            identifier: base.itemIdentifier, parentIdentifier: .rootContainer,
+            filename: "Received folder", contentType: .folder, documentSize: nil,
+            childItemCount: nil, capabilities: [.allowsReading, .allowsContentEnumerating],
+            contentVersion: Data(), metadataVersion: Data(), creationDate: nil,
+            contentModificationDate: nil, pinned: true, sharedWithMeState: true)
+        precondition(receivedFolder.decorations == [
+            FileProviderItem.keepDownloadedDecoration, FileProviderItem.sharedWithMeDecoration])
+        precondition(receivedFolder.isShared && !receivedFolder.isSharedByCurrentUser)
+        precondition(receivedFolder.contentType.conforms(to: .folder))
+        precondition(receivedFolder.contentType == .folder)
+        precondition(receivedFolder.withPinned(false).withLocked(true).decorations == [
+            FileProviderItem.lockedDecoration, FileProviderItem.sharedWithMeDecoration])
         precondition(
             sharedAfterPin.decorations?.contains(FileProviderItem.sharedDecoration) == true)
         let sharedAfterUnpin = sharedAfterPin.withPinned(false, effectivelyPinned: false)
         precondition(!sharedAfterUnpin.effectivelyPinned)
         precondition(sharedAfterUnpin.isShared)
-        precondition(
-            sharedAfterUnpin.decorations?.contains(FileProviderItem.sharedDecoration) == true)
+        precondition(sharedAfterUnpin.decorations == [FileProviderItem.sharedDecoration])
         precondition(
             sharedAfterUnpin.itemVersion.metadataVersion != base.itemVersion.metadataVersion)
 

@@ -77,7 +77,7 @@ function filenameParts(filename: string) {
     : { basename: filename, extension: "" };
 }
 
-function ConflictFilename({ filename }: { filename: string }) {
+export function ConflictFilename({ filename }: { filename: string }) {
   const displayedFilename = filenameParts(filename);
   const basenameRef = useRef<HTMLSpanElement>(null);
   const [isTruncated, setIsTruncated] = useState(false);

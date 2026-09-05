@@ -74,7 +74,42 @@ struct RemoteFile: Decodable {
     let owned: Bool?
     let primary_entity: String?
 
+    var presentationIdentity: String?
+
+    func isSharedWithMe(currentUserID: String?) -> Bool {
+        // Use the target owner because the shortcut belongs to this drive.
+        if let owner = metadata?["sys:shared_owner"], !owner.isEmpty,
+            let currentUserID, !currentUserID.isEmpty {
+            return owner != currentUserID
+        }
+        return owned == false && (
+            metadata?["sys:shared_redirect"] != nil || presentationIdentity != nil
+                || path.contains("@shared_with_me"))
+    }
+
+    func presented(at uri: String, name: String? = nil) -> RemoteFile {
+        guard path != uri else { return self }
+        var file = RemoteFile(
+            type: type, id: id, name: name ?? self.name, path: uri, size: size,
+            created_at: created_at, updated_at: updated_at, metadata: metadata,
+            shared: shared, owned: owned, primary_entity: primary_entity)
+        // Keep each shortcut as a separate Finder item.
+        file.presentationIdentity = uri
+        return file
+    }
+
     var isFolder: Bool { type == 1 }
+
+    /// Combine the shortcut identity with the target's content metadata.
+    func withContent(of target: RemoteFile) -> RemoteFile {
+        var file = RemoteFile(
+            type: type, id: id, name: name, path: path, size: target.size,
+            created_at: created_at, updated_at: target.updated_at,
+            metadata: (target.metadata ?? [:]).merging(metadata ?? [:]) { content, _ in content },
+            shared: shared, owned: owned, primary_entity: target.primary_entity)
+        file.presentationIdentity = presentationIdentity
+        return file
+    }
 }
 
 struct ListPayload: Decodable {
@@ -242,9 +277,10 @@ final class CloudreveClient {
         return f.date(from: s)
     }
 
-    init(drive: DriveConfig) {
+    init(drive: DriveConfig, session: URLSession? = nil) {
         self.baseURL = URL(string: drive.instance_url)!
         self.credentials = drive.credentials
+        if let session { self.session = session }
     }
 
     // MARK: Tokens
@@ -381,9 +417,19 @@ final class CloudreveClient {
         let nextPage: String?
     }
 
+    private func resolvedURI(_ uri: String, followLeaf: Bool) async throws -> String {
+        try await ShortcutResolver.resolve(uri, followLeaf: followLeaf) { candidate in
+            let file: RemoteFile = try await self.call(
+                "GET", "/file/info", body: nil as String?,
+                query: [URLQueryItem(name: "uri", value: candidate)])
+            return file.metadata?["sys:shared_redirect"]
+        }
+    }
+
     func listDirectory(uri: String, page: String?) async throws -> ListResult {
+        let target = try await resolvedURI(uri, followLeaf: true)
         var query = [
-            URLQueryItem(name: "uri", value: uri),
+            URLQueryItem(name: "uri", value: target),
             URLQueryItem(name: "page_size", value: "200"),
         ]
         if let page {
@@ -407,27 +453,51 @@ final class CloudreveClient {
         } else {
             next = nil
         }
-        return ListResult(files: payload.files, nextPage: next)
+        let files = target == uri ? payload.files : payload.files.map {
+            $0.presented(at: ShortcutResolver.child($0.name, of: uri))
+        }
+        var hydrated = files
+        for index in hydrated.indices {
+            do {
+                hydrated[index] = try await fileShortcutContent(hydrated[index])
+            } catch {
+                // A broken shortcut should not hide its siblings.
+                logger.notice("file shortcut target is unavailable: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        return ListResult(files: hydrated, nextPage: next)
     }
 
     func fileInfo(uri: String) async throws -> RemoteFile {
-        try await call(
-            "GET", "/file/info", body: nil as String?,
-            query: [URLQueryItem(name: "uri", value: uri)])
+        try await fileInfoWithShareState(uri: uri)
     }
 
-    /// Fetch the exact item with extended metadata so share state is included.
+    /// Keep the shortcut itself addressable for rename/delete; only ancestors
+    /// redirect metadata requests for its descendants.
     func fileInfoWithShareState(uri: String) async throws -> RemoteFile {
-        try await call(
+        let target = try await resolvedURI(uri, followLeaf: false)
+        let file: RemoteFile = try await call(
             "GET", "/file/info", body: nil as String?,
             query: [
-                URLQueryItem(name: "uri", value: uri),
+                URLQueryItem(name: "uri", value: target),
                 URLQueryItem(name: "extended", value: "true"),
             ])
+        let presented = target == uri ? file : file.presented(at: uri)
+        return try await fileShortcutContent(presented)
+    }
+
+    private func fileShortcutContent(_ file: RemoteFile) async throws -> RemoteFile {
+        guard !file.isFolder, file.metadata?["sys:shared_redirect"] != nil else { return file }
+        let target = try await resolvedURI(file.path, followLeaf: true)
+        let content: RemoteFile = try await call(
+            "GET", "/file/info", body: nil as String?,
+            query: [URLQueryItem(name: "uri", value: target)])
+        return file.withContent(of: content)
     }
 
     /// Fetches the server-generated thumbnail without materializing the file.
     func thumbnail(uri: String) async throws -> Data {
+        let uri = try await resolvedURI(uri, followLeaf: true)
         var payload: FileThumbPayload?
         var lastError: Error = CloudreveError.badResponse("thumbnail was not generated")
         // Cloudreve can enqueue generation and initially answer 40077. Retry
@@ -532,9 +602,11 @@ final class CloudreveClient {
             let uri: String
             let type: String
         }
-        return try await call(
+        let target = try await resolvedURI(uri, followLeaf: false)
+        let file: RemoteFile = try await call(
             "POST", "/file/create",
-            body: Body(uri: uri, type: isFolder ? "folder" : "file"))
+            body: Body(uri: target, type: isFolder ? "folder" : "file"))
+        return target == uri ? file : file.presented(at: uri)
     }
 
     func renameFile(uri: String, to newName: String) async throws -> RemoteFile {
@@ -542,8 +614,11 @@ final class CloudreveClient {
             let uri: String
             let new_name: String
         }
-        return try await call(
-            "POST", "/file/rename", body: Body(uri: uri, new_name: newName))
+        let target = try await resolvedURI(uri, followLeaf: false)
+        let file: RemoteFile = try await call(
+            "POST", "/file/rename", body: Body(uri: target, new_name: newName))
+        return target == uri ? file : file.presented(
+            at: ShortcutResolver.child(newName, of: ShortcutResolver.parent(uri)))
     }
 
     /// Moves `uri` into directory `dstURI`.
@@ -552,6 +627,8 @@ final class CloudreveClient {
             let uris: [String]
             let dst: String
         }
+        let uri = try await resolvedURI(uri, followLeaf: false)
+        let dstURI = try await resolvedURI(dstURI, followLeaf: true)
         try await callVoid("POST", "/file/move", body: Body(uris: [uri], dst: dstURI))
     }
 
@@ -560,6 +637,7 @@ final class CloudreveClient {
         struct Body: Encodable {
             let uris: [String]
         }
+        let uri = try await resolvedURI(uri, followLeaf: false)
         try await callVoid("DELETE", "/file", body: Body(uris: [uri]))
     }
 
@@ -584,6 +662,7 @@ final class CloudreveClient {
         onProgress: ((Int64, Int64) -> Void)? = nil
     ) async throws
     {
+        let uri = try await resolvedURI(uri, followLeaf: overwrite)
         let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
         guard let size = (attrs[.size] as? NSNumber)?.int64Value else {
             throw CloudreveError.badResponse("cannot stat \(fileURL.path)")
@@ -691,6 +770,7 @@ final class CloudreveClient {
     }
 
     func downloadURL(for uri: String) async throws -> URL {
+        let uri = try await resolvedURI(uri, followLeaf: true)
         struct Body: Encodable {
             let uris: [String]
             let download: Bool

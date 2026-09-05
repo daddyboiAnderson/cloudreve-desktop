@@ -243,6 +243,24 @@ fn share_request_for_drive(
     Ok(request)
 }
 
+async fn resolve_share_uri(client: &cloudreve_api::Client, uri: &str) -> CommandResult<String> {
+    crate::share_shortcuts::resolve(uri, |candidate| async move {
+        let file = client
+            .get_file_info(&GetFileInfoService {
+                uri: Some(candidate),
+                id: None,
+                extended: Some(true),
+                folder_summary: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(file
+            .metadata
+            .and_then(|metadata| metadata.get("sys:shared_redirect").cloned()))
+    })
+    .await
+}
+
 #[cfg(target_os = "macos")]
 fn signal_share_metadata_refresh(drive_id: &str, drive_name: &str, source_uris: &[String]) {
     cloudreve_sync::fileprovider::signal_metadata_refresh(drive_id, drive_name, source_uris);
@@ -257,10 +275,11 @@ pub async fn get_share_target(
 ) -> CommandResult<ShareTarget> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
     let uri = validate_share_uri(&uri, &config.remote_path, &config.user_id)?;
+    let resolved_uri = resolve_share_uri(&mount.cr_client, &uri).await?;
     let file = mount
         .cr_client
         .get_file_info(&GetFileInfoService {
-            uri: Some(uri.clone()),
+            uri: Some(resolved_uri.clone()),
             id: None,
             extended: Some(true),
             folder_summary: None,
@@ -272,7 +291,12 @@ pub async fn get_share_target(
     let mut shares = file
         .extended_info
         .and_then(|info| info.shares)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|share| {
+            crate::share_shortcuts::can_manage_share(share, &config.user_id, &resolved_uri)
+        })
+        .collect::<Vec<_>>();
 
     if shares.is_empty() {
         if let Ok(response) = mount
@@ -288,7 +312,10 @@ pub async fn get_share_target(
             shares = response
                 .shares
                 .into_iter()
-                .filter(|share| share.source_uri.as_deref() == Some(file_path.as_str()))
+                .filter(|share| {
+                    crate::share_shortcuts::can_manage_share(share, &config.user_id, &resolved_uri)
+                        && share.source_uri.as_deref() == Some(file_path.as_str())
+                })
                 .collect();
         }
     }
@@ -296,13 +323,13 @@ pub async fn get_share_target(
     // The extended file response is the authoritative share state for this
     // item. Refresh its Finder decoration when the Share window is opened.
     #[cfg(target_os = "macos")]
-    signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&file_path));
+    signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&uri));
 
     Ok(ShareTarget {
         drive_id,
         drive_name: config.name,
         instance_url: config.instance_url,
-        uri: file_path,
+        uri,
         name: file.name,
         is_folder: file.file_type == file_type::FOLDER,
         shares,
@@ -343,9 +370,10 @@ pub async fn create_share_link(
     request: ShareLinkRequest,
 ) -> CommandResult<String> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
-    let request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
+    let mut request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
     #[cfg(target_os = "macos")]
     let source_uri = request.uri.clone();
+    request.uri = resolve_share_uri(&mount.cr_client, &request.uri).await?;
     let url = mount
         .cr_client
         .create_share_link(&request)
@@ -365,9 +393,10 @@ pub async fn edit_share_link(
     request: ShareLinkRequest,
 ) -> CommandResult<String> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
-    let request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
+    let mut request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
     #[cfg(target_os = "macos")]
     let source_uri = request.uri.clone();
+    request.uri = resolve_share_uri(&mount.cr_client, &request.uri).await?;
     let url = mount
         .cr_client
         .edit_share_link(&share_id, &request)
@@ -1562,8 +1591,8 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
         "share",
         WebviewUrl::App(get_url_with_lang(&url_path).into()),
     )
-    .title("Share")
-    .inner_size(540.0, 540.0)
+    .title("Share Options")
+    .inner_size(540.0, 620.0)
     .min_inner_size(480.0, 480.0)
     .resizable(false)
     .visible(false)

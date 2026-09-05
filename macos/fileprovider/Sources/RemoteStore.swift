@@ -71,7 +71,7 @@ final class RemoteStore {
     /// as create callbacks after a domain is re-registered.
     private var deletedIdentityURIs: [String: String] = [:]
     /// Version marker used to force a working-set refresh after policy changes.
-    private static let policyMetadataVersion = "keep-downloaded-policy-v3"
+    private static let policyMetadataVersion = "finder-metadata-v8-sharing-sentence-case"
     private static let metadataRefreshTTL: TimeInterval = 5
     private static let lockStateTTL: TimeInterval = 30
     private var policyRescanPending = false
@@ -410,7 +410,7 @@ final class RemoteStore {
                 Self.canonicalIdentifier(preserved.rawValue))
         }
         return NSFileProviderItemIdentifier(
-            ItemIdentity.remoteID(file.id, fallbackURI: uri))
+            file.presentationIdentity ?? ItemIdentity.remoteID(file.id, fallbackURI: uri))
     }
 
     private func recordIdentity(_ identifier: NSFileProviderItemIdentifier, uri: String) {
@@ -1305,7 +1305,7 @@ final class RemoteStore {
 
     /// Finder metadata files that stay local-only.
     static func isIgnored(filename: String) -> Bool {
-        filename == ".DS_Store" || filename.hasPrefix("._")
+        filename == ".DS_Store" || filename == "Icon\r" || filename.hasPrefix("._")
     }
 
     /// Convert a logical path to a Cloudreve URI.
@@ -1398,6 +1398,7 @@ final class RemoteStore {
             effectivelyPinned: isEffectivelyPinned(identifier, uri: filePath),
             sharedState: file.shared ?? false,
             sharedByCurrentUserState: file.shared == true && file.owned == true,
+            sharedWithMeState: file.isSharedWithMe(currentUserID: drive.user_id),
             locked: locked,
             remoteID: file.id,
             remoteURI: filePath,
