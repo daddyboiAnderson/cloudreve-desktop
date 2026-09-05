@@ -83,6 +83,9 @@ final class RemoteStore {
     private var pendingStabilizationDeletes: Set<String> = []
     private static let presentedContainerLimit = 8
     private let cacheLock = NSLock()
+    private let pinRequestLock = NSLock()
+    private let stateDirectoryOverride: URL?
+    private let pinRequestDirectoryOverride: URL?
     private let actionGate = OperationGate()
     private let managerCallGate = OperationGate()
     private let metadataRefreshCoordinator = MetadataRefreshCoordinator()
@@ -109,7 +112,10 @@ final class RemoteStore {
             .appendingPathComponent("fp-events/\(drive.id).jsonl")
     }
 
-    init(drive: DriveConfig, domain: NSFileProviderDomain) {
+    init(drive: DriveConfig, domain: NSFileProviderDomain,
+         stateDirectory: URL? = nil, pinRequestDirectory: URL? = nil) {
+        self.stateDirectoryOverride = stateDirectory
+        self.pinRequestDirectoryOverride = pinRequestDirectory
         self.drive = drive
         self.domain = domain
         self.client = CloudreveClient(drive: drive)
@@ -178,6 +184,7 @@ final class RemoteStore {
     }
 
     private var stateDirectoryURL: URL {
+        if let stateDirectoryOverride { return stateDirectoryOverride }
         let base = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first ?? FileManager.default.temporaryDirectory
@@ -1153,30 +1160,44 @@ final class RemoteStore {
     }
 
     /// Apply menu-app requests without evicting downloaded contents.
-    func applyPinRequests() async {
-        await withActionLock {
-            struct Request: Decodable { let drive_id: String; let uri: String }
-            let directory = DriveStore.drivesURL.deletingLastPathComponent()
-                .appendingPathComponent("pin-requests")
-            let urls = (try? FileManager.default.contentsOfDirectory(
-                at: directory, includingPropertiesForKeys: nil)) ?? []
-            for url in urls where url.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: url),
-                    let request = try? JSONDecoder().decode(Request.self, from: data),
-                    request.drive_id == self.drive.id else { continue }
-                let uri = Self.canonicalURI(request.uri)
-                let root = Self.canonicalURI(self.rootPath).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                guard uri == root || uri.hasPrefix(root + "/") else { continue }
-                let matches = self.pinnedIdentifiersSnapshot().filter {
-                    Self.canonicalURI(self.uri(for: NSFileProviderItemIdentifier($0))) == uri
-                }
-                for raw in matches { self.setPinned(false, for: NSFileProviderItemIdentifier(raw)) }
-                self.recordPendingItemUpdates(uris: [uri])
-                // Acknowledge only after the persisted selection is updated.
-                if let saved = try? Data(contentsOf: self.pinnedFileURL),
-                    let pins = try? JSONDecoder().decode([String].self, from: saved),
-                    Set(pins).isDisjoint(with: matches) {
-                    try? FileManager.default.removeItem(at: url)
+    func applyPinRequests() {
+        // Enumeration must not wait on actions that await Finder enumeration.
+        pinRequestLock.lock()
+        defer { pinRequestLock.unlock() }
+        struct Request: Decodable { let drive_id: String; let uri: String }
+        let directory = pinRequestDirectoryOverride ?? DriveStore.drivesURL.deletingLastPathComponent()
+            .appendingPathComponent("pin-requests")
+        let urls: [URL]
+        do {
+            urls = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)
+        } catch {
+            if (error as NSError).code != NSFileReadNoSuchFileError {
+                logger.error("could not read pin requests: \(error.localizedDescription, privacy: .public)")
+            }
+            return
+        }
+        for url in urls where url.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: url),
+                let request = try? JSONDecoder().decode(Request.self, from: data),
+                request.drive_id == self.drive.id else { continue }
+            let uri = Self.canonicalURI(request.uri)
+            let root = Self.canonicalURI(self.rootPath).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard uri == root || uri.hasPrefix(root + "/") else { continue }
+            let matches = self.pinnedIdentifiersSnapshot().filter {
+                Self.canonicalURI(self.uri(for: NSFileProviderItemIdentifier($0))) == uri
+            }
+            for raw in matches { self.setPinned(false, for: NSFileProviderItemIdentifier(raw)) }
+            self.recordPendingItemUpdates(uris: [uri])
+            // Acknowledge only after the persisted selection is updated.
+            if let saved = try? Data(contentsOf: self.pinnedFileURL),
+                let pins = try? JSONDecoder().decode([String].self, from: saved),
+                Set(pins).isDisjoint(with: matches) {
+                do {
+                    try FileManager.default.removeItem(at: url)
+                    logger.notice("applied pin removal for \(uri, privacy: .public)")
+                } catch {
+                    logger.error("could not acknowledge pin removal: \(error.localizedDescription, privacy: .public)")
                 }
             }
         }

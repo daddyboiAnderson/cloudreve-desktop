@@ -96,22 +96,30 @@ export default function Popup() {
         driveId: selectedDrive,
       });
       setSummary(result);
-      if (isMacOS) {
-        try {
-          const issues = await invoke<FileProviderIssue[]>("list_file_provider_issues", {
-            driveId: selectedDrive,
-          });
-          setFileProviderIssues(issues);
-        } catch (error) {
-          console.error("Failed to fetch Finder issues:", error);
-        }
-      }
     } catch (error) {
       console.error("Failed to fetch status summary:", error);
     } finally {
       isFetchingRef.current = false;
       setLoading(false);
     }
+  }, [selectedDrive]);
+
+  useEffect(() => {
+    if (!isMacOS) return;
+    let cancelled = false;
+    let fetching = false;
+    const refreshIssues = async () => {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const issues = await invoke<FileProviderIssue[]>("list_file_provider_issues", { driveId: selectedDrive });
+        if (!cancelled) setFileProviderIssues(issues);
+      } catch (error) { console.error("Failed to fetch Finder issues:", error); }
+      finally { fetching = false; }
+    };
+    void refreshIssues();
+    const timer = setInterval(() => void refreshIssues(), 2000);
+    return () => { cancelled = true; clearInterval(timer); };
   }, [isMacOS, selectedDrive]);
 
   // Initial fetch and polling
@@ -120,7 +128,7 @@ export default function Popup() {
 
     const intervalId = setInterval(() => {
       fetchSummary();
-    }, 1000);
+    }, 500);
 
     return () => {
       clearInterval(intervalId);

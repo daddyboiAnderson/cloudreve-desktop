@@ -28,7 +28,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         if containerIdentifier == .workingSet {
             Task {
                 do {
-                    await store.applyPinRequests()
+                    store.applyPinRequests()
                     let items = try await store.workingSetItems()
                     observer.didEnumerate(items)
                     observer.finishEnumerating(upTo: nil)
@@ -62,7 +62,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
         Task {
             do {
-                await store.applyPinRequests()
+                store.applyPinRequests()
                 _ = consumePresentedContainerRefresh()
                 let (items, nextPage) = try await store.children(
                     of: containerIdentifier, page: pageToken)
@@ -92,7 +92,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         )
         Task {
             do {
-                await store.applyPinRequests()
+                store.applyPinRequests()
                 if containerIdentifier != .workingSet,
                     containerIdentifier != .trashContainer,
                     consumePresentedContainerRefresh()

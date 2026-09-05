@@ -205,6 +205,10 @@ final class FileProviderActivity {
     func update(processedBytes: Int64, totalBytes: Int64) {
         let measurementTime = Date()
         stateLock.lock()
+        guard record.status == "running" else {
+            stateLock.unlock()
+            return
+        }
         record.processedBytes = processedBytes
         record.totalBytes = max(totalBytes, 0)
         record.updatedAt = Int64(measurementTime.timeIntervalSince1970)
@@ -228,13 +232,12 @@ final class FileProviderActivity {
         let snapshot = record
         if shouldPersist { lastPersistedAt = measurementTime }
         stateLock.unlock()
-
         if shouldPersist { FileProviderActivityStore.upsert(snapshot) }
     }
 
     func complete() {
         let snapshot = finish(status: "completed", error: nil)
-        if snapshot.operation == "upload" {
+        if snapshot.operation == "upload" && snapshot.status == "completed" {
             FileProviderUploadReceiptStore.save(
                 id: snapshot.id,
                 driveID: snapshot.driveID,
@@ -252,6 +255,11 @@ final class FileProviderActivity {
 
     private func finish(status: String, error: String?) -> FileProviderActivityRecord {
         stateLock.lock()
+        guard record.status == "running" else {
+            let snapshot = record
+            stateLock.unlock()
+            return snapshot
+        }
         record.status = status
         if status == "completed", record.totalBytes > 0 {
             record.processedBytes = record.totalBytes

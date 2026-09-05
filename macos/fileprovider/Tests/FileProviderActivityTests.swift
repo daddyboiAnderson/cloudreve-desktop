@@ -31,6 +31,12 @@ enum FileProviderActivityTests {
         precondition(records[0].status == "completed")
         precondition(records[0].processedBytes == 1_000)
 
+        activity.update(processedBytes: 500, totalBytes: 1_000)
+        activity.fail(CocoaError(.userCancelled))
+        records = FileProviderActivityStore.records(driveID: "drive-1")
+        precondition(records[0].status == "completed")
+        precondition(records[0].processedBytes == 1_000)
+
         _ = FileProviderActivity(
             driveID: "drive-1",
             operation: "download",

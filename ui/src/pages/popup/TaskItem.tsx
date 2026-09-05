@@ -279,7 +279,12 @@ export default function TaskItem({
               <LinearProgress
                 variant="determinate"
                 value={progress * 100}
-                sx={{ mt: 0.5, height: 4, borderRadius: 2 }}
+                sx={{ mt: 0.5, height: 4, borderRadius: 2,
+                  "& .MuiLinearProgress-bar": { transition: "transform 450ms linear" },
+                  "@media (prefers-reduced-motion: reduce)": {
+                    "& .MuiLinearProgress-bar": { transition: "none" },
+                  },
+                }}
               />
             )}
           </Box>
