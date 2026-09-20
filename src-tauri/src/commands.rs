@@ -1646,6 +1646,50 @@ pub fn show_upload_conflict_window_impl(app: &AppHandle, id: &str) {
 }
 
 /// Show or create the Share window for a Finder item.
+fn focus_share_window(window: &WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    {
+        let window = window.clone();
+        let app = window.app_handle().clone();
+        if let Err(error) = app.run_on_main_thread(move || {
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Ok(handle) = window.ns_window() else {
+                tracing::warn!(target: "share", "Share window has no native NSWindow");
+                return;
+            };
+            let native = unsafe { &*handle.cast::<NSWindow>() };
+            // A Finder extension can invoke Share while Finder or another app
+            // is active. Move the window to that Space and perform activation
+            // plus native ordering together on AppKit's main thread.
+            let behavior = native
+                .collectionBehavior()
+                .difference(NSWindowCollectionBehavior::CanJoinAllSpaces)
+                | NSWindowCollectionBehavior::MoveToActiveSpace;
+            native.setCollectionBehavior(behavior);
+            let _ = window.app_handle().show();
+            let _ = window.show();
+            let _ = window.unminimize();
+            native.makeKeyAndOrderFront(None);
+            crate::update_dock_visibility(window.app_handle());
+            #[allow(deprecated)]
+            ns_app(mtm).activateIgnoringOtherApps(true);
+            native.makeKeyAndOrderFront(None);
+            refresh_traffic_light_tracking(&window);
+        }) {
+            tracing::warn!(target: "share", error = %error, "Failed to focus the Share window");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Show or create the Share window for a Finder item.
 pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
     let target = ShareWindowTarget {
         drive_id: drive_id.to_string(),
@@ -1653,18 +1697,7 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
     };
 
     if let Some(window) = app.get_webview_window("share") {
-        #[cfg(target_os = "macos")]
-        let _ = app.show();
-        let _ = window.show();
-        let _ = window.unminimize();
-        #[cfg(target_os = "macos")]
-        {
-            crate::update_dock_visibility(app);
-            activate_app(app);
-        }
-        let _ = window.set_focus();
-        #[cfg(target_os = "macos")]
-        refresh_traffic_light_tracking(&window);
+        focus_share_window(&window);
         let _ = window.emit("share-target", &target);
         return;
     }
@@ -1710,17 +1743,7 @@ pub fn show_share_window_impl(app: &AppHandle, drive_id: &str, uri: &str) {
             update_dock_on_window_close(&window);
 
             move_window_safely(&window, Position::Center, "share");
-            #[cfg(target_os = "macos")]
-            let _ = app.show();
-            let _ = window.show();
-            #[cfg(target_os = "macos")]
-            {
-                crate::update_dock_visibility(app);
-                activate_app(app);
-            }
-            let _ = window.set_focus();
-            #[cfg(target_os = "macos")]
-            refresh_traffic_light_tracking(&window);
+            focus_share_window(&window);
         }
         Err(error) => {
             tracing::error!(target: "share", error = %error, "Failed to create Share window");
