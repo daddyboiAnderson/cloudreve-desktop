@@ -3,18 +3,20 @@ mod saved_items;
 #[cfg(windows)]
 mod windows_shell;
 use cloudreve_sync::{
-    ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard,
-    shellext::shell_service::ServiceHandle,
+    shellext::shell_service::ServiceHandle, ConfigManager, DriveManager, EventBroadcaster,
+    LogConfig, LogGuard,
 };
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
+#[cfg(not(target_os = "macos"))]
+use tauri::tray::TrayIcon;
 use tauri::{
-    AppHandle, Listener, Manager, RunEvent,
     async_runtime::spawn,
     menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Listener, Manager, RunEvent,
 };
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -358,14 +360,27 @@ fn build_tray_menu<R: tauri::Runtime>(manager: &impl Manager<R>) -> anyhow::Resu
 
 /// Rebuild the tray context menu using the current locale.
 pub fn rebuild_tray_menu<R: tauri::Runtime>(app: &AppHandle<R>) -> anyhow::Result<()> {
-    let menu = build_tray_menu(app)?;
-    let tray = app.state::<TrayIcon<R>>();
-    tray.set_menu(Some(menu))?;
-    Ok(())
+    // On macOS the native menu is created on demand for a secondary click.
+    // Keeping an NSMenu attached to NSStatusItem makes recent macOS releases
+    // open it for a primary click before tray-icon can dispatch the click.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let menu = build_tray_menu(app)?;
+        let tray = app.state::<TrayIcon<R>>();
+        tray.set_menu(Some(menu))?;
+        Ok(())
+    }
 }
 
 /// Setup the system tray icon
 fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "macos"))]
     let menu = build_tray_menu(app)?;
 
     #[cfg(target_os = "macos")]
@@ -374,10 +389,9 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     let tray_icon = app.default_window_icon().unwrap().clone();
 
     // Build tray icon
-    let tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .icon(tray_icon)
         .icon_as_template(cfg!(target_os = "macos"))
-        .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
@@ -402,7 +416,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
         .on_tray_icon_event(|tray, event| {
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
             if let TrayIconEvent::Click {
-                button: MouseButton::Left,
+                button,
                 button_state: MouseButtonState::Up,
                 position,
                 ..
@@ -410,12 +424,32 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             {
                 let app = tray.app_handle();
                 #[cfg(target_os = "macos")]
-                toggle_main_window_at_click(app, position);
+                match button {
+                    MouseButton::Left => toggle_main_window_at_click(app, position),
+                    MouseButton::Right => {
+                        // Do not attach this menu to NSStatusItem: macOS 27 can
+                        // otherwise consume primary clicks and bypass the popup.
+                        if let (Ok(menu), Some(window)) =
+                            (build_tray_menu(app), app.get_webview_window("main_popup"))
+                        {
+                            if let Err(error) = window.popup_menu(&menu) {
+                                tracing::warn!(target: "main", %error, "Failed to show tray menu");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 #[cfg(not(target_os = "macos"))]
-                show_main_window(app);
+                if button == MouseButton::Left {
+                    show_main_window(app);
+                }
             }
-        })
-        .build(app)?;
+        });
+
+    #[cfg(target_os = "macos")]
+    let tray = tray_builder.build(app)?;
+    #[cfg(not(target_os = "macos"))]
+    let tray = tray_builder.menu(&menu).build(app)?;
 
     // Keep the tray icon in Tauri's managed state so we can update its menu
     // when the language changes.

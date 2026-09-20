@@ -1202,7 +1202,7 @@ impl Mount {
                 }
             }
             SyncAction::PreserveUnavailableReceivedItem { path } => {
-                let placeholder =
+                let mut placeholder =
                     CrPlaceholder::new(path.clone(), sync_root.clone(), drive_id.clone());
                 if let Err(error) = placeholder.update_sync_error_state(true) {
                     tracing::warn!(

@@ -102,7 +102,7 @@ impl Mount {
         }
     }
 
-    async fn listen_remote_events(&self) -> ListenResult {
+    async fn listen_remote_events(self: &Arc<Self>) -> ListenResult {
         let (remote_base, sync_path) = {
             let config = self.config.read().await;
             (config.remote_path.clone(), config.sync_path.clone())
@@ -205,7 +205,7 @@ impl Mount {
 
     /// Refresh the File Provider after a remote event stream reconnects.
     #[cfg(target_os = "macos")]
-    async fn record_rescan_marker(&self) {
+    async fn record_rescan_marker(self: &Arc<Self>) {
         let (drive_id, drive_name) = {
             let config = self.config.read().await;
             (config.id.clone(), config.name.clone())
@@ -222,6 +222,10 @@ impl Mount {
             &drive_name,
             &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
         );
+        // The working-set refresh repairs visible folders immediately. The
+        // background audit then compares the complete remote metadata tree
+        // against SQLite, so a missed event heals without an app restart.
+        self.schedule_fileprovider_recovery().await;
     }
 
     async fn handle_file_events(

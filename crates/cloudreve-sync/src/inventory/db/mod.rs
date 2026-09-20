@@ -1,8 +1,12 @@
 mod drive_props;
 mod file_metadata;
+#[cfg(target_os = "macos")]
+mod fileprovider_remote_items;
 mod tasks;
 mod upload_sessions;
 
+#[cfg(target_os = "macos")]
+pub use fileprovider_remote_items::{FileProviderRemoteItem, NewFileProviderRemoteItem};
 pub use tasks::RecentTasks;
 
 use anyhow::{Context, Result, anyhow};

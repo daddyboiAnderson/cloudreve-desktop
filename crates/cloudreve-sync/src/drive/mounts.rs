@@ -195,6 +195,8 @@ pub struct Mount {
     #[cfg(any(target_os = "macos", windows))]
     share_poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(target_os = "macos")]
+    pub(crate) fileprovider_audit_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     initial_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     manager_command_tx: mpsc::UnboundedSender<ManagerCommand>,
     fs_watcher: Mutex<Option<FsWatcher>>,
@@ -320,6 +322,8 @@ impl Mount {
             #[cfg(any(target_os = "macos", windows))]
             share_poll_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(target_os = "macos")]
+            fileprovider_audit_handle: Arc::new(tokio::sync::Mutex::new(None)),
             initial_sync_handle: Arc::new(tokio::sync::Mutex::new(None)),
             cr_client: cr_client_arc,
             inventory,
@@ -810,6 +814,13 @@ impl Mount {
         // Stop the remote event listener
         if let Some(handle) = self.remote_event_handle.lock().await.take() {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping remote event listener");
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Some(handle) = self.fileprovider_audit_handle.lock().await.take() {
+            tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping File Provider recovery audit");
             handle.abort();
             let _ = handle.await;
         }

@@ -81,7 +81,11 @@ final class RemoteStore {
     private var presentedContainerSequence: UInt64 = 0
     private var remoteDeleteGenerationByURI: [String: UInt64] = [:]
     private var pendingStabilizationDeletes: Set<String> = []
-    private static let presentedContainerLimit = 8
+    // Reconnect reconciliation only walks containers Finder has presented.
+    // Eight entries is too small for normal use and lets quiet folders fall
+    // out of recovery coverage, so missed SSE creates can remain invisible.
+    // Keep this bounded to avoid turning a reconnect into a full-drive crawl.
+    private static let presentedContainerLimit = 128
     private let cacheLock = NSLock()
     private let pinRequestLock = NSLock()
     private let stateDirectoryOverride: URL?

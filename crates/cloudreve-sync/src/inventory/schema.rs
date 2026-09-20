@@ -20,6 +20,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    fileprovider_remote_items (drive_id, remote_id) {
+        drive_id -> Text,
+        remote_id -> Text,
+        uri -> Text,
+        parent_uri -> Text,
+        is_folder -> Bool,
+        version -> Text,
+        seen_generation -> BigInt,
+    }
+}
+
+diesel::table! {
     task_queue (id) {
         id -> Text,
         drive_id -> Text,

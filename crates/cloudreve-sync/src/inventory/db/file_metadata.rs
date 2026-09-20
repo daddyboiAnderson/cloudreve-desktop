@@ -6,6 +6,8 @@ use diesel::sql_types::Text;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use crate::inventory::schema::fileprovider_remote_items;
 use crate::inventory::schema::{
     drive_props,
     file_metadata::{self, dsl as file_metadata_dsl},
@@ -57,6 +59,12 @@ impl InventoryDb {
                     .execute(tx_conn)?;
                 diesel::delete(drive_props::table.filter(drive_props::drive_id.eq(drive)))
                     .execute(tx_conn)?;
+                #[cfg(target_os = "macos")]
+                diesel::delete(
+                    fileprovider_remote_items::table
+                        .filter(fileprovider_remote_items::drive_id.eq(drive)),
+                )
+                .execute(tx_conn)?;
                 diesel::delete(
                     file_metadata_dsl::file_metadata.filter(file_metadata_dsl::drive_id.eq(drive)),
                 )
@@ -181,6 +189,14 @@ impl InventoryDb {
                 .distinct()
                 .load::<String>(&mut conn)
                 .context("Failed to list drive property IDs")?,
+        );
+        #[cfg(target_os = "macos")]
+        ids.extend(
+            fileprovider_remote_items::table
+                .select(fileprovider_remote_items::drive_id)
+                .distinct()
+                .load::<String>(&mut conn)
+                .context("Failed to list File Provider recovery drive IDs")?,
         );
 
         let mut ids = ids.into_iter().collect::<Vec<_>>();
