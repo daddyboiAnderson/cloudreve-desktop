@@ -116,6 +116,11 @@ final class RemoteStore {
             .appendingPathComponent("fp-events/\(drive.id).jsonl")
     }
 
+    /// Keep each File Provider callback short.  macOS immediately requests
+    /// the next page when `moreComing` is true, so a large recovery delta
+    /// cannot monopolize the extension or delay newer changes.
+    private static let changePageSize = 100
+
     init(drive: DriveConfig, domain: NSFileProviderDomain,
          stateDirectory: URL? = nil, pinRequestDirectory: URL? = nil) {
         self.stateDirectoryOverride = stateDirectory
@@ -1265,7 +1270,7 @@ final class RemoteStore {
 
     /// Return events after an anchor, or expire an unknown anchor.
     func changes(since anchorData: Data, for container: NSFileProviderItemIdentifier)
-        throws -> ([FpEvent], NSFileProviderSyncAnchor)
+        throws -> ([FpEvent], NSFileProviderSyncAnchor, Bool)
     {
         guard let text = String(data: anchorData, encoding: .utf8),
             text.hasPrefix("evt-"), let since = Int64(text.dropFirst(4))
@@ -1279,11 +1284,17 @@ final class RemoteStore {
         }
         let relevant = events.filter { $0.ts > since }
         let filtered = relevant.filter { changeTouchesContainer($0, container: container) }
-        let newAnchor = NSFileProviderSyncAnchor(Data("evt-\(events.last?.ts ?? since)".utf8))
+        let page = Array(filtered.prefix(Self.changePageSize))
+        let moreComing = filtered.count > page.count
+        // If this container has no more applicable events, it may safely
+        // advance past unrelated records. Otherwise stop at the last event in
+        // this page so the next callback continues without losing anything.
+        let nextTimestamp = moreComing ? (page.last?.ts ?? since) : (events.last?.ts ?? since)
+        let newAnchor = NSFileProviderSyncAnchor(Data("evt-\(nextTimestamp)".utf8))
         logger.notice(
-            "changes for \(container.rawValue, privacy: .public): anchor \(since), relevant \(relevant.count), delivered \(filtered.count), next \(events.last?.ts ?? since)"
+            "changes for \(container.rawValue, privacy: .public): anchor \(since), relevant \(relevant.count), delivered \(page.count), next \(nextTimestamp), moreComing \(moreComing)"
         )
-        return (filtered, newAnchor)
+        return (page, newAnchor, moreComing)
     }
 
     /// Convert an event path to a canonical URI.
@@ -1310,32 +1321,13 @@ final class RemoteStore {
             return Self.canonicalURI(parent)
         }
 
-        if container == .workingSet {
-            // The working-set enumerator is signalled for every remote event,
-            // but it must not turn a recovery audit into a full-drive sync.
-            // Deliver root children, changes in folders Finder has actually
-            // presented, and items whose stable identity is already known.
-            let fromParent = parentOf(fromURI)
-            let toParent = toURI.map { parentOf($0) }
-            if fromParent == rootPath || toParent == rootPath { return true }
-
-            let presented = Set(
-                presentedContainersSnapshot().map {
-                    $0 == .rootContainer
-                        ? rootPath : Self.canonicalURI(uri(for: $0))
-                })
-            if presented.contains(fromParent)
-                || (toParent.map { presented.contains($0) } == true)
-            {
-                return true
-            }
-
-            cacheLock.lock()
-            let known = identifierByURI[fromURI] != nil
-                || (toURI.map { identifierByURI[$0] != nil } == true)
-            cacheLock.unlock()
-            return known
-        }
+        // The working set is the domain-wide incremental feed. Every change
+        // must pass through it, including a new hierarchy below a folder that
+        // has never been opened. Items remain placeholders; this updates
+        // metadata only and does not download file contents. The persistent
+        // audit establishes its first snapshot without emitting events, and
+        // paging above bounds later recovery bursts.
+        if container == .workingSet { return true }
 
         let containerURI = container == .rootContainer
             ? rootPath : Self.canonicalURI(uri(for: container))

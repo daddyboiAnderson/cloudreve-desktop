@@ -113,8 +113,9 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 }
                 let changes: [RemoteStore.FpEvent]
                 let newAnchor: NSFileProviderSyncAnchor
+                let moreComing: Bool
                 do {
-                    (changes, newAnchor) = try store.changes(
+                    (changes, newAnchor, moreComing) = try store.changes(
                         since: anchor.rawValue, for: containerIdentifier)
                 } catch let error as NSFileProviderError
                     where error.code == .syncAnchorExpired
@@ -193,7 +194,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                         }
                     }
                 }
-                observer.finishEnumeratingChanges(upTo: newAnchor, moreComing: false)
+                observer.finishEnumeratingChanges(upTo: newAnchor, moreComing: moreComing)
                 if !downloadedContentUpdates.isEmpty {
                     await store.refreshDownloadedContent(downloadedContentUpdates)
                 }
