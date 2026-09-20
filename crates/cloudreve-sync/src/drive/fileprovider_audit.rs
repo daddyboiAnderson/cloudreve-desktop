@@ -78,6 +78,13 @@ impl Mount {
             .into_iter()
             .map(|item| (item.remote_id.clone(), item))
             .collect::<HashMap<_, _>>();
+        // An empty inventory means this is the first audit after installing a
+        // version with persistent recovery state.  The remote tree is a
+        // baseline, not thousands of newly-created Finder items.  Visible
+        // folders are reconciled separately when the SSE stream reconnects;
+        // subsequent audits can then emit precise deltas against this
+        // snapshot.
+        let establishing_baseline = previous.is_empty();
 
         tracing::info!(target: "fileprovider_audit", id=%drive_id, known=previous.len(), "Starting metadata-only File Provider recovery audit");
         let mut queue = VecDeque::from([root_uri]);
@@ -109,7 +116,7 @@ impl Mount {
                         Some(old) if old.version != item_version => Some(FileEventType::Modify),
                         _ => None,
                     };
-                    if let Some(event_type) = event_type {
+                    if !establishing_baseline && let Some(event_type) = event_type {
                         events.push(FileEventData {
                             event_type,
                             file_id: file.id.clone(),
@@ -150,13 +157,15 @@ impl Mount {
         let missing = self
             .inventory
             .finish_fileprovider_remote_generation(&drive_id, generation)?;
-        for item in collapse_missing_items(missing) {
-            events.push(FileEventData {
-                event_type: FileEventType::Delete,
-                file_id: item.remote_id,
-                from: canonical_uri(&item.uri),
-                to: String::new(),
-            });
+        if !establishing_baseline {
+            for item in collapse_missing_items(missing) {
+                events.push(FileEventData {
+                    event_type: FileEventType::Delete,
+                    file_id: item.remote_id,
+                    from: canonical_uri(&item.uri),
+                    to: String::new(),
+                });
+            }
         }
         flush_events(&drive_id, &drive_name, &mut events)?;
         tracing::info!(target: "fileprovider_audit", id=%drive_id, seen, "Metadata-only File Provider recovery audit completed");

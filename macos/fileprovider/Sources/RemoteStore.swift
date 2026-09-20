@@ -1299,11 +1299,6 @@ final class RemoteStore {
     ) -> Bool {
         let fromURI = uri(forEventPath: change.from)
         let toURI = change.to.map { uri(forEventPath: $0) }
-        if container == .workingSet { return true }
-
-        let containerURI = container == .rootContainer
-            ? rootPath : Self.canonicalURI(uri(for: container))
-        if fromURI == containerURI || toURI == containerURI { return true }
         let parentOf = { (uri: String) -> String in
             var u = uri
             if u.hasSuffix("/") { u.removeLast() }
@@ -1314,6 +1309,37 @@ final class RemoteStore {
             }
             return Self.canonicalURI(parent)
         }
+
+        if container == .workingSet {
+            // The working-set enumerator is signalled for every remote event,
+            // but it must not turn a recovery audit into a full-drive sync.
+            // Deliver root children, changes in folders Finder has actually
+            // presented, and items whose stable identity is already known.
+            let fromParent = parentOf(fromURI)
+            let toParent = toURI.map { parentOf($0) }
+            if fromParent == rootPath || toParent == rootPath { return true }
+
+            let presented = Set(
+                presentedContainersSnapshot().map {
+                    $0 == .rootContainer
+                        ? rootPath : Self.canonicalURI(uri(for: $0))
+                })
+            if presented.contains(fromParent)
+                || (toParent.map { presented.contains($0) } == true)
+            {
+                return true
+            }
+
+            cacheLock.lock()
+            let known = identifierByURI[fromURI] != nil
+                || (toURI.map { identifierByURI[$0] != nil } == true)
+            cacheLock.unlock()
+            return known
+        }
+
+        let containerURI = container == .rootContainer
+            ? rootPath : Self.canonicalURI(uri(for: container))
+        if fromURI == containerURI || toURI == containerURI { return true }
         return parentOf(fromURI) == containerURI || (toURI.map { parentOf($0) } == containerURI)
     }
 
