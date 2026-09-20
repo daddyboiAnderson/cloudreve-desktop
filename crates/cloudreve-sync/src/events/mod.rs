@@ -10,21 +10,26 @@ pub enum Event {
     ConnectionStatusChanged {
         connected: bool,
     },
-    NoDrive {
-    },
+    NoDrive {},
     /// Request to open the sync status window
     OpenSyncStatusWindow,
     /// Request to open the settings window
     OpenSettingsWindow,
+    /// Request to open Share Options for an item selected in the native shell.
+    OpenShareWindow {
+        drive_id: String,
+        uri: String,
+    },
 }
 
 impl Event {
     pub fn name(&self) -> &'static str {
         match self {
             Event::ConnectionStatusChanged { .. } => "ConnectionStatusChanged",
-            Event::NoDrive {  } => "NoDrive",
+            Event::NoDrive {} => "NoDrive",
             Event::OpenSyncStatusWindow => "OpenSyncStatusWindow",
             Event::OpenSettingsWindow => "OpenSettingsWindow",
+            Event::OpenShareWindow { .. } => "OpenShareWindow",
         }
     }
 }
@@ -75,7 +80,7 @@ impl EventBroadcaster {
 
     /// Helper: Broadcast no drive event
     pub fn no_drive(&self) {
-        self.broadcast(Event::NoDrive {  });
+        self.broadcast(Event::NoDrive {});
     }
 
     /// Helper: Broadcast connection status changed event
@@ -91,6 +96,10 @@ impl EventBroadcaster {
     /// Helper: Broadcast open settings window event
     pub fn open_settings_window(&self) {
         self.broadcast(Event::OpenSettingsWindow);
+    }
+
+    pub fn open_share_window(&self, drive_id: String, uri: String) {
+        self.broadcast(Event::OpenShareWindow { drive_id, uri });
     }
 
     /// Get the number of active subscribers

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     cfapi::placeholder::LocalFileInfo,
+    drive::share_shortcuts::inventory_fields,
     inventory::{FileMetadata, InventoryDb, MetadataEntry},
 };
 
@@ -158,6 +159,7 @@ impl CrPlaceholder {
     /// prepares the metadata that `commit` will apply using non-Windows full-sync
     /// behavior.
     pub fn with_remote_file(mut self, file_info: &FileResponse) -> Self {
+        let (metadata, props) = inventory_fields(file_info);
         let created_at = DateTime::parse_from_rfc3339(&file_info.created_at)
             .ok()
             .map(|dt| dt.timestamp())
@@ -187,8 +189,8 @@ impl CrPlaceholder {
                 .unwrap_or(&String::new())
                 .clone(),
             shared: file_info.shared.unwrap_or(false),
-            metadata: file_info.metadata.clone().unwrap_or_default(),
-            props: None,
+            metadata,
+            props,
             conflict_state: None,
             local_updated_at: None,
             local_size: None,

@@ -7,6 +7,7 @@ use crate::{
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
+        share_shortcuts::{inventory_content_uri, inventory_fields, list_presented_children},
         utils::{local_path_to_cr_uri, remote_path_to_local_relative_path},
     },
     inventory::{ConflictState, FileMetadata, MetadataEntry},
@@ -16,7 +17,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use cloudreve_api::{
     ApiError,
-    api::explorer::ExplorerApiExt,
     error::ErrorCode,
     models::{
         explorer::{FileResponse, file_type, metadata},
@@ -98,7 +98,8 @@ pub fn cloud_file_to_metadata_entry(
     let created_at = file.created_at.parse::<DateTime<Utc>>()?.timestamp();
     let last_modified = file.updated_at.parse::<DateTime<Utc>>()?.timestamp();
 
-    Ok(MetadataEntry::new(
+    let (metadata, props) = inventory_fields(file);
+    let mut entry = MetadataEntry::new(
         drive_id.clone(),
         local_path_str.unwrap(),
         file.file_type == file_type::FOLDER,
@@ -114,7 +115,11 @@ pub fn cloud_file_to_metadata_entry(
             .unwrap_or(&String::new())
             .clone(),
     )
-    .with_metadata(file.metadata.as_ref().unwrap_or(&HashMap::new()).clone()))
+    .with_metadata(metadata);
+    if let Some(props) = props {
+        entry = entry.with_props(props);
+    }
+    Ok(entry)
 }
 
 fn cloud_file_to_metadata_entry_at_path(
@@ -129,6 +134,7 @@ fn cloud_file_to_metadata_entry_at_path(
     let created_at = file.created_at.parse::<DateTime<Utc>>()?.timestamp();
     let last_modified = file.updated_at.parse::<DateTime<Utc>>()?.timestamp();
 
+    let (metadata, props) = inventory_fields(file);
     let mut entry = MetadataEntry::new(
         drive_id.clone(),
         local_path_str,
@@ -145,7 +151,10 @@ fn cloud_file_to_metadata_entry_at_path(
             .unwrap_or(&String::new())
             .clone(),
     )
-    .with_metadata(file.metadata.as_ref().unwrap_or(&HashMap::new()).clone());
+    .with_metadata(metadata);
+    if let Some(props) = props {
+        entry = entry.with_props(props);
+    }
     entry.conflict_state = conflict_state;
     Ok(entry)
 }
@@ -265,6 +274,9 @@ enum SyncAction {
     RenameLocalWithConflict {
         original: PathBuf,
         renamed: PathBuf,
+    },
+    PreserveUnavailableReceivedItem {
+        path: PathBuf,
     },
 }
 
@@ -445,8 +457,7 @@ fn system_time_to_unix_millis(time: SystemTime) -> Option<i64> {
 /// snapshots were introduced return `false` so the caller falls back to the
 /// CFAPI IN_SYNC flag.
 pub(crate) fn local_snapshot_differs(entry: &FileMetadata, local: &LocalFileInfo) -> bool {
-    let (Some(snapshot_mtime), Some(snapshot_size)) =
-        (entry.local_updated_at, entry.local_size)
+    let (Some(snapshot_mtime), Some(snapshot_size)) = (entry.local_updated_at, entry.local_size)
     else {
         return false;
     };
@@ -532,6 +543,14 @@ fn remote_change(remote: &FileResponse, inventory: Option<&FileMetadata>) -> Rem
     let Some(entry) = inventory else {
         return RemoteChange::Newer;
     };
+
+    // Share creation/removal does not change the content etag and Cloudreve
+    // does not emit a file event for it. Treat the server's sharing bit as
+    // independently mutable metadata so a share-poll reconciliation updates
+    // the inventory and the Explorer custom-state icon.
+    if remote.shared.unwrap_or(false) != entry.shared {
+        return RemoteChange::Newer;
+    }
 
     let remote_etag = remote.primary_entity.as_deref().unwrap_or("");
     if remote_etag != entry.etag {
@@ -1115,6 +1134,11 @@ impl Mount {
                     "Deleting local file/folder and inventory entry"
                 );
 
+                if let Err(err) = self.prepare_local_placeholder_deletion(path) {
+                    aggregate_error.push(path.clone(), err);
+                    return;
+                }
+
                 let cr_placeholder =
                     CrPlaceholder::new(path.clone(), sync_root.clone(), drive_id.clone());
                 if let Err(err) = cr_placeholder.delete_placeholder(self.inventory.clone()) {
@@ -1127,8 +1151,6 @@ impl Mount {
                     );
                     aggregate_error.push(path.clone(), anyhow::Error::from(err));
                 };
-                self.event_blocker
-                    .register_once(&EventKind::Remove(RemoveKind::Any), path.clone());
             }
             SyncAction::CreateRemoteFolderIfExist { path } => {
                 if !path.exists() {
@@ -1178,6 +1200,25 @@ impl Mount {
                     );
                     aggregate_error.push(original.clone(), anyhow::Error::from(err));
                 }
+            }
+            SyncAction::PreserveUnavailableReceivedItem { path } => {
+                let placeholder =
+                    CrPlaceholder::new(path.clone(), sync_root.clone(), drive_id.clone());
+                if let Err(error) = placeholder.update_sync_error_state(true) {
+                    tracing::warn!(
+                        target: "drive::sync",
+                        id = %self.id,
+                        path = %path.display(),
+                        error = %error,
+                        "Could not mark unavailable received item with a sync error"
+                    );
+                }
+                aggregate_error.push(
+                    path.clone(),
+                    anyhow::anyhow!(
+                        "Received item is no longer available remotely; local content was preserved and was not uploaded"
+                    ),
+                );
             }
         }
     }
@@ -1232,49 +1273,32 @@ impl Mount {
         let mut remote_entries: HashMap<PathBuf, FileResponse> =
             HashMap::with_capacity(paths.len());
         let mut remaining: HashSet<String> = target_remote_paths.keys().cloned().collect();
-        let mut previous_response = None;
-
-        while !remaining.is_empty() {
-            let response = match self
-                .cr_client
-                .list_files_all(
-                    previous_response.as_ref(),
-                    parent_uri_str.as_str(),
-                    REMOTE_PAGE_SIZE,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(ApiError::ApiError { code, .. })
-                    if code == ErrorCode::ParentNotExist as i32 =>
-                {
-                    tracing::debug!(
-                        target: "drive::sync",
-                        id = %self.id,
-                        parent = %parent.display(),
-                        "Remote parent directory missing during fetch"
-                    );
-                    return Ok(HashMap::new());
-                }
-                Err(err) => {
-                    return Err(err.into());
-                }
-            };
-
-            for file in &response.res.files {
-                if let Some(local_path) = target_remote_paths.get(&file.path) {
-                    if remote_entries.contains_key(local_path) {
-                        continue;
-                    }
-                    remote_entries.insert(local_path.clone(), file.clone());
-                    remaining.remove(&file.path);
-                }
+        let files = match list_presented_children(
+            self.cr_client.as_ref(),
+            parent_uri_str.as_str(),
+            REMOTE_PAGE_SIZE,
+        )
+        .await
+        {
+            Ok(files) => files,
+            Err(error) if is_parent_not_exist_error(&error) => {
+                tracing::debug!(
+                    target: "drive::sync",
+                    id = %self.id,
+                    parent = %parent.display(),
+                    "Remote parent directory missing during fetch"
+                );
+                return Ok(HashMap::new());
             }
+            Err(error) => return Err(error),
+        };
 
-            let has_more = response.more && !remaining.is_empty();
-            previous_response = Some(response);
-
-            if !has_more {
+        for file in files {
+            if let Some(local_path) = target_remote_paths.get(&file.path) {
+                remote_entries.insert(local_path.clone(), file.clone());
+                remaining.remove(&file.path);
+            }
+            if remaining.is_empty() {
                 break;
             }
         }
@@ -1600,6 +1624,21 @@ impl Mount {
             return;
         }
 
+        if let Some(inventory) = inventory
+            && is_received_item(inventory)
+        {
+            if should_preserve_unavailable_received_item(local, inventory) {
+                plan.actions
+                    .push(SyncAction::PreserveUnavailableReceivedItem { path: path.clone() });
+            } else {
+                plan.actions.push(SyncAction::DeleteLocalAndInventory {
+                    path: path.clone(),
+                    skip_if_not_empty: false,
+                });
+            }
+            return;
+        }
+
         if local.is_directory {
             let hydrated = local.is_folder_populated();
             if !hydrated {
@@ -1653,7 +1692,8 @@ impl Mount {
         let local_changed = local_has_changes(local, inventory);
         let remote_state = remote_change(remote, inventory);
 
-        let base_fingerprint = inventory.and_then(|entry| metadata_hash_fingerprint(&entry.metadata));
+        let base_fingerprint =
+            inventory.and_then(|entry| metadata_hash_fingerprint(&entry.metadata));
         let remote_fingerprint = remote_file_hash_fingerprint(remote);
 
         // ----- Local unchanged -----
@@ -1996,78 +2036,88 @@ impl Mount {
             }
         };
 
-        let mut previous_response = None;
         let mut children = Vec::new();
         let mut remote_files: HashMap<PathBuf, FileResponse> = HashMap::new();
+        let files = match list_presented_children(
+            self.cr_client.as_ref(),
+            remote_dir_uri_str.as_str(),
+            REMOTE_PAGE_SIZE,
+        )
+        .await
+        {
+            Ok(files) => files,
+            Err(error) if is_parent_not_exist_error(&error) => {
+                tracing::debug!(
+                    target: "drive::sync",
+                    id = %self.id,
+                    directory = %directory.display(),
+                    "Remote directory missing during walk"
+                );
+                return Ok((Vec::new(), HashMap::new()));
+            }
+            Err(error) => return Err(error),
+        };
 
-        loop {
-            let response = match self
-                .cr_client
-                .list_files_all(
-                    previous_response.as_ref(),
-                    remote_dir_uri_str.as_str(),
-                    REMOTE_PAGE_SIZE,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(ApiError::ApiError { code, .. })
-                    if code == ErrorCode::ParentNotExist as i32 =>
-                {
-                    tracing::debug!(
-                        target: "drive::sync",
-                        id = %self.id,
-                        directory = %directory.display(),
-                        "Remote directory missing during walk"
-                    );
-                    return Ok((Vec::new(), HashMap::new()));
+        for file in files {
+            match CrUri::new(&file.path).and_then(|file_uri| {
+                remote_path_to_local_relative_path(&file_uri, &remote_base_uri)
+            }) {
+                Ok(relative) => {
+                    let mut local_path = sync_root.clone();
+                    local_path.push(relative);
+                    if local_path
+                        .parent()
+                        .map(|p| p == directory.as_path())
+                        .unwrap_or(false)
+                    {
+                        children.push(local_path.clone());
+                        remote_files.insert(local_path, file);
+                    }
                 }
                 Err(err) => {
-                    return Err(err.into());
-                }
-            };
-
-            for file in &response.res.files {
-                if is_symbolic_link(file) {
-                    continue;
-                }
-
-                match CrUri::new(&file.path).and_then(|file_uri| {
-                    remote_path_to_local_relative_path(&file_uri, &remote_base_uri)
-                }) {
-                    Ok(relative) => {
-                        let mut local_path = sync_root.clone();
-                        local_path.push(relative);
-                        if local_path
-                            .parent()
-                            .map(|p| p == directory.as_path())
-                            .unwrap_or(false)
-                        {
-                            children.push(local_path.clone());
-                            remote_files.insert(local_path, file.clone());
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "drive::sync",
-                            id = %self.id,
-                            remote_path = %file.path,
-                            error = %err,
-                            "Failed to map remote child to local path"
-                        );
-                    }
+                    tracing::warn!(
+                        target: "drive::sync",
+                        id = %self.id,
+                        remote_path = %file.path,
+                        error = %err,
+                        "Failed to map remote child to local path"
+                    );
                 }
             }
-
-            if !response.more {
-                break;
-            }
-
-            previous_response = Some(response);
         }
 
         Ok((children, remote_files))
     }
+}
+
+fn is_received_item(inventory: &FileMetadata) -> bool {
+    inventory
+        .metadata
+        .contains_key(cloudreve_api::models::explorer::metadata::SHARE_REDIRECT)
+        || inventory_content_uri(inventory).is_some()
+}
+
+fn should_preserve_unavailable_received_item(
+    local: &LocalFileInfo,
+    inventory: &FileMetadata,
+) -> bool {
+    if local.is_directory {
+        !local.is_placeholder() || local.is_folder_populated()
+    } else {
+        local_has_changes(local, Some(inventory))
+    }
+}
+
+fn is_parent_not_exist_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<ApiError>().is_some_and(|api_error| {
+            matches!(
+                api_error,
+                ApiError::ApiError { code, .. }
+                    if *code == ErrorCode::ParentNotExist as i32
+            )
+        })
+    })
 }
 
 #[cfg(test)]
@@ -2114,8 +2164,8 @@ mod tests {
         info.exists = true;
         info.is_directory = false;
         info.file_size = size;
-        info.last_modified = mtime_ms
-            .map(|ms| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64));
+        info.last_modified =
+            mtime_ms.map(|ms| SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64));
         info
     }
 
@@ -2123,14 +2173,36 @@ mod tests {
     fn remote_change_etag_match_is_unchanged_even_if_date_differs() {
         let entry = file_metadata("etag-a", 100);
         let remote = file_response(Some("etag-a"), "1970-01-01T00:01:41Z");
-        assert_eq!(remote_change(&remote, Some(&entry)), RemoteChange::Unchanged);
+        assert_eq!(
+            remote_change(&remote, Some(&entry)),
+            RemoteChange::Unchanged
+        );
+    }
+
+    #[test]
+    fn remote_change_detects_share_metadata_with_matching_etag() {
+        let entry = file_metadata("etag-a", 100);
+        let mut remote = file_response(Some("etag-a"), "1970-01-01T00:01:40Z");
+        remote.shared = Some(true);
+        assert_eq!(remote_change(&remote, Some(&entry)), RemoteChange::Newer);
+
+        let mut shared_entry = entry;
+        shared_entry.shared = true;
+        remote.shared = Some(false);
+        assert_eq!(
+            remote_change(&remote, Some(&shared_entry)),
+            RemoteChange::Newer
+        );
     }
 
     #[test]
     fn remote_change_unparseable_date_never_forces_change() {
         let entry = file_metadata("etag-a", 100);
         let remote = file_response(Some("etag-a"), "not-a-date");
-        assert_eq!(remote_change(&remote, Some(&entry)), RemoteChange::Unchanged);
+        assert_eq!(
+            remote_change(&remote, Some(&entry)),
+            RemoteChange::Unchanged
+        );
     }
 
     #[test]
@@ -2176,9 +2248,18 @@ mod tests {
             local_size: Some(10),
             ..file_metadata("etag", 1)
         };
-        assert!(!local_snapshot_differs(&entry, &local_info(Some(1000), Some(10))));
-        assert!(local_snapshot_differs(&entry, &local_info(Some(2000), Some(10))));
-        assert!(local_snapshot_differs(&entry, &local_info(Some(1000), Some(11))));
+        assert!(!local_snapshot_differs(
+            &entry,
+            &local_info(Some(1000), Some(10))
+        ));
+        assert!(local_snapshot_differs(
+            &entry,
+            &local_info(Some(2000), Some(10))
+        ));
+        assert!(local_snapshot_differs(
+            &entry,
+            &local_info(Some(1000), Some(11))
+        ));
     }
 
     #[test]
@@ -2188,7 +2269,10 @@ mod tests {
             local_size: None,
             ..file_metadata("etag", 1)
         };
-        assert!(!local_snapshot_differs(&entry, &local_info(Some(999), Some(9))));
+        assert!(!local_snapshot_differs(
+            &entry,
+            &local_info(Some(999), Some(9))
+        ));
     }
 
     #[test]
@@ -2200,9 +2284,59 @@ mod tests {
                 local_size: Some(10),
                 ..file_metadata("etag", 1)
             };
-            assert!(!local_has_changes(&local_info(Some(1000), Some(10)), Some(&entry)));
-            assert!(local_has_changes(&local_info(Some(2000), Some(10)), Some(&entry)));
+            assert!(!local_has_changes(
+                &local_info(Some(1000), Some(10)),
+                Some(&entry)
+            ));
+            assert!(local_has_changes(
+                &local_info(Some(2000), Some(10)),
+                Some(&entry)
+            ));
             assert!(local_has_changes(&local_info(Some(1000), Some(10)), None));
         }
+    }
+
+    #[test]
+    fn revoked_received_file_is_never_treated_as_a_new_upload() {
+        let mut entry = FileMetadata {
+            local_updated_at: Some(1000),
+            local_size: Some(10),
+            ..file_metadata("etag", 1)
+        };
+        entry.metadata.insert(
+            cloudreve_api::models::explorer::metadata::SHARE_REDIRECT.into(),
+            "cloudreve://share-id@share/file.txt".into(),
+        );
+        assert!(is_received_item(&entry));
+        assert!(should_preserve_unavailable_received_item(
+            &local_info(Some(2000), Some(10)),
+            &entry
+        ));
+    }
+
+    #[test]
+    fn clean_received_file_can_be_removed_after_revocation() {
+        let mut entry = FileMetadata {
+            local_updated_at: Some(1000),
+            local_size: Some(10),
+            ..file_metadata("etag", 1)
+        };
+        crate::drive::share_shortcuts::set_inventory_content_uri(
+            &mut entry,
+            "cloudreve://share-id@share/file.txt".into(),
+        )
+        .unwrap();
+        assert!(is_received_item(&entry));
+        #[cfg(not(windows))]
+        assert!(!should_preserve_unavailable_received_item(
+            &local_info(Some(1000), Some(10)),
+            &entry
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_remote_missing_file_keeps_normal_sync_semantics() {
+        let entry = file_metadata("etag", 1);
+        assert!(!is_received_item(&entry));
     }
 }

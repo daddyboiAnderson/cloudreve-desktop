@@ -4,9 +4,8 @@ use crate::utils::toast::send_conflict_toast;
 use crate::{
     drive::{
         placeholder::CrPlaceholder,
-        sync::{
-            calculate_file_hash, local_snapshot_differs, remote_file_hash_fingerprint,
-        },
+        share_shortcuts::{inventory_content_uri, present_at, resolve_uri},
+        sync::{calculate_file_hash, local_snapshot_differs, remote_file_hash_fingerprint},
         utils::local_path_to_cr_uri,
     },
     inventory::{ConflictState, FileMetadata, InventoryDb},
@@ -19,7 +18,10 @@ use cloudreve_api::{
     ApiError, Client,
     api::ExplorerApi,
     error::ErrorCode,
-    models::explorer::{CreateFileService, FileResponse, FileUpdateService, file_type},
+    models::{
+        explorer::{CreateFileService, FileResponse, FileUpdateService, file_type, metadata},
+        uri::CrUri,
+    },
 };
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
@@ -97,6 +99,50 @@ impl<'a> UploadTask<'a> {
         self
     }
 
+    fn visible_uri(&self) -> Result<String> {
+        Ok(local_path_to_cr_uri(
+            self.task.payload.local_path.clone(),
+            self.sync_path.clone(),
+            self.remote_base.clone(),
+        )
+        .context("failed to convert local path to cloudreve uri")?
+        .to_string())
+    }
+
+    async fn remote_uri(&self, follow_leaf: bool) -> Result<String> {
+        if follow_leaf
+            && let Some(uri) = self.inventory_meta.as_ref().and_then(inventory_content_uri)
+        {
+            return Ok(uri.to_string());
+        }
+        resolve_uri(self.cr_client.as_ref(), &self.visible_uri()?, follow_leaf).await
+    }
+
+    fn presented_response(&self, file: &FileResponse) -> Result<FileResponse> {
+        let mut presented = file.clone();
+        let visible_uri = self.visible_uri()?;
+        let has_presentation = self.inventory_meta.as_ref().is_some_and(|inventory| {
+            inventory_content_uri(inventory).is_some()
+                || inventory.metadata.contains_key(metadata::SHARE_REDIRECT)
+        });
+        if has_presentation
+            || CrUri::new(&visible_uri)?.to_string() != CrUri::new(&file.path)?.to_string()
+        {
+            if let Some(inventory) = &self.inventory_meta {
+                for key in [metadata::SHARE_REDIRECT, metadata::SHARE_OWNER] {
+                    if let Some(value) = inventory.metadata.get(key) {
+                        presented
+                            .metadata
+                            .get_or_insert_with(Default::default)
+                            .insert(key.into(), value.clone());
+                    }
+                }
+            }
+            present_at(&mut presented, visible_uri, file.path.clone());
+        }
+        Ok(presented)
+    }
+
     // Upload a local file/folder to cloud
     pub async fn execute(&mut self) -> Result<()> {
         // Get local file info
@@ -138,16 +184,15 @@ impl<'a> UploadTask<'a> {
         let snapshot_differs = self
             .local_file
             .as_ref()
-            .and_then(|file| self.inventory_meta.as_ref().map(|meta| (meta, &file.local_file_info)))
+            .and_then(|file| {
+                self.inventory_meta
+                    .as_ref()
+                    .map(|meta| (meta, &file.local_file_info))
+            })
             .map(|(meta, info)| local_snapshot_differs(meta, info))
             .unwrap_or(false);
 
-        if self
-            .local_file
-            .as_ref()
-            .unwrap()
-            .local_file_info
-            .in_sync()
+        if self.local_file.as_ref().unwrap().local_file_info.in_sync()
             && !is_directory
             && !snapshot_differs
         {
@@ -191,13 +236,7 @@ impl<'a> UploadTask<'a> {
     /// recorded) along with the remote metadata, `Ok(None)` if the contents differ,
     /// or `Err` if the check itself failed.
     async fn check_actual_conflict(&self) -> Result<Option<FileResponse>> {
-        let uri = local_path_to_cr_uri(
-            self.task.payload.local_path.clone(),
-            self.sync_path.clone(),
-            self.remote_base.clone(),
-        )
-        .context("failed to convert local path to cloudreve uri")?
-        .to_string();
+        let uri = self.remote_uri(true).await?;
 
         let remote = self
             .cr_client
@@ -291,7 +330,9 @@ impl<'a> UploadTask<'a> {
                             );
                             // Update local placeholder/inventory from remote to reflect
                             // the existing file and avoid leaving a stale conflict state.
-                            if let Err(sync_err) = self.sync_remote_metadata_after_match(&remote).await {
+                            if let Err(sync_err) =
+                                self.sync_remote_metadata_after_match(&remote).await
+                            {
                                 warn!(
                                     target: "tasks::upload",
                                     task_id = %self.task.task_id,
@@ -364,12 +405,8 @@ impl<'a> UploadTask<'a> {
     /// Pull remote metadata into the local placeholder/inventory after we have
     /// determined that the local file matches the existing remote file.
     async fn sync_remote_metadata_after_match(&mut self, remote: &FileResponse) -> Result<()> {
-        self.local_file = Some(
-            self.local_file
-                .take()
-                .unwrap()
-                .with_remote_file(remote),
-        );
+        let remote = self.presented_response(remote)?;
+        self.local_file = Some(self.local_file.take().unwrap().with_remote_file(&remote));
 
         self.local_file
             .as_mut()
@@ -394,13 +431,7 @@ impl<'a> UploadTask<'a> {
             "Clearing file content with update request"
         );
 
-        let uri = local_path_to_cr_uri(
-            self.task.payload.local_path.clone(),
-            self.sync_path.clone(),
-            self.remote_base.clone(),
-        )
-        .context("failed to convert local path to cloudreve uri")?
-        .to_string();
+        let uri = self.remote_uri(true).await?;
         let etag = self.inventory_meta.as_ref().unwrap().etag.clone();
         let res = self
             .cr_client
@@ -434,13 +465,7 @@ impl<'a> UploadTask<'a> {
         );
 
         // Get remote URI
-        let uri = local_path_to_cr_uri(
-            self.task.payload.local_path.clone(),
-            self.sync_path.clone(),
-            self.remote_base.clone(),
-        )
-        .context("failed to convert local path to cloudreve uri")?
-        .to_string();
+        let uri = self.remote_uri(!is_new_file).await?;
 
         // If conflict state is set to Override, omit previous_version to force upload without version check
         let previous_version = if let Some(meta) = &self.inventory_meta {
@@ -497,13 +522,7 @@ impl<'a> UploadTask<'a> {
     /// Finalize upload by updating local file placeholder
     async fn finalize_upload(&mut self) -> Result<()> {
         // Get file info from server to confirm upload
-        let uri = local_path_to_cr_uri(
-            self.task.payload.local_path.clone(),
-            self.sync_path.clone(),
-            self.remote_base.clone(),
-        )
-        .context("failed to convert local path to cloudreve uri")?
-        .to_string();
+        let uri = self.remote_uri(self.inventory_meta.is_some()).await?;
 
         let file_info = self
             .cr_client
@@ -529,13 +548,7 @@ impl<'a> UploadTask<'a> {
             "Creating empty file/folder"
         );
         let local_file = &self.local_file.as_ref().unwrap().local_file_info;
-        let uri = local_path_to_cr_uri(
-            self.task.payload.local_path.clone(),
-            self.sync_path.clone(),
-            self.remote_base.clone(),
-        )
-        .context("failed to convert local path to cloudreve uri")?
-        .to_string();
+        let uri = self.remote_uri(false).await?;
 
         debug!(target: "tasks::upload", task_id = %self.task.task_id, local_path = %self.task.payload.local_path_display(), uri = %uri, "Send test toast");
 
@@ -567,12 +580,14 @@ impl<'a> UploadTask<'a> {
             "File uploaded"
         );
 
+        let file = self.presented_response(file)?;
+
         self.local_file = Some(
             self.local_file
                 .take()
                 .unwrap()
                 .with_mark_no_children(file.file_type == file_type::FOLDER)
-                .with_remote_file(file),
+                .with_remote_file(&file),
         );
 
         self.local_file

@@ -4,18 +4,14 @@ use crate::{
         placeholder::{ConvertOptions, LocalFileInfo, OpenOptions, UpdateOptions},
         placeholder_file::PlaceholderFile,
     },
-    drive::utils::notify_shell_change,
+    drive::{share_shortcuts::inventory_fields, utils::notify_shell_change},
     inventory::{FileMetadata, InventoryDb, MetadataEntry},
 };
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use cloudreve_api::models::explorer::{FileResponse, file_type};
 use nt_time::FileTime;
-use std::{
-    ffi::OsString,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 use widestring::U16CString;
 use windows::{
@@ -25,11 +21,8 @@ use windows::{
         System::Variant::VT_UI4,
         UI::Shell::{
             IShellItem2,
-            PropertiesSystem::{
-                GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore,
-            },
-            SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR,
-            SHCreateItemFromParsingName,
+            PropertiesSystem::{GPS_EXTRINSICPROPERTIESONLY, GPS_READWRITE, IPropertyStore},
+            SHCNE_CREATE, SHCNE_DELETE, SHCNE_MKDIR, SHCreateItemFromParsingName,
         },
     },
     core::PCWSTR,
@@ -250,9 +243,9 @@ impl CrPlaceholder {
         notify_shell_change(
             &self.local_path,
             if file_meta.is_folder {
-                SHCNE_CREATE
-            } else {
                 SHCNE_MKDIR
+            } else {
+                SHCNE_CREATE
             },
         )
         .context("failed to notify shell change")?;
@@ -272,6 +265,7 @@ impl CrPlaceholder {
             .map(|dt| dt.timestamp())
             .unwrap_or_default();
 
+        let (metadata, props) = inventory_fields(file_info);
         self.file_meta = Some(FileMetadata {
             drive_id: self.drive_id,
             local_path: self.local_path.to_string_lossy().to_string(),
@@ -281,8 +275,8 @@ impl CrPlaceholder {
             size: file_info.size,
             etag: file_info.primary_entity.clone().unwrap_or_default(),
             id: 0,
-            metadata: file_info.metadata.clone().unwrap_or_default(),
-            props: None,
+            metadata,
+            props,
             permissions: file_info.permission.clone().unwrap_or_default(),
             shared: file_info.shared.unwrap_or(false),
             conflict_state: None,

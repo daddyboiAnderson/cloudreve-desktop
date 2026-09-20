@@ -133,7 +133,7 @@ export default function Settings() {
           {!isMacOS && (
             <IconButton
               size="small"
-              onClick={() => getCurrentWindow().close()}
+              onClick={() => getCurrentWindow().destroy()}
               sx={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" }}
             >
               <CloseIcon fontSize="small" />

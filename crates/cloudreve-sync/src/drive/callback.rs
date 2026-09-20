@@ -8,10 +8,12 @@ use crate::{
     },
     drive::{
         commands::MountCommand,
-        sync::{cloud_file_to_metadata_entry, cloud_file_to_placeholder, is_symbolic_link},
+        mounts::DeletedShareShortcutTombstones,
+        sync::{cloud_file_to_metadata_entry, cloud_file_to_placeholder},
     },
     inventory::{InventoryDb, MetadataEntry},
 };
+use cloudreve_api::models::explorer::metadata;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -20,18 +22,21 @@ pub struct CallbackHandler {
     command_tx: mpsc::UnboundedSender<MountCommand>,
     id: String,
     inventory: Arc<InventoryDb>,
+    deleted_share_shortcuts: DeletedShareShortcutTombstones,
 }
 
 impl CallbackHandler {
-    pub fn new(
+    pub(crate) fn new(
         command_tx: mpsc::UnboundedSender<MountCommand>,
         id: String,
         inventory: Arc<InventoryDb>,
+        deleted_share_shortcuts: DeletedShareShortcutTombstones,
     ) -> Self {
         Self {
             command_tx,
-            id: id,
-            inventory: inventory,
+            id,
+            inventory,
+            deleted_share_shortcuts,
         }
     }
 
@@ -69,9 +74,31 @@ impl SyncFilter for CallbackHandler {
         tracing::debug!(target: "drive::mounts", id = %self.id, path = %request.path().display(), "Deleted");
     }
 
-    fn delete(&self, request: Request, ticket: ticket::Delete, _info: info::Delete) -> CResult<()> {
-        tracing::debug!(target: "drive::mounts", id = %self.id, path = %request.path().display(), "Delete");
-       let _ = ticket.pass();
+    fn delete(&self, request: Request, ticket: ticket::Delete, info: info::Delete) -> CResult<()> {
+        let path = request.path();
+        tracing::debug!(target: "drive::mounts", id = %self.id, path = %path.display(), "Delete");
+
+        // Record the redirect root before allowing Windows to recurse into it.
+        // The filesystem watcher can otherwise see child removals before the
+        // root event and resolve them to the sender's real shared content.
+        if !info.is_undelete() {
+            let Some(path_str) = path.to_str() else {
+                tracing::error!(target: "drive::mounts", id = %self.id, path = %path.display(), "Refusing to delete a non-Unicode placeholder path");
+                return Err(CloudErrorKind::Unsuccessful);
+            };
+            match self.inventory.query_by_path(path_str) {
+                Ok(Some(entry)) if entry.metadata.contains_key(metadata::SHARE_REDIRECT) => {
+                    self.deleted_share_shortcuts.remember(path.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(target: "drive::mounts", id = %self.id, path = %path.display(), error = %error, "Refusing deletion because received-share state could not be checked");
+                    return Err(CloudErrorKind::Unsuccessful);
+                }
+            }
+        }
+
+        let _ = ticket.pass();
         Ok(())
     }
 
@@ -119,39 +146,39 @@ impl SyncFilter for CallbackHandler {
         match response_rx.blocking_recv() {
             Ok(Ok(files)) => {
                 tracing::debug!(target: "drive::mounts", id = %self.id, files = %files.files.len(), "Received placeholders");
-                let mut placeholders = files.files.iter()
-                    .filter(|file| !is_symbolic_link(file))
-                    .map(|file| cloud_file_to_placeholder(file, &files.local_path, &files.remote_path))
-                    .filter_map(|result|{
-                        if result.is_ok() {
-                            Some(result.unwrap())
-                        } else {
-                            tracing::error!(target: "drive::mounts", id = %self.id, error = %result.unwrap_err(), "Failed to convert cloud file to placeholder");
-                            None
+                let drive_id = match Uuid::parse_str(&self.id) {
+                    Ok(drive_id) => drive_id,
+                    Err(error) => {
+                        tracing::error!(target: "drive::mounts", id = %self.id, error = %error, "Failed to parse drive ID");
+                        return Err(CloudErrorKind::Unsuccessful);
+                    }
+                };
+                let mut placeholders = Vec::<PlaceholderFile>::new();
+                let mut entries = Vec::<MetadataEntry>::new();
+                for file in &files.files {
+                    let placeholder =
+                        cloud_file_to_placeholder(file, &files.local_path, &files.remote_path);
+                    let entry = cloud_file_to_metadata_entry(file, &drive_id, &files.local_path);
+                    match (placeholder, entry) {
+                        (Ok(placeholder), Ok(entry)) => {
+                            placeholders.push(placeholder);
+                            entries.push(entry);
                         }
-                    })
-                    .collect::<Vec<PlaceholderFile>>();
+                        (Err(error), _) => {
+                            tracing::error!(target: "drive::mounts", id = %self.id, error = %error, "Failed to convert cloud file to placeholder")
+                        }
+                        (_, Err(error)) => {
+                            tracing::error!(target: "drive::mounts", id = %self.id, error = %error, "Failed to convert cloud file to metadata entry")
+                        }
+                    }
+                }
                 if let Err(e) = ticket.pass_with_placeholder(&mut placeholders) {
                     tracing::error!(target: "drive::mounts", id = %self.id, error = %e, "Failed to pass placeholders");
                     return Err(CloudErrorKind::Unsuccessful);
                 }
                 tracing::debug!(target: "drive::mounts", id = %self.id, placeholders = %placeholders.len(), "Passed placeholders");
 
-                // Insert placeholders into inventory
-                let drive_id = Uuid::parse_str(&self.id)
-                    .unwrap_or_else(|e| {
-                        tracing::error!(target: "drive::mounts", id = %self.id, error = %e, "Failed to parse drive ID");
-                        return Uuid::new_v4();
-                    });
-                let entries = files
-                    .files
-                    .iter()
-                    .filter_map(|f| {
-                        cloud_file_to_metadata_entry(f, &drive_id, &files.local_path).map_err(|e| {
-                            tracing::error!(target: "drive::mounts", id = %self.id, error = %e, "Failed to convert cloud file to metadata entry");
-                        }).ok()
-                    })
-                    .collect::<Vec<MetadataEntry>>();
+                // Insert exactly the entries that were passed to CFAPI.
                 if let Err(e) = self.inventory.batch_insert(&entries) {
                     tracing::error!(target: "drive::mounts", id = %self.id, error = ?e, "Failed to insert placeholders into inventory");
                 }

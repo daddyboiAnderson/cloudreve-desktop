@@ -18,7 +18,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use cloudreve_api::{Client, api::ExplorerApi, models::explorer::FileURLService};
+use cloudreve_api::{
+    Client,
+    api::ExplorerApi,
+    models::explorer::{FileURLService, metadata},
+};
 use dashmap::DashMap;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
@@ -30,7 +34,11 @@ use uuid::Uuid;
 
 use crate::{
     cfapi::placeholder::LocalFileInfo,
-    drive::{placeholder::CrPlaceholder, utils::local_path_to_cr_uri},
+    drive::{
+        placeholder::CrPlaceholder,
+        share_shortcuts::{inventory_content_uri, present_at, resolve_uri},
+        utils::local_path_to_cr_uri,
+    },
     inventory::{FileMetadata, InventoryDb},
     tasks::queue::QueuedTask,
 };
@@ -303,13 +311,17 @@ impl<'a> DownloadTask<'a> {
         );
 
         // Get remote URI
-        let uri = local_path_to_cr_uri(
+        let visible_uri = local_path_to_cr_uri(
             local_path.clone(),
             self.sync_path.clone(),
             self.remote_base.clone(),
         )
         .context("failed to convert local path to cloudreve uri")?
         .to_string();
+        let uri = match self.inventory_meta.as_ref().and_then(inventory_content_uri) {
+            Some(uri) => uri.to_string(),
+            None => resolve_uri(self.cr_client.as_ref(), &visible_uri, true).await?,
+        };
 
         // Fetch latest file info from remote before download
         let file_info = self
@@ -329,8 +341,18 @@ impl<'a> DownloadTask<'a> {
         // Get download URL from server using inventory metadata for entity validation
         let mut request = FileURLService::default();
         request.uris.push(uri.clone());
-        if self.remote_file_info.as_ref().map(|f|f.primary_entity.is_some()).unwrap_or(false) {
-            request.entity = self.remote_file_info.as_ref().unwrap().primary_entity.clone();
+        if self
+            .remote_file_info
+            .as_ref()
+            .map(|f| f.primary_entity.is_some())
+            .unwrap_or(false)
+        {
+            request.entity = self
+                .remote_file_info
+                .as_ref()
+                .unwrap()
+                .primary_entity
+                .clone();
         }
 
         let entity_url_res = self
@@ -533,12 +555,35 @@ impl<'a> DownloadTask<'a> {
                 .context("failed to copy temp file to local path")?;
         }
 
+        let mut presented_file_info = remote_file_info.clone();
+        if let Some(inventory) = &self.inventory_meta
+            && (inventory_content_uri(inventory).is_some()
+                || inventory.metadata.contains_key(metadata::SHARE_REDIRECT))
+        {
+            for key in [metadata::SHARE_REDIRECT, metadata::SHARE_OWNER] {
+                if let Some(value) = inventory.metadata.get(key) {
+                    presented_file_info
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .insert(key.into(), value.clone());
+                }
+            }
+            let visible_uri = local_path_to_cr_uri(
+                local_path.clone(),
+                self.sync_path.clone(),
+                self.remote_base.clone(),
+            )?
+            .to_string();
+            let content_uri = presented_file_info.path.clone();
+            present_at(&mut presented_file_info, visible_uri, content_uri);
+        }
+
         // Use CrPlaceholder to convert and mark as in-sync
         let drive_id = Uuid::from_str(self.drive_id).context("invalid drive ID")?;
         // Create CrPlaceholder and commit changes using the latest remote file info
         let mut cr_placeholder =
             CrPlaceholder::new(local_path.clone(), self.sync_path.clone(), drive_id)
-                .with_remote_file(remote_file_info);
+                .with_remote_file(&presented_file_info);
 
         cr_placeholder
             .commit(self.inventory.clone())

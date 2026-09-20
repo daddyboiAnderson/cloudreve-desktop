@@ -1,5 +1,6 @@
 use super::DriveManager;
 use crate::drive::commands::{ManagerCommand, MountCommand};
+use crate::drive::share_shortcuts::resolve_uri;
 use crate::drive::utils::{local_path_to_cr_uri, view_online_url};
 use crate::utils::toast::send_conflict_toast;
 use anyhow::{Context, Result};
@@ -39,6 +40,13 @@ impl DriveManager {
                         let result = manager.handle_view_online(path.clone()).await;
                         // TODO: handle result in UI
                         tracing::debug!(target: "drive::manager", path = %path.display(), result = ?result, "ViewOnline command result");
+                    });
+                }
+                ManagerCommand::Share { path } => {
+                    spawn(async move {
+                        if let Err(error) = manager.handle_share(path.clone()).await {
+                            tracing::error!(target: "drive::manager", path = %path.display(), error = %error, "Share command failed");
+                        }
                     });
                 }
                 ManagerCommand::PersistConfig => {
@@ -182,15 +190,33 @@ impl DriveManager {
         let url = match file_meta {
             // If no metadata, assume it's the sync root, open folder
             None => view_online_url(&config.remote_path, None, &config)?,
-            Some(ref meta) if meta.is_folder => view_online_url(&uri, None, &config)?,
+            Some(ref meta) if meta.is_folder => {
+                let uri = resolve_uri(mount.cr_client.as_ref(), &uri, true).await?;
+                view_online_url(&uri, None, &config)?
+            }
             Some(ref _meta) => {
                 use cloudreve_api::models::uri::CrUri;
+                let uri = resolve_uri(mount.cr_client.as_ref(), &uri, true).await?;
                 let parent_path = CrUri::new(&uri)?.parent()?.to_string();
                 view_online_url(&parent_path, Some(&uri), &config)?
             }
         };
 
         open::that(url)?;
+        Ok(())
+    }
+
+    /// Resolve a local Cloudreve path and ask the desktop shell to show Share Options.
+    pub(super) async fn handle_share(&self, path: PathBuf) -> Result<()> {
+        let mount = self
+            .search_drive_by_child_path(path.to_str().unwrap_or(""))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No drive found for path: {:?}", path))?;
+        let config = mount.get_config().await;
+        let uri = local_path_to_cr_uri(path, config.sync_path.clone(), config.remote_path.clone())?
+            .to_string();
+        self.event_broadcaster
+            .open_share_window(config.id.clone(), uri);
         Ok(())
     }
 

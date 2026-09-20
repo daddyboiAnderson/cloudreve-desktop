@@ -1049,7 +1049,7 @@ export default function Share() {
           Share Options
         </Typography>
         {!isMacOS && (
-          <IconButton size="small" onClick={closeWindow} aria-label="Close" sx={{ flexShrink: 0, ml: 1 }}>
+          <IconButton size="small" onClick={closeWindow} aria-label="Close" sx={{ flexShrink: 0, ml: 1, WebkitAppRegion: "no-drag", appRegion: "no-drag" }}>
             <CloseIcon fontSize="small" />
           </IconButton>
         )}

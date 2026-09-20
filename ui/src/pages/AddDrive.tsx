@@ -365,15 +365,24 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
   }
 
   const handleOpenDriveAndClose = async () => {
-    if (isMacOS) {
-      // On macOS the drive lives in Finder's CloudStorage locations.
-      const home = await homeDir();
-      await openPath(`${home}/Library/CloudStorage`);
-    } else {
-      const pathToOpen = localPath.endsWith('/') || localPath.endsWith('\\') ? localPath : localPath + '/';
-      await openPath(pathToOpen);
+    try {
+      if (isMacOS) {
+        // On macOS the drive lives in Finder's CloudStorage locations.
+        const home = await homeDir();
+        await openPath(`${home}/Library/CloudStorage`);
+      } else {
+        // The opener plugin is intentionally scoped to $HOME, while Windows
+        // sync roots can live on any drive (for example E:\\Cloudreve). Use
+        // the native command so valid non-home paths are not rejected.
+        await invoke("show_file_in_explorer", { path: localPath });
+      }
+    } catch (openError) {
+      console.error("Failed to open drive folder:", openError);
+    } finally {
+      // This is a one-shot setup window. Destroy it even when Explorer could
+      // not be opened so the success screen can never trap the user.
+      await getCurrentWindow().destroy();
     }
-    await getCurrentWindow().close();
   }
 
   return (
@@ -397,7 +406,6 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
         }}
       >
         <Box
-          data-tauri-drag-region
           sx={{
             position: "absolute",
             top: 0,
@@ -411,11 +419,15 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
             zIndex: 1,
           }}
         >
+          <Box
+            data-tauri-drag-region
+            sx={{ position: "absolute", inset: 0 }}
+          />
           {!isMacOS && (
             <IconButton
               size="small"
-              onClick={() => getCurrentWindow().close()}
-              sx={{ WebkitAppRegion: "no-drag", appRegion: "no-drag" }}
+              onClick={() => getCurrentWindow().destroy()}
+              sx={{ WebkitAppRegion: "no-drag", appRegion: "no-drag", zIndex: 1 }}
             >
               <CloseIcon fontSize="small" />
             </IconButton>
@@ -477,7 +489,7 @@ export default function AddDrive({ mode = "add" }: AddDriveProps) {
                     variant="contained"
                     size="large"
                     fullWidth
-                    onClick={() => getCurrentWindow().close()}
+                    onClick={() => getCurrentWindow().destroy()}
                   >
                     {t("addDrive.close")}
                   </Button>

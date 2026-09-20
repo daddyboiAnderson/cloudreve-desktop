@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::cfapi::utility::WriteAt;
 use crate::{
     cfapi::{
         filter::ticket,
@@ -6,10 +8,15 @@ use crate::{
     drive::{
         mounts::Mount,
         placeholder::CrPlaceholder,
+        share_shortcuts::{
+            clear_inventory_content_uri, inventory_content_uri, is_received_content_location,
+            is_received_inventory_entry, list_presented_children, rebase_content_uri, resolve_uri,
+            set_inventory_content_uri, set_inventory_owned,
+        },
         sync::{GroupedFsEvents, SyncMode, local_snapshot_differs},
         utils::{local_path_to_cr_uri, notify_shell_change},
     },
-    inventory::ConflictState,
+    inventory::{ConflictState, FileMetadata, MetadataEntry},
     tasks::TaskPayload,
     utils::toast,
 };
@@ -17,7 +24,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use cloudreve_api::{
     ApiError,
-    api::{ExplorerApi, explorer::ExplorerApiExt},
+    api::ExplorerApi,
     models::{
         explorer::{
             DeleteFileService, FileResponse, FileURLService, MoveFileService, RenameFileService,
@@ -39,12 +46,189 @@ use std::{
 use tokio::sync::oneshot::Sender;
 use uuid::Uuid;
 #[cfg(windows)]
-use crate::cfapi::utility::WriteAt;
-#[cfg(windows)]
 use windows::Win32::UI::Shell::SHCNE_ATTRIBUTES;
 #[cfg(not(windows))]
 const SHCNE_ATTRIBUTES: u32 = 0;
 const PAGE_SIZE: i32 = 1000;
+const DELETED_SHARE_SHORTCUT_TOMBSTONE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+#[cfg(windows)]
+fn hydrate_pinned_directory_tree(root: &Path) -> Result<usize> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut hydrated = 0usize;
+
+    while let Some(directory) = directories.pop() {
+        let directory_info = LocalFileInfo::from_path(&directory)?;
+        if !directory_info.exists
+            || !directory_info.is_placeholder()
+            || directory_info.pinned() != PinState::Pinned
+        {
+            continue;
+        }
+
+        // Enumerating a partially populated placeholder directory asks CFAPI
+        // for its children. Doing this explicitly closes the gap where the
+        // shell's recursive pin notification is collapsed to the folder event.
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    target: "drive::commands",
+                    path = %directory.display(),
+                    error = %error,
+                    "Could not enumerate pinned directory during hydration"
+                );
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "drive::commands",
+                        path = %directory.display(),
+                        error = %error,
+                        "Could not inspect pinned directory entry"
+                    );
+                    continue;
+                }
+            };
+            if entry
+                .file_type()
+                .map(|kind| kind.is_symlink())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let path = entry.path();
+            let info = match LocalFileInfo::from_path(&path) {
+                Ok(info) => info,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "drive::commands",
+                        path = %path.display(),
+                        error = %error,
+                        "Could not inspect pinned placeholder"
+                    );
+                    continue;
+                }
+            };
+            if !info.exists || !info.is_placeholder() || info.pinned() != PinState::Pinned {
+                continue;
+            }
+            if info.is_directory() {
+                directories.push(path);
+                continue;
+            }
+            if !info.partial_on_disk() {
+                continue;
+            }
+
+            // Explorer and antivirus software can briefly hold the placeholder
+            // while applying attributes. Retry that transient window instead
+            // of silently abandoning the recursive folder request.
+            let mut placeholder = None;
+            for attempt in 0..5 {
+                match OpenOptions::new().open_win32(&path) {
+                    Ok(opened) => {
+                        placeholder = Some(opened);
+                        break;
+                    }
+                    Err(error) if attempt < 4 => {
+                        tracing::trace!(
+                            target: "drive::commands",
+                            path = %path.display(),
+                            error = %error,
+                            attempt = attempt + 1,
+                            "Pinned placeholder is temporarily busy"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "drive::commands",
+                            path = %path.display(),
+                            error = %error,
+                            "Could not open pinned placeholder after retries"
+                        );
+                    }
+                }
+            }
+
+            let Some(mut placeholder) = placeholder else {
+                continue;
+            };
+            match placeholder.hydrate(0..) {
+                Ok(()) => {
+                    hydrated += 1;
+                    let _ = notify_shell_change(&path, SHCNE_ATTRIBUTES);
+                }
+                Err(error) => tracing::warn!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    error = %error,
+                    "Could not hydrate pinned placeholder"
+                ),
+            }
+        }
+    }
+
+    Ok(hydrated)
+}
+
+fn is_strict_descendant_of(path: &Path, ancestor: &Path) -> bool {
+    path != ancestor && path.starts_with(ancestor)
+}
+
+fn is_stale_remove_event(path: &Path) -> bool {
+    path.exists()
+}
+
+fn should_reconcile_received_delete(
+    entry: Option<&FileMetadata>,
+    received_ancestor: Option<&Path>,
+) -> bool {
+    let exact_shortcut =
+        entry.is_some_and(|entry| entry.metadata.contains_key(metadata::SHARE_REDIRECT));
+    !exact_shortcut
+        && (entry.is_some_and(is_received_inventory_entry) || received_ancestor.is_some())
+}
+
+fn should_reconcile_resolved_delete(visible_uri: &str, resolved_uri: &str) -> Result<bool> {
+    is_received_content_location(visible_uri, resolved_uri)
+}
+
+fn recently_deleted_shortcut_ancestor<'a>(
+    path: &Path,
+    shortcut_roots: &'a [PathBuf],
+) -> Option<&'a Path> {
+    shortcut_roots
+        .iter()
+        .find(|root| path.starts_with(root))
+        .map(PathBuf::as_path)
+}
+
+fn received_inventory_ancestor(
+    inventory: &crate::inventory::InventoryDb,
+    path: &Path,
+) -> Result<Option<PathBuf>> {
+    for ancestor in path.ancestors().skip(1) {
+        let Some(ancestor_str) = ancestor.to_str() else {
+            continue;
+        };
+        if inventory.query_by_path(ancestor_str)?.is_some_and(|entry| {
+            entry.metadata.contains_key(metadata::SHARE_REDIRECT)
+                || is_received_inventory_entry(&entry)
+        }) {
+            return Ok(Some(ancestor.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
 
 /// Generate a unique filename by appending a counter suffix before the extension.
 /// For example: "document.txt" -> "document (1).txt", "document (2).txt", etc.
@@ -146,6 +330,10 @@ pub enum ManagerCommand {
     ViewOnline {
         path: PathBuf,
     },
+    /// Open the Cloudreve Share Options window for a local item.
+    Share {
+        path: PathBuf,
+    },
     PersistConfig,
     GenerateThumbnail {
         path: PathBuf,
@@ -203,6 +391,34 @@ impl ConflictAction {
 }
 
 impl Mount {
+    /// Register local deletion side effects before the filesystem is touched.
+    /// This closes the watcher race for every programmatic placeholder delete
+    /// and preserves received-share ancestry after inventory subtree removal.
+    pub(crate) fn prepare_local_placeholder_deletion(&self, path: &Path) -> Result<()> {
+        let path_str = path
+            .to_str()
+            .context("failed to inspect non-Unicode deletion path")?;
+        if self
+            .inventory
+            .query_by_path(path_str)
+            .context("failed to inspect deletion inventory entry")?
+            .as_ref()
+            .is_some_and(|entry| {
+                entry.metadata.contains_key(metadata::SHARE_REDIRECT)
+                    || is_received_inventory_entry(entry)
+            })
+        {
+            self.recently_deleted_share_shortcuts
+                .remember(path.to_path_buf());
+        }
+
+        if path.exists() {
+            self.event_blocker
+                .register_once(&EventKind::Remove(RemoveKind::Any), path.to_path_buf());
+        }
+        Ok(())
+    }
+
     pub async fn fetch_data(
         &self,
         path: PathBuf,
@@ -214,7 +430,7 @@ impl Mount {
         let sync_path = config.sync_path.clone();
         drop(config);
 
-        let uri = local_path_to_cr_uri(path.clone(), sync_path, remote_base)
+        let visible_uri = local_path_to_cr_uri(path.clone(), sync_path, remote_base)
             .context("failed to convert local path to cloudreve uri")?;
 
         let file_meta = self
@@ -222,8 +438,13 @@ impl Mount {
             .query_by_path(path.to_str().unwrap_or(""))
             .context("failed to query metadata by path")?;
 
+        let uri = match file_meta.as_ref().and_then(inventory_content_uri) {
+            Some(uri) => uri.to_string(),
+            None => resolve_uri(self.cr_client.as_ref(), &visible_uri.to_string(), true).await?,
+        };
+
         let mut request: FileURLService = FileURLService::default();
-        request.uris.push(uri.to_string());
+        request.uris.push(uri);
         if let Some(meta) = file_meta {
             if !meta.etag.is_empty() {
                 request.entity = Some(meta.etag.clone());
@@ -339,26 +560,11 @@ impl Mount {
 
         let uri = local_path_to_cr_uri(path.clone(), sync_path, remote_base)
             .context("failed to convert local path to cloudreve uri")?;
-        let mut placehodlers: Vec<FileResponse> = Vec::new();
+        let mut placehodlers =
+            list_presented_children(self.cr_client.as_ref(), &uri.to_string(), PAGE_SIZE).await?;
 
-        let mut previous_response = None;
-        loop {
-            let response = self
-                .cr_client
-                .list_files_all(previous_response.as_ref(), &uri.to_string(), PAGE_SIZE)
-                .await?;
-
-            for file in &response.res.files {
-                tracing::debug!(target: "drive::mounts", file = %file.name, "Server file");
-            }
-
-            placehodlers.extend(response.res.files.clone());
-            let has_more: bool = response.more;
-            previous_response = Some(response);
-
-            if !has_more {
-                break;
-            }
+        for file in &placehodlers {
+            tracing::debug!(target: "drive::mounts", file = %file.name, "Server file");
         }
 
         tracing::debug!(target: "drive::mounts", uri = %uri.to_string(), "Fetch file list from cloudreve");
@@ -408,9 +614,13 @@ impl Mount {
             let config = self.config.read().await;
             (config.sync_path.clone(), config.remote_path.to_string())
         };
-        let uri = local_path_to_cr_uri(path.clone(), sync_path, remote_base)
+        let visible_uri = local_path_to_cr_uri(path.clone(), sync_path, remote_base)
             .context("failed to convert local path to cloudreve uri")?
             .to_string();
+        let uri = match inventory_content_uri(&file_meta) {
+            Some(uri) => uri.to_string(),
+            None => resolve_uri(self.cr_client.as_ref(), &visible_uri, true).await?,
+        };
         let thumb_res = self.cr_client.get_file_thumb(uri.as_str(), None).await?;
 
         // Download the thumbnail
@@ -447,6 +657,75 @@ impl Mount {
                     .context("failed to convert destination path to string")?,
             )
             .context("failed to rename path in inventory")?;
+
+        // Descendants presented through a received folder keep a local-only
+        // content URI. Update it after a move/rename; the received shortcut
+        // itself retains its target because renaming that shortcut must not
+        // rename the sender's item.
+        if let Some(metadata) = self
+            .inventory
+            .query_by_path(destination.to_str().unwrap_or(""))
+            .context("failed to read renamed inventory metadata")?
+            && !metadata.metadata.contains_key(metadata::SHARE_REDIRECT)
+        {
+            let config = self.config.read().await;
+            let visible_uri = local_path_to_cr_uri(
+                destination.clone(),
+                config.sync_path.clone(),
+                config.remote_path.clone(),
+            )?
+            .to_string();
+            let sync_path = config.sync_path.clone();
+            let remote_path = config.remote_path.clone();
+            drop(config);
+            let new_content_root =
+                resolve_uri(self.cr_client.as_ref(), &visible_uri, false).await?;
+            let destination_is_received =
+                is_received_content_location(&visible_uri, &new_content_root)?;
+            let old_content_root = inventory_content_uri(&metadata).map(ToOwned::to_owned);
+
+            let mut rebased_entries = Vec::new();
+            for mut descendant in self
+                .inventory
+                .query_by_drive(&self.id)
+                .context("failed to read renamed received-share descendants")?
+            {
+                if !Path::new(&descendant.local_path).starts_with(&destination) {
+                    continue;
+                }
+                let content_uri = match (inventory_content_uri(&descendant), &old_content_root) {
+                    (Some(content_uri), Some(old_content_root)) => {
+                        rebase_content_uri(content_uri, old_content_root, &new_content_root)
+                    }
+                    (None, _) if destination_is_received => {
+                        let descendant_visible_uri = local_path_to_cr_uri(
+                            PathBuf::from(&descendant.local_path),
+                            sync_path.clone(),
+                            remote_path.clone(),
+                        )?
+                        .to_string();
+                        rebase_content_uri(&descendant_visible_uri, &visible_uri, &new_content_root)
+                    }
+                    _ => None,
+                };
+                let Some(content_uri) = content_uri else {
+                    continue;
+                };
+                if destination_is_received {
+                    set_inventory_content_uri(&mut descendant, content_uri)?;
+                    set_inventory_owned(&mut descendant, false)?;
+                    descendant.shared = true;
+                } else {
+                    clear_inventory_content_uri(&mut descendant)?;
+                    set_inventory_owned(&mut descendant, true)?;
+                    descendant.shared = false;
+                }
+                rebased_entries.push(MetadataEntry::from(&descendant));
+            }
+            self.inventory
+                .batch_insert(&rebased_entries)
+                .context("failed to update renamed received-share subtree metadata")?;
+        }
 
         // Cancel ongoing/pending tasks
         match self.task_queue.cancel_by_path(source.clone()).await {
@@ -526,10 +805,14 @@ impl Mount {
         let target_parent = target.parent().context("root cannot be moved")?;
         let source_parent = source.parent().context("root cannot be moved")?;
         if target_parent == source_parent {
+            let source_uri =
+                local_path_to_cr_uri(source.clone(), sync_path.clone(), remote_path.clone())?
+                    .to_string();
+            let source_uri = resolve_uri(self.cr_client.as_ref(), &source_uri, false).await?;
             match self
                 .cr_client
                 .rename_file(&RenameFileService {
-                    uri: local_path_to_cr_uri(source.clone(), sync_path, remote_path)?.to_string(),
+                    uri: source_uri,
                     new_name: target
                         .file_name()
                         .context("target cannot be moved")?
@@ -556,19 +839,22 @@ impl Mount {
         }
 
         // Process move call
+        let source_uri =
+            local_path_to_cr_uri(source.clone(), sync_path.clone(), remote_path.clone())?
+                .to_string();
+        let source_uri = resolve_uri(self.cr_client.as_ref(), &source_uri, false).await?;
+        let destination_uri = local_path_to_cr_uri(
+            target_parent.to_path_buf(),
+            sync_path.clone(),
+            remote_path.clone(),
+        )?
+        .to_string();
+        let destination_uri = resolve_uri(self.cr_client.as_ref(), &destination_uri, true).await?;
         match self
             .cr_client
             .move_files(&MoveFileService {
-                uris: vec![
-                    local_path_to_cr_uri(source.clone(), sync_path.clone(), remote_path.clone())?
-                        .to_string(),
-                ],
-                dst: local_path_to_cr_uri(
-                    target_parent.to_path_buf(),
-                    sync_path.clone(),
-                    remote_path.clone(),
-                )?
-                .to_string(),
+                uris: vec![source_uri],
+                dst: destination_uri,
                 copy: None,
             })
             .await
@@ -685,15 +971,12 @@ impl Mount {
         match action {
             ConflictAction::KeepRemote => {
                 // Delete local file and trigger sync on origin path
+                self.prepare_local_placeholder_deletion(Path::new(&local_path))?;
                 let cr_placeholder =
                     CrPlaceholder::new(local_path.clone(), sync_root.clone(), drive_id.clone());
                 cr_placeholder
                     .delete_placeholder(self.inventory.clone())
                     .context("failed to delete local placeholder")?;
-                self.event_blocker.register_once(
-                    &EventKind::Remove(RemoveKind::Any),
-                    local_path.clone().into(),
-                );
                 let command = MountCommand::Sync {
                     local_paths: vec![local_path.clone().into()],
                     mode: SyncMode::PathOnly,
@@ -753,15 +1036,12 @@ impl Mount {
                 );
 
                 // Delete local file and trigger sync on origin path (same as KeepRemote)
+                self.prepare_local_placeholder_deletion(Path::new(&local_path))?;
                 let cr_placeholder =
                     CrPlaceholder::new(local_path.clone(), sync_root.clone(), drive_id.clone());
                 cr_placeholder
                     .delete_placeholder(self.inventory.clone())
                     .context("failed to delete local placeholder")?;
-                self.event_blocker.register_once(
-                    &EventKind::Remove(RemoveKind::Any),
-                    local_path.clone().into(),
-                );
 
                 // Trigger sync to restore the remote version at original path
                 let command = MountCommand::Sync {
@@ -784,10 +1064,7 @@ impl Mount {
         Ok(())
     }
 
-    pub async fn resolve_all_conflicts(
-        &self,
-        action: ConflictAction,
-    ) -> Result<(usize, usize)> {
+    pub async fn resolve_all_conflicts(&self, action: ConflictAction) -> Result<(usize, usize)> {
         let pending = self
             .inventory
             .query_pending_conflicts(Some(&self.id))
@@ -885,6 +1162,40 @@ impl Mount {
                 }
             };
             if placeholder_info.is_directory() {
+                #[cfg(windows)]
+                if placeholder_info.is_placeholder()
+                    && placeholder_info.pinned() == PinState::Pinned
+                {
+                    let hydration_roots = self.pinned_hydration_roots.clone();
+                    let should_start = hydration_roots
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(path.clone());
+                    if should_start {
+                        let hydration_path = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = hydrate_pinned_directory_tree(&hydration_path);
+                            hydration_roots
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .remove(&hydration_path);
+                            match result {
+                                Ok(count) => tracing::debug!(
+                                    target: "drive::commands",
+                                    path = %hydration_path.display(),
+                                    hydrated_files = count,
+                                    "Finished recursive pinned-folder hydration"
+                                ),
+                                Err(error) => tracing::error!(
+                                    target: "drive::commands",
+                                    path = %hydration_path.display(),
+                                    error = %error,
+                                    "Recursive pinned-folder hydration failed"
+                                ),
+                            }
+                        });
+                    }
+                }
                 #[cfg(not(windows))]
                 {
                     // Windows receives richer CFAPI callbacks for directory
@@ -1014,6 +1325,29 @@ impl Mount {
         );
 
         for (_remote_uri, path) in path_uri_mappings {
+            // Creating/updating remote placeholders also produces filesystem
+            // create notifications. An in-sync placeholder is the result of
+            // that download-side work, not a new local file to upload.
+            match LocalFileInfo::from_path(path.as_path()) {
+                Ok(info) if info.exists && info.is_placeholder() && info.in_sync() => {
+                    tracing::trace!(
+                        target: "drive::commands",
+                        path = %path.display(),
+                        "Ignoring create event for in-sync placeholder"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "drive::commands",
+                        path = %path.display(),
+                        error = %error,
+                        "Could not inspect created path; treating it as a local create"
+                    );
+                }
+            }
+
             let payload = TaskPayload::upload(path.clone());
 
             self.task_queue
@@ -1046,7 +1380,154 @@ impl Mount {
             "Processing filesystem delete events"
         );
 
+        // Explorer can report a recursive folder removal as one event for the
+        // received-share shortcut and additional events for its descendants.
+        // Only the shortcut identity must be removed: resolving descendant
+        // paths would otherwise delete the sender's real files.
+        let shortcut_roots = path_uri_mappings
+            .values()
+            .filter_map(|path| {
+                let path_str = path.to_str()?;
+                match self.inventory.query_by_path(path_str) {
+                    Ok(Some(entry)) if entry.metadata.contains_key(metadata::SHARE_REDIRECT) => {
+                        Some(Ok(path.clone()))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("failed to identify deleted received-share shortcuts")?;
+
+        // Remember shortcut removals briefly because Explorer may deliver
+        // descendant notifications in a later debounce batch. By then the
+        // inventory subtree has already been deleted, and resolving the
+        // visible path against an eventually-consistent server could target
+        // the sender's actual item.
+        for root in &shortcut_roots {
+            self.recently_deleted_share_shortcuts.remember(root.clone());
+        }
+        let recent_shortcut_roots = self
+            .recently_deleted_share_shortcuts
+            .recent_roots(DELETED_SHARE_SHORTCUT_TOMBSTONE_TTL);
+
+        let mut suppressed_paths = Vec::new();
+        let mut reconcile_paths = Vec::new();
+        let mut resolved_mappings = HashMap::with_capacity(path_uri_mappings.len());
+        for (visible_uri, path) in path_uri_mappings {
+            // A remove notification can arrive after an atomic-save recreate.
+            // Never turn that stale event into a remote deletion.
+            if is_stale_remove_event(&path) {
+                tracing::debug!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    "Ignoring stale remove event because the path exists again"
+                );
+                continue;
+            }
+
+            let same_batch_root = shortcut_roots
+                .iter()
+                .find(|root| is_strict_descendant_of(&path, root));
+            let exact_shortcut_in_batch = shortcut_roots.iter().any(|root| root == &path);
+            let recent_batch_root = if !exact_shortcut_in_batch && same_batch_root.is_none() {
+                recently_deleted_shortcut_ancestor(&path, &recent_shortcut_roots)
+            } else {
+                None
+            };
+            if let Some(root) = same_batch_root.map(PathBuf::as_path).or(recent_batch_root) {
+                tracing::info!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    shortcut = %root.display(),
+                    "Ignoring descendant delete emitted while removing a received-share shortcut"
+                );
+                suppressed_paths.push(path);
+                continue;
+            }
+
+            let path_str = path
+                .to_str()
+                .context("failed to inspect deleted inventory path")?;
+            let inventory_entry = self
+                .inventory
+                .query_by_path(path_str)
+                .context("failed to inspect deleted inventory entry")?;
+            let received_ancestor = received_inventory_ancestor(self.inventory.as_ref(), &path)?;
+
+            // Filesystem remove notifications are ambiguous during a recursive
+            // shortcut delete. Only the redirect leaf itself is safe to send
+            // to Cloudreve; received content is locally reconciled instead.
+            if should_reconcile_received_delete(
+                inventory_entry.as_ref(),
+                received_ancestor.as_deref(),
+            ) {
+                let guard_root = received_ancestor.as_deref().unwrap_or(path.as_path());
+                tracing::info!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    received_root = %guard_root.display(),
+                    "Ignoring ambiguous deletion of received content and scheduling reconciliation"
+                );
+                self.recently_deleted_share_shortcuts.remember(path.clone());
+                suppressed_paths.push(path.clone());
+                // If the containing shortcut is already gone, its own delete
+                // will remove the presentation; recreating the child would race
+                // that operation. Otherwise restore the received item locally.
+                if received_ancestor.as_ref().is_none_or(|root| root.exists()) {
+                    reconcile_paths.push(path);
+                }
+                continue;
+            }
+
+            let remote_uri = resolve_uri(self.cr_client.as_ref(), &visible_uri, false)
+                .await
+                .with_context(|| format!("failed to resolve deletion target {visible_uri}"))?;
+            // Inventory can be absent if Windows accepted a placeholder just
+            // before its inventory upsert failed or the process stopped. URI
+            // resolution is the final authority: never forward a watcher
+            // deletion that resolves into someone else's received tree.
+            if should_reconcile_resolved_delete(&visible_uri, &remote_uri)? {
+                tracing::warn!(
+                    target: "drive::commands",
+                    path = %path.display(),
+                    visible_uri = %visible_uri,
+                    "Ignoring inventory-less deletion that resolves to received content"
+                );
+                self.recently_deleted_share_shortcuts.remember(path.clone());
+                suppressed_paths.push(path.clone());
+                reconcile_paths.push(path);
+                continue;
+            }
+            resolved_mappings.insert(remote_uri, path);
+        }
+        let path_uri_mappings = resolved_mappings;
         let uris: Vec<String> = path_uri_mappings.keys().cloned().collect();
+
+        // These rows describe paths that are already gone locally. Removing
+        // only local cache state is safe even if deleting the shortcut itself
+        // later fails; a resync will recreate them from the still-live link.
+        if !suppressed_paths.is_empty() {
+            for path in &suppressed_paths {
+                let _ = self.task_queue.cancel_by_path(path).await;
+            }
+            self.update_inventory_for_deletions(&suppressed_paths)
+                .context("failed to remove suppressed shortcut descendants from inventory")?;
+        }
+
+        if !reconcile_paths.is_empty() {
+            self.command_tx
+                .send(MountCommand::Sync {
+                    local_paths: reconcile_paths,
+                    mode: SyncMode::PathOnly,
+                    user_initiated: false,
+                })
+                .context("failed to schedule received-content reconciliation")?;
+        }
+
+        if path_uri_mappings.is_empty() {
+            return Ok(());
+        }
 
         // cancel related tasks
         for path in path_uri_mappings.values() {
@@ -1242,5 +1723,176 @@ impl Mount {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod delete_guard_tests {
+    use super::*;
+    use crate::inventory::MetadataEntry;
+
+    #[test]
+    fn detects_same_batch_descendants_without_matching_similar_siblings() {
+        let shortcut = PathBuf::from("Cloudreve").join("Received");
+        assert!(is_strict_descendant_of(
+            &shortcut.join("folder").join("file.txt"),
+            &shortcut
+        ));
+        assert!(!is_strict_descendant_of(
+            &PathBuf::from("Cloudreve")
+                .join("Received-old")
+                .join("file.txt"),
+            &shortcut
+        ));
+    }
+
+    #[test]
+    fn detects_received_ancestor_even_before_shortcut_root_is_removed() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let inventory = crate::inventory::InventoryDb::with_path(temp.path().join("inventory.db"))
+            .expect("create inventory");
+        let shortcut = temp.path().join("Received");
+        let child = shortcut.join("folder").join("file.txt");
+        let mut entry = MetadataEntry::new(Uuid::new_v4(), shortcut.to_string_lossy(), true);
+        entry.metadata.insert(
+            metadata::SHARE_REDIRECT.into(),
+            "cloudreve://share-id@share".into(),
+        );
+        inventory.insert(&entry).expect("insert shortcut inventory");
+
+        assert_eq!(
+            received_inventory_ancestor(&inventory, &child).expect("query shortcut ancestor"),
+            Some(shortcut.clone())
+        );
+
+        std::fs::create_dir(&shortcut).expect("materialize shortcut");
+        assert_eq!(
+            received_inventory_ancestor(&inventory, &child)
+                .expect("query present shortcut ancestor"),
+            Some(shortcut)
+        );
+    }
+
+    #[test]
+    fn tombstone_guards_descendants_for_the_full_drain_period() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let shortcut = temp.path().join("Received");
+        let child = shortcut.join("folder").join("file.txt");
+        let roots = vec![shortcut.clone()];
+
+        assert_eq!(
+            recently_deleted_shortcut_ancestor(&child, &roots),
+            Some(shortcut.as_path())
+        );
+        assert_eq!(
+            recently_deleted_shortcut_ancestor(&shortcut, &roots),
+            Some(shortcut.as_path())
+        );
+
+        std::fs::create_dir(&shortcut).expect("recreate shortcut");
+        assert_eq!(
+            recently_deleted_shortcut_ancestor(&child, &roots),
+            Some(shortcut.as_path())
+        );
+    }
+
+    #[test]
+    fn child_first_received_delete_is_reconciled_without_a_tombstone() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let inventory = crate::inventory::InventoryDb::with_path(temp.path().join("inventory.db"))
+            .expect("create inventory");
+        let shortcut = temp.path().join("Received");
+        let child = shortcut.join("file.txt");
+        std::fs::create_dir(&shortcut).expect("materialize shortcut");
+
+        let drive_id = Uuid::new_v4();
+        let mut shortcut_entry = MetadataEntry::new(drive_id, shortcut.to_string_lossy(), true);
+        shortcut_entry.metadata.insert(
+            metadata::SHARE_REDIRECT.into(),
+            "cloudreve://share-id@share".into(),
+        );
+        let child_entry = MetadataEntry::new(drive_id, child.to_string_lossy(), false).with_props(
+            serde_json::json!({
+                "presented_content_uri": "cloudreve://share-id@share/file.txt",
+                "owned": false
+            }),
+        );
+        inventory
+            .batch_insert(&[shortcut_entry, child_entry])
+            .expect("insert received inventory tree");
+
+        let stored_child = inventory
+            .query_by_path(&child.to_string_lossy())
+            .expect("query child")
+            .expect("child exists");
+        let ancestor =
+            received_inventory_ancestor(&inventory, &child).expect("query received ancestor");
+
+        assert!(recently_deleted_shortcut_ancestor(&child, &[]).is_none());
+        assert!(should_reconcile_received_delete(
+            Some(&stored_child),
+            ancestor.as_deref()
+        ));
+    }
+
+    #[test]
+    fn duplicate_direct_share_remove_is_blocked_after_inventory_purge() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let inventory = crate::inventory::InventoryDb::with_path(temp.path().join("inventory.db"))
+            .expect("create inventory");
+        let path = temp.path().join("received-file.txt");
+        let entry = MetadataEntry::new(Uuid::new_v4(), path.to_string_lossy(), false).with_props(
+            serde_json::json!({
+                "presented_content_uri": "cloudreve://share-id@shared_with_me/received-file.txt",
+                "owned": false
+            }),
+        );
+        inventory.insert(&entry).expect("insert direct-share item");
+
+        let first_entry = inventory
+            .query_by_path(&path.to_string_lossy())
+            .expect("query first remove")
+            .expect("direct-share item exists");
+        assert!(should_reconcile_received_delete(Some(&first_entry), None));
+
+        let roots = vec![path.clone()];
+        let path_string = path.to_string_lossy().into_owned();
+        inventory
+            .batch_delete_by_path(vec![path_string.as_str()])
+            .expect("purge local inventory");
+        assert!(
+            inventory
+                .query_by_path(&path_string)
+                .expect("query duplicate remove")
+                .is_none()
+        );
+        assert_eq!(
+            recently_deleted_shortcut_ancestor(&path, &roots),
+            Some(path.as_path())
+        );
+    }
+
+    #[test]
+    fn inventory_less_redirected_child_is_reconciled_not_remote_deleted() {
+        assert!(
+            should_reconcile_resolved_delete(
+                "cloudreve://my/Shared/child.txt",
+                "cloudreve://sender@shared_with_me/child.txt"
+            )
+            .expect("classify received target")
+        );
+        assert!(
+            !should_reconcile_resolved_delete("cloudreve://my/Shared", "cloudreve://my/Shared")
+                .expect("classify owned shortcut leaf")
+        );
+    }
+
+    #[test]
+    fn recreated_path_makes_remove_event_stale() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let path = temp.path().join("atomic-save.txt");
+        assert!(!is_stale_remove_event(&path));
+        std::fs::write(&path, b"replacement").expect("recreate file");
+        assert!(is_stale_remove_event(&path));
     }
 }

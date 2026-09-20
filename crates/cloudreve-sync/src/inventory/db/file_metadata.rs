@@ -3,10 +3,14 @@ use crate::inventory::{ConflictState, FileMetadata, MetadataEntry};
 use anyhow::{Context, Result};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use crate::inventory::schema::file_metadata::{self, dsl as file_metadata_dsl};
+use crate::inventory::schema::{
+    drive_props,
+    file_metadata::{self, dsl as file_metadata_dsl},
+    task_queue, upload_sessions,
+};
 
 impl InventoryDb {
     pub fn batch_insert(&self, entries: &[MetadataEntry]) -> Result<()> {
@@ -19,21 +23,47 @@ impl InventoryDb {
             .map(NewFileMetadata::try_from)
             .collect::<Result<_>>()?;
 
+        let changesets: Vec<FileMetadataChangeset> = entries
+            .iter()
+            .map(FileMetadataChangeset::from_entry)
+            .collect::<Result<_>>()?;
+
         let mut conn = self.connection()?;
-        diesel::insert_into(file_metadata::table)
-            .values(&rows)
-            .execute(&mut conn)
-            .context("Failed to batch insert inventory metadata")?;
+        (&mut *conn)
+            .transaction::<(), diesel::result::Error, _>(|tx_conn| {
+                for (row, changeset) in rows.iter().zip(changesets.iter()) {
+                    diesel::insert_into(file_metadata::table)
+                        .values(row)
+                        .on_conflict(file_metadata::local_path)
+                        .do_update()
+                        .set(changeset)
+                        .execute(tx_conn)?;
+                }
+                Ok(())
+            })
+            .context("Failed to batch upsert inventory metadata")?;
         Ok(())
     }
 
     pub fn nuke_drive(&self, drive: &str) -> Result<()> {
         let mut conn = self.connection()?;
-        diesel::delete(
-            file_metadata_dsl::file_metadata.filter(file_metadata_dsl::drive_id.eq(drive)),
-        )
-        .execute(&mut conn)
-        .context("Failed to delete inventory rows for drive")?;
+        (&mut *conn)
+            .transaction::<(), diesel::result::Error, _>(|tx_conn| {
+                // A removed drive must not leave resumable uploads or status
+                // rows behind. Delete dependent records before its metadata.
+                diesel::delete(upload_sessions::table.filter(upload_sessions::drive_id.eq(drive)))
+                    .execute(tx_conn)?;
+                diesel::delete(task_queue::table.filter(task_queue::drive_id.eq(drive)))
+                    .execute(tx_conn)?;
+                diesel::delete(drive_props::table.filter(drive_props::drive_id.eq(drive)))
+                    .execute(tx_conn)?;
+                diesel::delete(
+                    file_metadata_dsl::file_metadata.filter(file_metadata_dsl::drive_id.eq(drive)),
+                )
+                .execute(tx_conn)?;
+                Ok(())
+            })
+            .context("Failed to delete inventory rows for drive")?;
         Ok(())
     }
 
@@ -88,6 +118,23 @@ impl InventoryDb {
         row.map(FileMetadata::try_from).transpose()
     }
 
+    /// Query every known item for one configured drive.
+    ///
+    /// This is primarily used by platform integrations that need to inspect
+    /// native state (for example Windows Cloud Files pin state) while keeping
+    /// the result strictly scoped to Cloudreve-owned sync roots.
+    pub fn query_by_drive(&self, drive: &str) -> Result<Vec<FileMetadata>> {
+        let mut conn = self.connection()?;
+        file_metadata_dsl::file_metadata
+            .filter(file_metadata_dsl::drive_id.eq(drive))
+            .order(file_metadata_dsl::local_path.asc())
+            .load::<FileMetadataRow>(&mut conn)
+            .context("Failed to query inventory metadata by drive")?
+            .into_iter()
+            .map(FileMetadata::try_from)
+            .collect()
+    }
+
     /// Query file metadata by id
     pub fn query_by_id(&self, id: i64) -> Result<Option<FileMetadata>> {
         let mut conn = self.connection()?;
@@ -100,14 +147,45 @@ impl InventoryDb {
         row.map(FileMetadata::try_from).transpose()
     }
 
-    /// List all distinct drive IDs present in the inventory.
+    /// List all distinct drive IDs present anywhere in the inventory.
+    ///
+    /// Including task/session/property tables lets startup cleanup find drives
+    /// whose file metadata was already removed by an older app version.
     pub fn list_drive_ids(&self) -> Result<Vec<String>> {
         let mut conn = self.connection()?;
-        file_metadata_dsl::file_metadata
-            .select(file_metadata_dsl::drive_id)
-            .distinct()
-            .load::<String>(&mut conn)
-            .context("Failed to list inventory drive IDs")
+        let mut ids = HashSet::new();
+        ids.extend(
+            file_metadata_dsl::file_metadata
+                .select(file_metadata_dsl::drive_id)
+                .distinct()
+                .load::<String>(&mut conn)
+                .context("Failed to list file metadata drive IDs")?,
+        );
+        ids.extend(
+            task_queue::table
+                .select(task_queue::drive_id)
+                .distinct()
+                .load::<String>(&mut conn)
+                .context("Failed to list task queue drive IDs")?,
+        );
+        ids.extend(
+            upload_sessions::table
+                .select(upload_sessions::drive_id)
+                .distinct()
+                .load::<String>(&mut conn)
+                .context("Failed to list upload session drive IDs")?,
+        );
+        ids.extend(
+            drive_props::table
+                .select(drive_props::drive_id)
+                .distinct()
+                .load::<String>(&mut conn)
+                .context("Failed to list drive property IDs")?,
+        );
+
+        let mut ids = ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids)
     }
 
     /// Query files that are waiting for manual conflict resolution.
@@ -154,10 +232,18 @@ impl InventoryDb {
                         )
                         .execute(tx_conn)? as i64;
 
-                        let prefix = format!("{}/%", path);
+                        // SQLite LIKE has no default escape character. Escape
+                        // wildcard characters in user-controlled file names,
+                        // and use the platform separator so Windows descendant
+                        // rows (which contain backslashes) are actually removed.
+                        let escaped_path = path
+                            .replace('!', "!!")
+                            .replace('%', "!%")
+                            .replace('_', "!_");
+                        let prefix = format!("{}{}%", escaped_path, std::path::MAIN_SEPARATOR);
                         total += diesel::delete(
                             file_metadata_dsl::file_metadata
-                                .filter(file_metadata_dsl::local_path.like(&prefix)),
+                                .filter(file_metadata_dsl::local_path.like(&prefix).escape('!')),
                         )
                         .execute(tx_conn)? as i64;
                     }
@@ -297,7 +383,9 @@ struct FileMetadataChangeset {
     updated_at: i64,
     etag: String,
     metadata: String,
-    props: Option<String>,
+    /// Nested option is required so an entry without props clears stale
+    /// local-only presentation data instead of Diesel skipping the column.
+    props: Option<Option<String>>,
     permissions: String,
     shared: bool,
     size: i64,
@@ -364,7 +452,7 @@ impl TryFrom<&MetadataEntry> for NewFileMetadata {
             props: entry
                 .props
                 .as_ref()
-                .map(|p| serde_json::to_string(p))
+                .map(serde_json::to_string)
                 .transpose()
                 .context("Failed to serialize props field")?,
             permissions: entry.permissions.clone(),
@@ -386,12 +474,14 @@ impl FileMetadataChangeset {
             etag: entry.etag.clone(),
             metadata: serde_json::to_string(&entry.metadata)
                 .context("Failed to serialize metadata map")?,
-            props: entry
-                .props
-                .as_ref()
-                .map(|p| serde_json::to_string(p))
-                .transpose()
-                .context("Failed to serialize props field")?,
+            props: Some(
+                entry
+                    .props
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("Failed to serialize props field")?,
+            ),
             permissions: entry.permissions.clone(),
             shared: entry.shared,
             size: entry.size,
@@ -401,5 +491,151 @@ impl FileMetadataChangeset {
             local_updated_at: entry.local_updated_at.map(Some),
             local_size: entry.local_size.map(Some),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::{NewTaskRecord, TaskStatus};
+
+    fn test_inventory() -> (tempfile::TempDir, InventoryDb) {
+        let temp_dir = tempfile::tempdir().expect("create temp directory");
+        let inventory =
+            InventoryDb::with_path(temp_dir.path().join("inventory.db")).expect("create inventory");
+        (temp_dir, inventory)
+    }
+
+    #[test]
+    fn batch_insert_updates_existing_paths() {
+        let (_temp_dir, inventory) = test_inventory();
+        let drive_id = Uuid::new_v4();
+        let path = "C:\\Cloudreve\\same-file.txt";
+
+        inventory
+            .batch_insert(&[MetadataEntry::new(drive_id, path, false)
+                .with_etag("old")
+                .with_size(10)])
+            .expect("insert initial metadata");
+        inventory
+            .batch_insert(&[MetadataEntry::new(drive_id, path, false)
+                .with_etag("new")
+                .with_size(20)])
+            .expect("upsert repeated metadata");
+
+        let stored = inventory
+            .query_by_path(path)
+            .expect("query metadata")
+            .expect("metadata exists");
+        assert_eq!(inventory.count().expect("count metadata"), 1);
+        assert_eq!(stored.etag, "new");
+        assert_eq!(stored.size, 20);
+    }
+
+    #[test]
+    fn batch_insert_clears_stale_props() {
+        let (_temp_dir, inventory) = test_inventory();
+        let drive_id = Uuid::new_v4();
+        let path = "C:\\Cloudreve\\received-file.txt";
+
+        inventory
+            .batch_insert(&[MetadataEntry::new(drive_id, path, false).with_props(
+                serde_json::json!({
+                    "presented_content_uri": "cloudreve://sender-file@share"
+                }),
+            )])
+            .expect("insert metadata with presentation props");
+        inventory
+            .batch_insert(&[MetadataEntry::new(drive_id, path, false)])
+            .expect("replace metadata without props");
+
+        let stored = inventory
+            .query_by_path(path)
+            .expect("query metadata")
+            .expect("metadata exists");
+        assert_eq!(stored.props, None);
+    }
+
+    #[test]
+    fn query_by_drive_does_not_leak_other_drive_items() {
+        let (_temp_dir, inventory) = test_inventory();
+        let selected = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        inventory
+            .batch_insert(&[
+                MetadataEntry::new(selected, "C:\\Cloudreve\\selected.txt", false),
+                MetadataEntry::new(other, "D:\\OtherCloud\\other.txt", false),
+            ])
+            .expect("insert metadata");
+
+        let items = inventory
+            .query_by_drive(&selected.to_string())
+            .expect("query selected drive");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].local_path, "C:\\Cloudreve\\selected.txt");
+    }
+
+    #[test]
+    fn batch_delete_removes_descendants_with_native_separators_only() {
+        let (_temp_dir, inventory) = test_inventory();
+        let drive_id = Uuid::new_v4();
+        let separator = std::path::MAIN_SEPARATOR;
+        let root = format!("C:{separator}Cloudreve{separator}Shared_100%");
+        let child = format!("{root}{separator}folder{separator}file.txt");
+        let wildcard_sibling =
+            format!("C:{separator}Cloudreve{separator}SharedX100Y{separator}file.txt");
+        let prefix_sibling = format!("{root}-old{separator}file.txt");
+
+        inventory
+            .batch_insert(&[
+                MetadataEntry::new(drive_id, &root, true),
+                MetadataEntry::new(drive_id, &child, false),
+                MetadataEntry::new(drive_id, &wildcard_sibling, false),
+                MetadataEntry::new(drive_id, &prefix_sibling, false),
+            ])
+            .expect("insert metadata");
+
+        inventory
+            .batch_delete_by_path(vec![root.as_str()])
+            .expect("delete subtree");
+
+        assert!(inventory.query_by_path(&root).unwrap().is_none());
+        assert!(inventory.query_by_path(&child).unwrap().is_none());
+        assert!(
+            inventory
+                .query_by_path(&wildcard_sibling)
+                .unwrap()
+                .is_some()
+        );
+        assert!(inventory.query_by_path(&prefix_sibling).unwrap().is_some());
+    }
+
+    #[test]
+    fn nuke_drive_removes_orphaned_task_rows() {
+        let (_temp_dir, inventory) = test_inventory();
+        let drive_id = Uuid::new_v4().to_string();
+        let task = NewTaskRecord::new("task-id", &drive_id, "upload", "C:\\Cloudreve\\orphan.txt");
+        inventory
+            .insert_task_if_not_exist(&task)
+            .expect("insert task");
+
+        assert_eq!(
+            inventory.list_drive_ids().expect("list drive ids"),
+            [drive_id.clone()]
+        );
+        inventory.nuke_drive(&drive_id).expect("nuke drive");
+
+        assert!(
+            inventory
+                .list_drive_ids()
+                .expect("list drive ids")
+                .is_empty()
+        );
+        assert!(
+            inventory
+                .list_tasks(Some(&drive_id), Some(&[TaskStatus::Pending]))
+                .expect("list tasks")
+                .is_empty()
+        );
     }
 }

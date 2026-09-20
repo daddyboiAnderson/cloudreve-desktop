@@ -1,9 +1,12 @@
-use super::{CLSID_EXPLORER_COMMAND, SubCommands};
-use crate::{drive::manager::DriveManager, utils::app::{AppRoot, get_app_root}};
+use super::{SubCommands, CLSID_EXPLORER_COMMAND};
+use crate::{
+    drive::manager::DriveManager,
+    utils::app::{get_app_root, AppRoot},
+};
 use std::sync::Arc;
 use windows::{
-    Win32::{Foundation::*, System::Com::*, UI::Shell::*},
     core::*,
+    Win32::{Foundation::*, System::Com::*, UI::Shell::*},
 };
 
 #[implement(IExplorerCommand)]
@@ -22,6 +25,38 @@ impl CrExplorerCommandHandler {
             app_root: get_app_root(),
             site: std::sync::Mutex::new(None),
         }
+    }
+
+    fn selection_is_in_cloudreve(&self, items: Option<&IShellItemArray>) -> bool {
+        let Some(items) = items else {
+            return false;
+        };
+        unsafe {
+            let Ok(count) = items.GetCount() else {
+                return false;
+            };
+            if count == 0 {
+                return false;
+            }
+            for index in 0..count {
+                let Ok(item) = items.GetItemAt(index) else {
+                    return false;
+                };
+                let Ok(display_name) = item.GetDisplayName(SIGDN_FILESYSPATH) else {
+                    return false;
+                };
+                let Ok(path) = display_name.to_string() else {
+                    return false;
+                };
+                if !matches!(
+                    self.drive_manager.get_inventory().query_by_path(&path),
+                    Ok(Some(_))
+                ) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -45,8 +80,12 @@ impl IExplorerCommand_Impl for CrExplorerCommandHandler_Impl {
         Ok(CLSID_EXPLORER_COMMAND)
     }
 
-    fn GetState(&self, _items: Option<&IShellItemArray>, _oktobeslow: BOOL) -> Result<u32> {
-        Ok(ECS_ENABLED.0 as u32)
+    fn GetState(&self, items: Option<&IShellItemArray>, _oktobeslow: BOOL) -> Result<u32> {
+        Ok(if self.selection_is_in_cloudreve(items) {
+            ECS_ENABLED.0 as u32
+        } else {
+            ECS_HIDDEN.0 as u32
+        })
     }
 
     fn Invoke(

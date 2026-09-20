@@ -6,9 +6,10 @@ use std::{
 
 use crate::cfapi::utility::ToHString;
 use anyhow::Result;
-use flagset::{FlagSet, flags};
+use flagset::{flags, FlagSet};
 use widestring::U16String;
 use windows::{
+    core,
     Foundation::Uri,
     Storage::{
         Provider::{
@@ -20,7 +21,6 @@ use windows::{
         StorageFolder,
         Streams::{DataReader, DataWriter},
     },
-    core,
 };
 
 use super::SyncRootId;
@@ -88,6 +88,16 @@ impl SyncRootInfo {
             .StorageProviderItemPropertyDefinitions()?
             .Append(&property_definition)?;
         Ok(())
+    }
+
+    /// Returns the custom-state identifiers stored in this registration.
+    pub fn custom_state_ids(&self) -> core::Result<Vec<i32>> {
+        let definitions = self.0.StorageProviderItemPropertyDefinitions()?;
+        let mut ids = Vec::with_capacity(definitions.Size()? as usize);
+        for index in 0..definitions.Size()? {
+            ids.push(definitions.GetAt(index)?.Id()?);
+        }
+        Ok(ids)
     }
 
     /// Sets the display name that maps to the existing sync root registration.

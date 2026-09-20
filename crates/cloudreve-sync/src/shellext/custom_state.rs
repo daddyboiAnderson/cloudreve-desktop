@@ -17,7 +17,7 @@ pub const CLSID_CUSTOM_STATE_HANDLER: GUID =
 
 #[implement(IStorageProviderItemPropertySource)]
 pub struct CustomStateHandler {
-     #[allow(dead_code)]
+    #[allow(dead_code)]
     drive_manager: Arc<DriveManager>,
     inventory: Arc<InventoryDb>,
     app_root: AppRoot,
@@ -56,11 +56,27 @@ impl IStorageProviderItemPropertySource_Impl for CustomStateHandler_Impl {
         let image_path = self.app_root.image_path();
         let mut vec = Vec::new();
 
-        if file_metadata.shared {
+        let shared_with_me = file_metadata
+            .metadata
+            .contains_key(cloudreve_api::models::explorer::metadata::SHARE_REDIRECT)
+            || (file_metadata.shared
+                && file_metadata
+                    .props
+                    .as_ref()
+                    .and_then(|props| props.get("owned"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false));
+
+        if file_metadata.shared || shared_with_me {
             let properties = StorageProviderItemProperty::new()?;
             properties.SetId(1)?;
-            properties.SetIconResource(&HSTRING::from(format!("{}\\people.ico,0", image_path)))?;
-            properties.SetValue(&HSTRING::from(t!("shared").as_ref()))?;
+            let (icon, label) = if shared_with_me {
+                ("shared-with-me.ico", t!("sharedWithMe"))
+            } else {
+                ("shared-by-me.ico", t!("sharedByMe"))
+            };
+            properties.SetIconResource(&HSTRING::from(format!("{}\\{},0", image_path, icon)))?;
+            properties.SetValue(&HSTRING::from(label.as_ref()))?;
             vec.push(Some(properties));
         }
 

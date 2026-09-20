@@ -2,6 +2,7 @@ import { Alert, Box, Button, CircularProgress, IconButton, InputAdornment, List,
 import { ContentCopy, FolderOutlined, FolderOpenOutlined, MoreHoriz, OfflinePinOutlined, PeopleOutline, Refresh, Search } from "@mui/icons-material";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { type as platformType } from "@tauri-apps/plugin-os";
 import { useTranslation } from "react-i18next";
 import type { DriveConfig } from "./types";
 import FileIcon from "./FileIcon";
@@ -19,6 +20,7 @@ interface SavedItem {
   share_id: string | null;
   share_count: number;
   expired: boolean;
+  sharing: "shared_by_me" | "shared_with_me" | null;
   drive: DriveConfig;
 }
 
@@ -26,6 +28,8 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
   kind: "pinned" | "shared"; drives: DriveConfig[]; selectedDrive: string | null;
 }) {
   const { t } = useTranslation();
+  const platform = platformType();
+  const fileManagerName = platform === "macos" ? "Finder" : platform === "windows" ? "File Explorer" : "File Manager";
   const [items, setItems] = useState<SavedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -96,7 +100,7 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
           driveId: item.drive.id, uri: item.uri,
         });
         if (command === "unpin") {
-          setNotice(t("popup.pinRemoved", "Keep Downloaded removed from “{{name}}”. Existing downloads stay on this Mac.", { name: item.name }));
+          setNotice(t("popup.pinRemoved", "Keep Downloaded removed from “{{name}}”. Existing downloaded content stays on this device.", { name: item.name }));
           await refresh();
         }
       }
@@ -124,7 +128,9 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
       <Box sx={{ textAlign: "center", py: 5, color: "text.secondary" }}>
         <EmptyIcon sx={{ fontSize: 36, mb: 1, opacity: 0.5 }} />
         <Typography variant="body2">{query ? t("popup.noMatches", "No matching items") : kind === "pinned" ? t("popup.noPins", "Nothing kept downloaded yet") : t("popup.noShares", "No share links in this drive")}</Typography>
-        {!query && kind === "pinned" && <Typography variant="caption" sx={{ display: "block", mt: 0.5 }}>{t("popup.pinHelp", "Choose Keep Downloaded from an item’s Finder menu.")}</Typography>}
+        {!query && kind === "pinned" && <Typography variant="caption" sx={{ display: "block", mt: 0.5 }}>{platform === "windows"
+          ? t("popup.pinHelpWindows", "Choose Always keep on this device from an item’s File Explorer menu.")
+          : t("popup.pinHelpMac", "Choose Keep Downloaded from an item’s Finder menu.")}</Typography>}
       </Box> : <>
         <Typography variant="caption" color="text.secondary">{t("popup.itemCount", "{{count}} items", { count: filtered.length })}{loading ? " · Refreshing…" : ""}</Typography>
         <List disablePadding sx={{ mt: 0.5 }}>
@@ -133,10 +139,16 @@ export default function SavedItems({ kind, drives, selectedDrive }: {
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <Typography title={item.name} variant="body2" noWrap sx={{ fontWeight: 600 }}>{item.name}</Typography>
               <Typography title={displayPath(item.uri)} variant="caption" color="text.secondary" noWrap component="div">{item.drive.name} · {displayPath(item.uri.split("/").slice(3, -1).join("/")) || "/"}</Typography>
+              {item.sharing && <Box sx={{ display: "flex", alignItems: "center", gap: 0.4, color: "primary.main" }}>
+                <PeopleOutline sx={{ fontSize: 14 }} />
+                <Typography variant="caption">{item.sharing === "shared_with_me"
+                  ? t("popup.sharedWithMe", "Shared with me")
+                  : t("popup.sharedByMe", "Shared by me")}</Typography>
+              </Box>}
               {item.expired && <Typography variant="caption" color="warning.main">{t("popup.expiredLink", "Expired link")}</Typography>}
               {item.share_count > 1 && <Typography variant="caption" color="text.secondary">{t("popup.linkCount", "{{count}} share links", { count: item.share_count })}</Typography>}
             </Box>
-            <Tooltip title={t("popup.showInFinder", "Show in Finder")}><span><IconButton size="small" aria-label={`Show ${item.name} in Finder`} disabled={busy} onClick={() => void action(item, "reveal")}><FolderOpenOutlined fontSize="small" /></IconButton></span></Tooltip>
+            <Tooltip title={t("popup.showInFileManager", "Show in {{fileManager}}", { fileManager: fileManagerName })}><span><IconButton size="small" aria-label={`Show ${item.name} in ${fileManagerName}`} disabled={busy} onClick={() => void action(item, "reveal")}><FolderOpenOutlined fontSize="small" /></IconButton></span></Tooltip>
             <IconButton size="small" aria-label={`Actions for ${item.name}`} disabled={busy} onClick={e => setMenu({ anchor: e.currentTarget, item })}><MoreHoriz fontSize="small" /></IconButton>
           </ListItem>)}
         </List>

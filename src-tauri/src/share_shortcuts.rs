@@ -134,12 +134,14 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_cycles_and_permission_errors() {
-        assert!(resolve("cloudreve://my/loop", |_| async {
-            Ok(Some("cloudreve://my/loop".into()))
-        })
-        .await
-        .unwrap_err()
-        .contains("circular"));
+        assert!(
+            resolve("cloudreve://my/loop", |_| async {
+                Ok(Some("cloudreve://my/loop".into()))
+            })
+            .await
+            .unwrap_err()
+            .contains("circular")
+        );
         assert_eq!(
             resolve("cloudreve://my/denied/file", |_| async {
                 Err("Permission denied".into())

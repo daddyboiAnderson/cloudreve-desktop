@@ -11,5 +11,6 @@ pub mod placeholder;
 #[path = "placeholder_non_windows.rs"]
 pub mod placeholder;
 pub mod remote_events;
+pub mod share_shortcuts;
 pub mod sync;
 pub mod utils;

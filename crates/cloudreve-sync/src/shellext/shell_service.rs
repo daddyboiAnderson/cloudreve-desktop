@@ -1,18 +1,20 @@
 use super::context_menu::*;
 use crate::drive::manager::DriveManager;
-use crate::shellext::custom_state::{CLSID_CUSTOM_STATE_HANDLER, CustomStateHandlerFactory};
-use crate::shellext::status_ui::{
-    CLSID_STATUS_UI_HANDLER, StatusUIHandlerFactoryFactory,
-};
-use crate::shellext::thumbnail::{CLSID_THUMBNAIL_PROVIDER, ThumbnailProviderFactory};
-use crate::shellext::toast::{CLSID_TOAST_ACTIVATOR, ToastActivatorFactory};
-use std::sync::{Arc, mpsc};
+use crate::shellext::custom_state::{CustomStateHandlerFactory, CLSID_CUSTOM_STATE_HANDLER};
+use crate::shellext::status_ui::{StatusUIHandlerFactoryFactory, CLSID_STATUS_UI_HANDLER};
+use crate::shellext::thumbnail::{ThumbnailProviderFactory, CLSID_THUMBNAIL_PROVIDER};
+use crate::shellext::toast::{ToastActivatorFactory, CLSID_TOAST_ACTIVATOR};
+use std::sync::{mpsc, Arc};
 use std::thread;
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoWaitForMultipleHandles};
+use windows::Win32::System::Com::{CoWaitForMultipleHandles, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::CreateEventW;
 use windows::{
-    Win32::{Foundation::*, System::Com::*},
     core::*,
+    Win32::{
+        Foundation::*,
+        System::Com::*,
+        UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST},
+    },
 };
 
 pub fn init_and_start_service_task(drive_manager: Arc<DriveManager>) -> ServiceHandle {
@@ -58,6 +60,13 @@ pub fn init_and_start_service_task(drive_manager: Arc<DriveManager>) -> ServiceH
             return;
         }
 
+        // Package upgrades can leave Explorer using its previous extension
+        // cache for the rest of the session. Ask the shell to reload handler
+        // associations after every successful service initialization.
+        unsafe {
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        }
+
         // Notify that initialization is complete
         let _ = tx.send(Ok(()));
 
@@ -74,7 +83,7 @@ pub fn init_and_start_service_task(drive_manager: Arc<DriveManager>) -> ServiceH
 }
 
 pub struct ServiceHandle {
-     #[allow(dead_code)]
+    #[allow(dead_code)]
     thread: Option<thread::JoinHandle<()>>,
     init_result: mpsc::Receiver<windows::core::Result<()>>,
 }

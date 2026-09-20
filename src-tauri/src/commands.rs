@@ -48,15 +48,48 @@ use tauri::{
     webview::{WebviewWindow, WebviewWindowBuilder},
     AppHandle, Emitter, Manager, State, WebviewUrl,
 };
-#[cfg(windows)]
-use tauri_plugin_frame::WebviewWindowExt;
 use tauri_plugin_positioner::{Position, WindowExt};
 use uuid::Uuid;
 #[cfg(windows)]
 use windows::ApplicationModel::{StartupTask, StartupTaskState};
+#[cfg(windows)]
+use windows::Win32::UI::Shell::SHCNE_UPDATEITEM;
 
 /// Result type for Tauri commands
 type CommandResult<T> = Result<T, String>;
+
+#[cfg(windows)]
+pub(crate) fn update_windows_shared_state(
+    mount: &cloudreve_sync::drive::mounts::Mount,
+    config: &DriveConfig,
+    source_uri: &str,
+    shared: bool,
+) -> CommandResult<()> {
+    use cloudreve_sync::{
+        drive::utils::{notify_shell_change, remote_path_to_local_relative_path},
+        inventory::MetadataEntry,
+    };
+
+    let source = CrUri::new(source_uri).map_err(|error| error.to_string())?;
+    let root = CrUri::new(&config.remote_path).map_err(|error| error.to_string())?;
+    let relative =
+        remote_path_to_local_relative_path(&source, &root).map_err(|error| error.to_string())?;
+    let local_path = config.sync_path.join(relative);
+    if let Some(metadata) = mount
+        .inventory
+        .query_by_path(local_path.to_string_lossy().as_ref())
+        .map_err(|error| error.to_string())?
+    {
+        let mut entry = MetadataEntry::from(&metadata);
+        entry.shared = shared;
+        mount
+            .inventory
+            .update(&entry)
+            .map_err(|error| error.to_string())?;
+    }
+    notify_shell_change(&local_path, SHCNE_UPDATEITEM).map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 #[cfg(target_os = "macos")]
 static MAIN_POPUP_FOCUS_LOST_AT_MS: AtomicU64 = AtomicU64::new(0);
@@ -287,6 +320,7 @@ pub async fn get_share_target(
         })
         .await
         .map_err(|error| error.to_string())?;
+    let server_reports_shared = file.shared.unwrap_or(false);
 
     let file_path = file.path.clone();
     let mut shares = file
@@ -320,6 +354,14 @@ pub async fn get_share_target(
                 .collect();
         }
     }
+
+    #[cfg(windows)]
+    update_windows_shared_state(
+        &mount,
+        &config,
+        &uri,
+        server_reports_shared || !shares.is_empty(),
+    )?;
 
     // The extended file response is the authoritative share state for this
     // item. Refresh its Finder decoration when the Share window is opened.
@@ -372,7 +414,6 @@ pub async fn create_share_link(
 ) -> CommandResult<String> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
     let mut request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
-    #[cfg(target_os = "macos")]
     let source_uri = request.uri.clone();
     request.uri = resolve_share_uri(&mount.cr_client, &request.uri).await?;
     let url = mount
@@ -380,6 +421,8 @@ pub async fn create_share_link(
         .create_share_link(&request)
         .await
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    update_windows_shared_state(&mount, &config, &source_uri, true)?;
     #[cfg(target_os = "macos")]
     signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&source_uri));
     Ok(url)
@@ -395,7 +438,6 @@ pub async fn edit_share_link(
 ) -> CommandResult<String> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
     let mut request = share_request_for_drive(request, &config.remote_path, &config.user_id)?;
-    #[cfg(target_os = "macos")]
     let source_uri = request.uri.clone();
     request.uri = resolve_share_uri(&mount.cr_client, &request.uri).await?;
     let url = mount
@@ -403,6 +445,8 @@ pub async fn edit_share_link(
         .edit_share_link(&share_id, &request)
         .await
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    update_windows_shared_state(&mount, &config, &source_uri, true)?;
     #[cfg(target_os = "macos")]
     signal_share_metadata_refresh(&drive_id, &config.name, std::slice::from_ref(&source_uri));
     Ok(url)
@@ -452,7 +496,6 @@ pub async fn delete_share_link(
     share_id: String,
 ) -> CommandResult<()> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
-    #[cfg(target_os = "macos")]
     let source_uri = mount
         .cr_client
         .get_share_link_info(&share_id)
@@ -464,6 +507,21 @@ pub async fn delete_share_link(
         .delete_share_link(&share_id)
         .await
         .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    if let Some(source_uri) = source_uri.as_deref() {
+        let still_shared = mount
+            .cr_client
+            .get_file_info(&GetFileInfoService {
+                uri: Some(source_uri.to_string()),
+                id: None,
+                extended: Some(true),
+                folder_summary: None,
+            })
+            .await
+            .map(|file| file.shared.unwrap_or(false))
+            .unwrap_or(false);
+        update_windows_shared_state(&mount, &config, source_uri, still_shared)?;
+    }
     #[cfg(target_os = "macos")]
     let source_uris = source_uri.into_iter().collect::<Vec<_>>();
     #[cfg(target_os = "macos")]
@@ -541,6 +599,15 @@ fn stable_drive_id(instance_url: &str, user_id: &str, remote_path: &str) -> Stri
     Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
 }
 
+fn same_cloudreve_root(existing: &DriveConfig, requested: &AddDriveArgs) -> bool {
+    existing
+        .instance_url
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(requested.site_url.trim_end_matches('/'))
+        && existing.user_id == requested.user_id
+        && existing.remote_path.trim_end_matches('/') == requested.remote_path.trim_end_matches('/')
+}
+
 /// Add a new drive configuration
 #[tauri::command]
 pub async fn add_drive(
@@ -559,6 +626,24 @@ pub async fn add_drive(
     // Validate local_path for new drives (not for reauthorization)
     if config.drive_id.is_none() && is_root_drive(&config.local_path) {
         return Err(t!("localPathCannotBeRootDrive").to_string());
+    }
+
+    // Logging in again must not mount the same Cloudreve account/root a
+    // second time. Besides showing duplicate drives, two mounts can compete
+    // for the same files and make a first-time sync look like uploads.
+    if config.drive_id.is_none() {
+        if let Some(existing) = app_state
+            .drive_manager
+            .list_drives()
+            .await
+            .into_iter()
+            .find(|existing| same_cloudreve_root(existing, &config))
+        {
+            return Err(format!(
+                "This Cloudreve drive is already connected at {}. Remove it in Settings before adding it again.",
+                existing.sync_path.display()
+            ));
+        }
     }
 
     // Convert relative expiry times (seconds) to absolute RFC3339 timestamps
@@ -1432,6 +1517,9 @@ fn show_main_window_at_position(app: &AppHandle, position: Position) {
 /// This will open the parent folder and select/highlight the file.
 #[tauri::command]
 pub async fn show_file_in_explorer(path: String) -> CommandResult<()> {
+    #[cfg(windows)]
+    crate::windows_shell::reveal_item(path).await?;
+    #[cfg(not(windows))]
     showfile::show_path_in_file_manager(&path);
     Ok(())
 }
@@ -1692,11 +1780,16 @@ fn focus_drive_window(window: &WebviewWindow) {
         let window = window.clone();
         let app = window.app_handle().clone();
         if let Err(error) = app.run_on_main_thread(move || {
-            let Some(mtm) = MainThreadMarker::new() else { return };
-            let Ok(handle) = window.ns_window() else { return };
+            let Some(mtm) = MainThreadMarker::new() else {
+                return;
+            };
+            let Ok(handle) = window.ns_window() else {
+                return;
+            };
             let native = unsafe { &*handle.cast::<NSWindow>() };
             // Bring the login window to the Space where the browser is open.
-            let behavior = native.collectionBehavior()
+            let behavior = native
+                .collectionBehavior()
                 .difference(NSWindowCollectionBehavior::CanJoinAllSpaces)
                 | NSWindowCollectionBehavior::MoveToActiveSpace;
             native.setCollectionBehavior(behavior);
@@ -1773,8 +1866,8 @@ fn show_drive_window_internal(app: &AppHandle, title: &str, url_path: &str) {
             }
 
             move_window_safely(&window, Position::Center, "add-drive");
-            #[cfg(windows)]
-            let _ = window.create_overlay_titlebar();
+            // Keep the React title bar on Windows. The frame plugin's injected
+            // controls require `withGlobalTauri`, which is intentionally disabled.
             focus_drive_window(&window);
         }
         Err(e) => {
@@ -1855,8 +1948,8 @@ pub fn show_settings_window_impl(app: &AppHandle) {
             }
 
             move_window_safely(&window, Position::Center, "settings");
-            #[cfg(windows)]
-            let _ = window.create_overlay_titlebar();
+            // Use the same React close control as the Share window; an injected
+            // frame would cover it with controls that cannot access the Tauri API.
             let _ = window.show();
             let _ = window.set_focus();
             #[cfg(target_os = "macos")]
@@ -2183,6 +2276,9 @@ pub async fn open_log_folder() -> CommandResult<()> {
         std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     }
 
-    showfile::show_path_in_file_manager(format!("{}\\", log_dir.display()));
+    #[cfg(windows)]
+    crate::windows_shell::reveal_item(log_dir).await?;
+    #[cfg(not(windows))]
+    showfile::show_path_in_file_manager(log_dir);
     Ok(())
 }

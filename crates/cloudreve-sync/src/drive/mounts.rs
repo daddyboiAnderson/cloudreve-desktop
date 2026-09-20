@@ -23,7 +23,9 @@ use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+#[cfg(windows)]
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -38,9 +40,41 @@ use url::Url;
 use windows::Storage::Provider::StorageProviderSyncRootManager;
 
 #[cfg(windows)]
+const SYNC_ROOT_REGISTRATION_VERSION: &str = "1.1.0";
+
+#[cfg(windows)]
 type MountConnection = Connection<CallbackHandler>;
 #[cfg(not(windows))]
 type MountConnection = Connection<()>;
+
+/// A short-lived, process-local record of received-share shortcut roots whose
+/// deletion has started. CFAPI callbacks are synchronous, so the registry uses
+/// a small standard mutex and can be updated before Windows proceeds with the
+/// recursive removal.
+#[derive(Clone, Default)]
+pub(crate) struct DeletedShareShortcutTombstones {
+    roots: Arc<std::sync::Mutex<HashMap<PathBuf, Instant>>>,
+}
+
+impl DeletedShareShortcutTombstones {
+    pub(crate) fn remember(&self, path: PathBuf) {
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        roots.insert(path, Instant::now());
+    }
+
+    pub(crate) fn recent_roots(&self, ttl: Duration) -> Vec<PathBuf> {
+        let now = Instant::now();
+        let mut roots = self
+            .roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        roots.retain(|_, deleted_at| now.saturating_duration_since(*deleted_at) <= ttl);
+        roots.keys().cloned().collect()
+    }
+}
 
 /// Derive the API client ID sent as `X-Cr-Client-Id`. Historically the raw
 /// drive UUID was used; flipping the first hex nibble keeps it stable per
@@ -158,7 +192,7 @@ pub struct Mount {
     command_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<MountCommand>>>>,
     processor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     props_refresh_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     share_poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     remote_event_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     initial_sync_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -174,6 +208,16 @@ pub struct Mount {
     pub ignore_matcher: RwLock<IgnoreMatcher>,
     /// Status flags for the mount (credential expired, event push subscribed, etc.)
     status_flags: Mutex<MountStatusFlags>,
+    /// Short-lived guard for delayed descendant remove notifications emitted
+    /// after Explorer has already removed a received-share shortcut and its
+    /// inventory subtree.
+    pub(crate) recently_deleted_share_shortcuts: DeletedShareShortcutTombstones,
+    /// Folder pin notifications can be coalesced by the Windows filesystem
+    /// watcher. Keep one explicit recursive hydration pass per root in flight
+    /// so "Always keep on this device" remains reliable even when the user
+    /// pins several items in quick succession.
+    #[cfg(windows)]
+    pub(crate) pinned_hydration_roots: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl Mount {
@@ -273,7 +317,7 @@ impl Mount {
             command_rx: Arc::new(tokio::sync::Mutex::new(Some(command_rx))),
             processor_handle: Arc::new(tokio::sync::Mutex::new(None)),
             props_refresh_handle: Arc::new(tokio::sync::Mutex::new(None)),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             share_poll_handle: Arc::new(tokio::sync::Mutex::new(None)),
             remote_event_handle: Arc::new(tokio::sync::Mutex::new(None)),
             initial_sync_handle: Arc::new(tokio::sync::Mutex::new(None)),
@@ -287,6 +331,9 @@ impl Mount {
             event_blocker: EventBlocker::new(),
             ignore_matcher: RwLock::new(ignore_matcher),
             status_flags: Mutex::new(MountStatusFlags::new()),
+            recently_deleted_share_shortcuts: DeletedShareShortcutTombstones::default(),
+            #[cfg(windows)]
+            pinned_hydration_roots: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -453,8 +500,34 @@ impl Mount {
 
             let sync_root_id = config.sync_root_id.as_ref().unwrap();
 
-            // Register sync root if not registered
-            if !sync_root_id.is_registered()? {
+            let registered = sync_root_id.is_registered()?;
+            let registration_needs_refresh = if registered {
+                match sync_root_id.info() {
+                    Ok(info) => {
+                        let custom_states = info.custom_state_ids().unwrap_or_default();
+                        info.version() != std::ffi::OsStr::new(SYNC_ROOT_REGISTRATION_VERSION)
+                            || !custom_states.contains(&1)
+                            || !custom_states.contains(&2)
+                    }
+                    Err(error) => {
+                        tracing::warn!(target: "drive::mounts", id = %self.id, error = %error, "Could not inspect sync root registration; refreshing it");
+                        true
+                    }
+                }
+            } else {
+                false
+            };
+
+            // Registration metadata is immutable. Re-register once when its
+            // schema changes so existing drives gain new Explorer states.
+            if registration_needs_refresh {
+                tracing::info!(target: "drive::mounts", id = %self.id, "Refreshing sync root registration");
+                sync_root_id
+                    .unregister()
+                    .context("failed to refresh sync root registration")?;
+            }
+
+            if !registered || registration_needs_refresh {
                 tracing::info!(target: "drive::mounts", id = %self.id, "Registering sync root");
                 let mut sync_root_info = SyncRootInfo::default();
                 sync_root_info.set_display_name(config.name.clone());
@@ -463,7 +536,7 @@ impl Mount {
                 if let Some(icon_path) = config.icon_path.as_ref() {
                     sync_root_info.set_icon(format!("{},0", icon_path));
                 }
-                sync_root_info.set_version("1.0.0");
+                sync_root_info.set_version(SYNC_ROOT_REGISTRATION_VERSION);
                 sync_root_info
                     .set_recycle_bin_uri(
                         recycle_bin_url(&config)
@@ -493,6 +566,7 @@ impl Mount {
                         self.command_tx.clone(),
                         self.id.clone(),
                         self.inventory.clone(),
+                        self.recently_deleted_share_shortcuts.clone(),
                     ),
                 )
                 .context("failed to connect to sync root")?;
@@ -763,7 +837,7 @@ impl Mount {
         }
 
         // Stop the share poll task
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(handle) = self.share_poll_handle.lock().await.take() {
             tracing::debug!(target: "drive::mounts", id=%self.id, "Stopping share poll task");
             handle.abort();
@@ -829,7 +903,8 @@ impl Mount {
         *self.props_refresh_handle.lock().await = Some(handle);
     }
 
-    /// Spawn the periodic share-state poll (macOS File Provider only).
+    /// Spawn the periodic share-state poll for platforms whose native file
+    /// presentation needs an explicit metadata refresh.
     ///
     /// Cloudreve does not emit file events when shares are created or
     /// removed (verified against the raw SSE stream), and the share list API
@@ -838,26 +913,40 @@ impl Mount {
     /// active share IDs changes, trigger a working-set reconciliation. Share
     /// responses omit source IDs and paths, so the exact changed item cannot
     /// be identified safely from this endpoint.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub async fn spawn_share_poll_task(self: &Arc<Self>) {
         use cloudreve_api::api::share::ShareApi;
         use cloudreve_api::models::share::ListShareService;
 
         let mount = self.clone();
         let mount_id = self.id.clone();
-        let drive_name = self.config.read().await.name.clone();
+        let config = self.config.read().await;
+        #[cfg(target_os = "macos")]
+        let drive_name = config.name.clone();
+        #[cfg(windows)]
+        let sync_path = config.sync_path.clone();
+        drop(config);
+        #[cfg(target_os = "macos")]
         let share_state_path = dirs::home_dir().map(|home| {
-            home.join(".cloudreve").join("fp-share-state").join(format!("{mount_id}.json"))
+            home.join(".cloudreve")
+                .join("fp-share-state")
+                .join(format!("{mount_id}.json"))
         });
 
         let handle = spawn(async move {
             let interval = Duration::from_secs(10);
             // The first poll establishes the baseline and repairs stale share
             // flags left behind by a previous process.
+            #[cfg(target_os = "macos")]
             let mut known: Option<std::collections::BTreeMap<String, String>> = share_state_path
                 .as_ref()
                 .and_then(|path| std::fs::read(path).ok())
                 .and_then(|data| serde_json::from_slice(&data).ok());
+            // Windows deliberately starts without a persisted baseline. The
+            // first pass repairs Explorer state for Web UI changes made while
+            // the desktop client was not running.
+            #[cfg(windows)]
+            let mut known: Option<std::collections::BTreeMap<String, String>> = None;
             // Let the initial SSE subscription reconciliation finish first so
             // File Provider does not coalesce the two independent signals.
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -907,25 +996,49 @@ impl Mount {
                         initial = known.is_none(),
                         "Share set changed, refreshing cached File Provider metadata"
                     );
-                    if let Some(previous) = &known {
-                        let mut names = std::collections::BTreeSet::new();
-                        for (id, name) in previous {
-                            if shares.get(id) != Some(name) && !name.is_empty() {
-                                names.insert(name.clone());
+                    #[cfg(target_os = "macos")]
+                    {
+                        if let Some(previous) = &known {
+                            let mut names = std::collections::BTreeSet::new();
+                            for (id, name) in previous {
+                                if shares.get(id) != Some(name) && !name.is_empty() {
+                                    names.insert(name.clone());
+                                }
                             }
-                        }
-                        for (id, name) in &shares {
-                            if previous.get(id) != Some(name) && !name.is_empty() {
-                                names.insert(name.clone());
+                            for (id, name) in &shares {
+                                if previous.get(id) != Some(name) && !name.is_empty() {
+                                    names.insert(name.clone());
+                                }
                             }
+                            crate::fileprovider::signal_metadata_name_refresh(
+                                &mount_id,
+                                &drive_name,
+                                &names.into_iter().collect::<Vec<_>>(),
+                            );
+                        } else {
+                            crate::fileprovider::signal_metadata_refresh(
+                                &mount_id,
+                                &drive_name,
+                                &[],
+                            );
                         }
-                        crate::fileprovider::signal_metadata_name_refresh(
-                            &mount_id, &drive_name, &names.into_iter().collect::<Vec<_>>());
-                    } else {
-                        crate::fileprovider::signal_metadata_refresh(&mount_id, &drive_name, &[]);
+                    }
+                    #[cfg(windows)]
+                    if let Err(error) = mount.command_tx.send(MountCommand::Sync {
+                        local_paths: vec![sync_path.clone()],
+                        mode: crate::drive::sync::SyncMode::FullHierarchy,
+                        user_initiated: false,
+                    }) {
+                        tracing::warn!(
+                            target: "drive::mounts",
+                            id = %mount_id,
+                            error = %error,
+                            "Could not queue share metadata reconciliation"
+                        );
                     }
                 }
                 known = Some(shares);
+                #[cfg(target_os = "macos")]
                 if let (Some(path), Some(current)) = (&share_state_path, &known) {
                     if let Some(parent) = path.parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -1108,4 +1221,53 @@ mod tests {
         assert!(mount.processor_handle.lock().await.is_none());
     }
 
+    #[test]
+    fn deleted_share_shortcut_tombstone_is_visible_to_all_clones() {
+        let tombstones = DeletedShareShortcutTombstones::default();
+        let callback_view = tombstones.clone();
+        let root = PathBuf::from("C:\\Cloudreve\\Received");
+
+        callback_view.remember(root.clone());
+
+        assert_eq!(tombstones.recent_roots(Duration::from_secs(60)), [root]);
+    }
+
+    #[tokio::test]
+    async fn programmatic_received_delete_is_blocked_and_premarked() {
+        let temp_dir = TempDir::new().unwrap();
+        let mount = create_test_mount(&temp_dir).await;
+        let path = mount.get_sync_path().await.join("received-folder");
+        std::fs::create_dir(&path).expect("create received folder");
+        mount
+            .inventory
+            .insert(
+                &crate::inventory::MetadataEntry::new(
+                    uuid::Uuid::new_v4(),
+                    path.to_string_lossy(),
+                    true,
+                )
+                .with_props(serde_json::json!({
+                    "presented_content_uri": "cloudreve://share-id@shared_with_me/folder",
+                    "owned": false
+                })),
+            )
+            .expect("insert received inventory entry");
+
+        mount
+            .prepare_local_placeholder_deletion(&path)
+            .expect("prepare programmatic deletion");
+
+        assert_eq!(
+            mount
+                .recently_deleted_share_shortcuts
+                .recent_roots(Duration::from_secs(60)),
+            [path.clone()]
+        );
+        assert!(mount.event_blocker.should_block(
+            &notify_debouncer_full::notify::EventKind::Remove(
+                notify_debouncer_full::notify::event::RemoveKind::Any
+            ),
+            &path
+        ));
+    }
 }

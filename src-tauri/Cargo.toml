@@ -50,7 +50,14 @@ tauri-plugin-frame = "1.1.6"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58.0"
-features = ["Foundation", "ApplicationModel"]
+features = [
+    "Foundation",
+    "ApplicationModel",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"

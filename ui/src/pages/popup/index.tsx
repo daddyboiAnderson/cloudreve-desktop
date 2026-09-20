@@ -39,7 +39,9 @@ export default function Popup() {
   const [view, setView] = useState<"recent" | "pinned" | "shared">("recent");
   const isFetchingRef = useRef(false);
   const suppressBlurCloseUntilRef = useRef(0);
-  const isMacOS = platformType() === "macos";
+  const platform = platformType();
+  const isMacOS = platform === "macos";
+  const supportsKeepDownloadedOverview = isMacOS || platform === "windows";
 
   // Close the tray popup on ordinary focus loss, but keep it alive while a native
   // context menu is open. On Linux/Wayland and macOS, opening the browser/system
@@ -237,7 +239,7 @@ export default function Popup() {
             "& .MuiToggleButton-root.Mui-selected, & .MuiToggleButton-root.Mui-selected:hover": { bgcolor: "background.paper", color: "text.primary", fontWeight: 600, boxShadow: "none" },
             "& .MuiToggleButton-root.Mui-focusVisible": { outline: "2px solid", outlineColor: "primary.main", outlineOffset: -2, boxShadow: "none" } }}>
           <ToggleButton value="recent">{t("popup.recent", "Recent")}{conflictCount > 0 ? ` · ${conflictCount}` : ""}</ToggleButton>
-          {isMacOS && <ToggleButton value="pinned">{t("popup.keepDownloaded", "Keep Downloaded")}</ToggleButton>}
+          {supportsKeepDownloadedOverview && <ToggleButton value="pinned">{t("popup.keepDownloaded", "Keep Downloaded")}</ToggleButton>}
           <ToggleButton value="shared">{t("popup.sharedByMe", "Shared by me")}</ToggleButton>
         </ToggleButtonGroup>
       </Box>

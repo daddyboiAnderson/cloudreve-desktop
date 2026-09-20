@@ -1,18 +1,20 @@
 use anyhow::Context;
 mod saved_items;
+#[cfg(windows)]
+mod windows_shell;
 use cloudreve_sync::{
-    shellext::shell_service::ServiceHandle, ConfigManager, DriveManager, EventBroadcaster,
-    LogConfig, LogGuard,
+    ConfigManager, DriveManager, EventBroadcaster, LogConfig, LogGuard,
+    shellext::shell_service::ServiceHandle,
 };
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 use tauri::{
+    AppHandle, Listener, Manager, RunEvent,
     async_runtime::spawn,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Listener, Manager, RunEvent,
 };
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_deep_link::DeepLinkExt;
@@ -24,12 +26,12 @@ use crate::commands::{
     handle_deep_link, show_add_drive_window_impl, show_main_window, show_settings_window_impl,
 };
 mod commands;
-mod share_shortcuts;
-#[cfg(target_os = "macos")]
-mod received_folder_icons;
 mod event_handler;
 #[cfg(target_os = "macos")]
 mod file_provider_issue;
+#[cfg(target_os = "macos")]
+mod received_folder_icons;
+mod share_shortcuts;
 #[cfg(target_os = "macos")]
 mod upload_conflict;
 

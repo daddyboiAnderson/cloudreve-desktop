@@ -12,6 +12,12 @@ use cloudreve_api::{
 use std::collections::{HashMap, HashSet};
 use tauri::State;
 
+#[cfg(windows)]
+use cloudreve_sync::{
+    cfapi::placeholder::{LocalFileInfo, PinOptions, PinState, Placeholder},
+    drive::{sync::SyncMode, utils::local_path_to_cr_uri},
+};
+
 #[derive(serde::Serialize)]
 pub struct SavedItem {
     uri: String,
@@ -21,6 +27,98 @@ pub struct SavedItem {
     share_id: Option<String>,
     share_count: usize,
     expired: bool,
+    sharing: Option<String>,
+}
+
+fn sharing_kind(metadata: &cloudreve_sync::inventory::FileMetadata) -> Option<String> {
+    if metadata
+        .metadata
+        .contains_key(cloudreve_api::models::explorer::metadata::SHARE_REDIRECT)
+        || metadata
+            .props
+            .as_ref()
+            .and_then(|props| props.get("owned"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        Some("shared_with_me".into())
+    } else if metadata.shared {
+        Some("shared_by_me".into())
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_pinned_items(
+    state: &State<'_, AppStateHandle>,
+    drive_id: &str,
+    config: &cloudreve_sync::drive::mounts::DriveConfig,
+) -> Result<Vec<SavedItem>, String> {
+    let app_state = state
+        .get()
+        .ok_or_else(|| "App not yet initialized".to_string())?;
+    let inventory = app_state.drive_manager.get_inventory();
+    let root = config.sync_path.clone();
+    let mut candidates = Vec::new();
+
+    if let Ok(info) = LocalFileInfo::from_path(&root) {
+        if info.exists && info.is_placeholder() && info.pinned() == PinState::Pinned {
+            candidates.push((root.clone(), true, None));
+        }
+    }
+
+    for metadata in inventory
+        .query_by_drive(drive_id)
+        .map_err(|error| error.to_string())?
+    {
+        let path = std::path::PathBuf::from(&metadata.local_path);
+        let Ok(info) = LocalFileInfo::from_path(&path) else {
+            continue;
+        };
+        if info.exists && info.is_placeholder() && info.pinned() == PinState::Pinned {
+            candidates.push((path, metadata.is_folder, sharing_kind(&metadata)));
+        }
+    }
+
+    // Windows applies a recursive pin to descendants. Present the selected
+    // folder once instead of flooding the overview with every pinned child.
+    candidates.sort_by_key(|(path, _, _)| path.components().count());
+    let mut pinned_folders = Vec::<std::path::PathBuf>::new();
+    let mut items = Vec::new();
+    for (path, is_folder, sharing) in candidates {
+        if pinned_folders
+            .iter()
+            .any(|folder| path != *folder && path.starts_with(folder))
+        {
+            continue;
+        }
+        let uri = local_path_to_cr_uri(path.clone(), root.clone(), config.remote_path.clone())
+            .map_err(|error| error.to_string())?
+            .to_string();
+        let name = if path == root {
+            config.name.clone()
+        } else {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| config.name.clone())
+        };
+        if is_folder {
+            pinned_folders.push(path);
+        }
+        items.push(SavedItem {
+            uri,
+            name,
+            is_folder,
+            share_url: None,
+            share_id: None,
+            share_count: 0,
+            expired: false,
+            sharing,
+        });
+    }
+    items.sort_by_key(|item| item.name.to_lowercase());
+    Ok(items)
 }
 
 #[cfg(target_os = "macos")]
@@ -46,6 +144,8 @@ pub async fn list_saved_items(
 ) -> Result<Vec<SavedItem>, String> {
     let (mount, config) = get_share_mount(&state, &drive_id).await?;
     if kind == "pinned" {
+        #[cfg(windows)]
+        return windows_pinned_items(&state, &drive_id, &config);
         #[cfg(target_os = "macos")]
         {
             let pins: Vec<String> = read_state(&format!("pinned-{drive_id}.json"))?;
@@ -84,13 +184,14 @@ pub async fn list_saved_items(
                     share_id: None,
                     share_count: 0,
                     expired: false,
+                    sharing: None,
                 });
             }
             items.sort_by_key(|i| i.name.to_lowercase());
             return Ok(items);
         }
-        #[cfg(not(target_os = "macos"))]
-        return Err("Keep Downloaded is available on macOS".into());
+        #[cfg(not(any(target_os = "macos", windows)))]
+        return Err("Keep Downloaded is not available on this platform".into());
     }
     if kind != "shared" {
         return Err("Unknown saved item view".into());
@@ -135,13 +236,14 @@ pub async fn list_saved_items(
                 share_id: Some(share.id),
                 share_count: 1,
                 expired: share.expired.unwrap_or(false),
+                sharing: Some("shared_by_me".into()),
             });
         }
         token = response.pagination.next_token.filter(|s| !s.is_empty());
         match &token {
             None => break,
             Some(t) if !tokens.insert(t.clone()) => {
-                return Err("Share pagination did not advance".into())
+                return Err("Share pagination did not advance".into());
             }
             _ => {}
         }
@@ -164,6 +266,15 @@ pub async fn list_saved_items(
     }
     let mut items: Vec<_> = grouped.into_values().collect();
     items.sort_by_key(|i| i.name.to_lowercase());
+    #[cfg(windows)]
+    for item in &items {
+        if item.sharing.as_deref() == Some("shared_by_me") {
+            // The server share list can change without changing file content or
+            // etag. Reconcile Explorer's cached custom state while this view is
+            // refreshed, including shares created by another client.
+            crate::commands::update_windows_shared_state(&mount, &config, &item.uri, true)?;
+        }
+    }
     Ok(items)
 }
 
@@ -285,6 +396,7 @@ async fn received_share_items(
                     share_id: Some(share.id),
                     share_count: 1,
                     expired: share.expired.unwrap_or(false),
+                    sharing: Some("shared_by_me".into()),
                 });
             }
         }
@@ -435,7 +547,7 @@ pub async fn reveal_saved_item(
     drive_id: String,
     uri: String,
 ) -> Result<(), String> {
-    let (_, config) = get_share_mount(&state, &drive_id).await?;
+    let (mount, config) = get_share_mount(&state, &drive_id).await?;
     let uri = validate_share_uri(&uri, &config.remote_path, &config.user_id)?;
     #[cfg(target_os = "macos")]
     let root = cloudreve_sync::fileprovider::user_visible_url(
@@ -446,12 +558,55 @@ pub async fn reveal_saved_item(
     .ok_or("Drive is unavailable in Finder")?;
     #[cfg(not(target_os = "macos"))]
     let root = config.sync_path.clone();
-    let path = std::path::Path::new(&root).join(relative_path(&uri, &config.remote_path)?);
+    let relative = relative_path(&uri, &config.remote_path)?;
+    let path = std::path::Path::new(&root).join(&relative);
+    #[cfg(windows)]
     if !path.exists() {
+        // A received-share shortcut may not have been enumerated in Explorer
+        // yet. Materialize every missing parent in order, then populate the
+        // requested folder's first layer so the click can open it immediately.
+        let components = std::path::Path::new(&relative)
+            .components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect::<Vec<_>>();
+        let mut candidate = std::path::PathBuf::from(&root);
+        for (index, component) in components.iter().enumerate() {
+            candidate.push(component);
+            if candidate.exists() {
+                continue;
+            }
+            let mode = if index + 1 == components.len() {
+                SyncMode::PathAndFirstLayer
+            } else {
+                SyncMode::PathOnly
+            };
+            mount
+                .sync_paths(vec![candidate.clone()], mode)
+                .await
+                .map_err(|error| {
+                    format!("Could not make this item available in File Explorer: {error:#}")
+                })?;
+        }
+    }
+    if !path.exists() {
+        #[cfg(target_os = "macos")]
         return Err(
             "This item is not available locally. Open its parent folder in Finder first.".into(),
         );
+        #[cfg(windows)]
+        return Err(
+            "This item is not available locally. Open its parent folder in File Explorer first."
+                .into(),
+        );
+        #[cfg(not(any(target_os = "macos", windows)))]
+        return Err(
+            "This item is not available locally. Open its parent folder in the file manager first."
+                .into(),
+        );
     }
+    #[cfg(windows)]
+    crate::windows_shell::reveal_item(path).await?;
+    #[cfg(not(windows))]
     showfile::show_path_in_file_manager(path);
     Ok(())
 }
@@ -464,6 +619,27 @@ pub async fn remove_saved_pin(
 ) -> Result<(), String> {
     let (_, config) = get_share_mount(&state, &drive_id).await?;
     let uri = validate_share_uri(&uri, &config.remote_path, &config.user_id)?;
+    #[cfg(windows)]
+    {
+        let path = config
+            .sync_path
+            .join(relative_path(&uri, &config.remote_path)?);
+        let info = LocalFileInfo::from_path(&path).map_err(|error| error.to_string())?;
+        if !info.exists || !info.is_placeholder() {
+            return Err("This Cloudreve item is no longer available in File Explorer".into());
+        }
+        let mut options = PinOptions::default();
+        if info.is_directory() {
+            options.recurse();
+        }
+        Placeholder::open(&path)
+            .and_then(|mut placeholder| {
+                placeholder.mark_pin(PinState::Unspecified, options)?;
+                Ok(())
+            })
+            .map_err(|error| format!("Could not remove Keep Downloaded: {error}"))?;
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         let directory = dirs::home_dir()
@@ -487,6 +663,6 @@ pub async fn remove_saved_pin(
                 .into(),
         );
     }
-    #[cfg(not(target_os = "macos"))]
-    Err("Keep Downloaded is available on macOS".into())
+    #[cfg(not(any(target_os = "macos", windows)))]
+    Err("Keep Downloaded is not available on this platform".into())
 }
