@@ -24,8 +24,8 @@ use objc2_app_kit::NSApp as ns_app;
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSColor,
-    NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow, NSWindowButton,
-    NSWindowCollectionBehavior,
+    NSFloatingWindowLevel, NSFontWeightSemibold, NSImage, NSImageSymbolConfiguration, NSWindow,
+    NSWindowButton, NSWindowCollectionBehavior,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSString};
@@ -1671,8 +1671,15 @@ fn focus_share_window(window: &WebviewWindow) {
             let _ = window.app_handle().show();
             let _ = window.show();
             let _ = window.unminimize();
-            native.makeKeyAndOrderFront(None);
+            // Finder regains activation when its extension command returns.
+            // Keep this utility window above normal application windows even
+            // after that callback, without using a modal session.
+            native.setLevel(NSFloatingWindowLevel);
+            // Hiding the Dock icon changes NSApplication activation policy;
+            // do it before the final activation/order sequence so it cannot
+            // demote the window immediately afterwards.
             crate::update_dock_visibility(window.app_handle());
+            native.makeKeyAndOrderFront(None);
             #[allow(deprecated)]
             ns_app(mtm).activateIgnoringOtherApps(true);
             native.makeKeyAndOrderFront(None);
