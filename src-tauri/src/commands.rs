@@ -1645,48 +1645,67 @@ pub fn show_upload_conflict_window_impl(app: &AppHandle, id: &str) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn focus_share_window_once(window: &WebviewWindow) {
+    let window = window.clone();
+    let app = window.app_handle().clone();
+    if let Err(error) = app.run_on_main_thread(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Ok(handle) = window.ns_window() else {
+            tracing::warn!(target: "share", "Share window has no native NSWindow");
+            return;
+        };
+        let native = unsafe { &*handle.cast::<NSWindow>() };
+        // A Finder extension can invoke Share while Finder or another app
+        // is active. Move the window to that Space and perform activation
+        // plus native ordering together on AppKit's main thread.
+        let behavior = native
+            .collectionBehavior()
+            .difference(NSWindowCollectionBehavior::CanJoinAllSpaces)
+            | NSWindowCollectionBehavior::MoveToActiveSpace;
+        native.setCollectionBehavior(behavior);
+        let _ = window.app_handle().show();
+        let _ = window.show();
+        let _ = window.unminimize();
+        // Finder regains activation when its extension command returns.
+        // Keep this utility window above normal application windows even
+        // after that callback, without using a modal session.
+        native.setLevel(NSFloatingWindowLevel);
+        // Hiding the Dock icon changes NSApplication activation policy;
+        // do it before the final activation/order sequence so it cannot
+        // demote the window immediately afterwards.
+        crate::update_dock_visibility(window.app_handle());
+        native.makeKeyAndOrderFront(None);
+        #[allow(deprecated)]
+        ns_app(mtm).activateIgnoringOtherApps(true);
+        native.makeKeyAndOrderFront(None);
+        refresh_traffic_light_tracking(&window);
+    }) {
+        tracing::warn!(target: "share", error = %error, "Failed to focus the Share window");
+    }
+}
+
 /// Show or create the Share window for a Finder item.
 fn focus_share_window(window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
     {
+        focus_share_window_once(window);
+
+        // Finder activates itself once more when its extension command has
+        // returned. Reassert focus after that handoff. The retries are short,
+        // bounded, and only scheduled for an explicit Share action.
         let window = window.clone();
-        let app = window.app_handle().clone();
-        if let Err(error) = app.run_on_main_thread(move || {
-            let Some(mtm) = MainThreadMarker::new() else {
-                return;
-            };
-            let Ok(handle) = window.ns_window() else {
-                tracing::warn!(target: "share", "Share window has no native NSWindow");
-                return;
-            };
-            let native = unsafe { &*handle.cast::<NSWindow>() };
-            // A Finder extension can invoke Share while Finder or another app
-            // is active. Move the window to that Space and perform activation
-            // plus native ordering together on AppKit's main thread.
-            let behavior = native
-                .collectionBehavior()
-                .difference(NSWindowCollectionBehavior::CanJoinAllSpaces)
-                | NSWindowCollectionBehavior::MoveToActiveSpace;
-            native.setCollectionBehavior(behavior);
-            let _ = window.app_handle().show();
-            let _ = window.show();
-            let _ = window.unminimize();
-            // Finder regains activation when its extension command returns.
-            // Keep this utility window above normal application windows even
-            // after that callback, without using a modal session.
-            native.setLevel(NSFloatingWindowLevel);
-            // Hiding the Dock icon changes NSApplication activation policy;
-            // do it before the final activation/order sequence so it cannot
-            // demote the window immediately afterwards.
-            crate::update_dock_visibility(window.app_handle());
-            native.makeKeyAndOrderFront(None);
-            #[allow(deprecated)]
-            ns_app(mtm).activateIgnoringOtherApps(true);
-            native.makeKeyAndOrderFront(None);
-            refresh_traffic_light_tracking(&window);
-        }) {
-            tracing::warn!(target: "share", error = %error, "Failed to focus the Share window");
-        }
+        tauri::async_runtime::spawn(async move {
+            for delay_ms in [100, 300] {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                if !window.is_visible().unwrap_or(false) {
+                    return;
+                }
+                focus_share_window_once(&window);
+            }
+        });
     }
     #[cfg(not(target_os = "macos"))]
     {
