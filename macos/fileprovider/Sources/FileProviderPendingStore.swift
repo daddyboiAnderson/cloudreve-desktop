@@ -122,7 +122,7 @@ private struct FileProviderPendingSnapshot: Codable {
 
 final class FileProviderPendingMonitor {
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "pending")
+        subsystem: "cloudreve.desktop.fileprovider", category: "pending")
     private let drive: DriveConfig
     private let domain: NSFileProviderDomain
     private let queue = DispatchQueue(label: "cloudreve.fileprovider.pending")

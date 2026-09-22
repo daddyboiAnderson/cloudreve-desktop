@@ -124,7 +124,7 @@ fn windows_pinned_items(
 #[cfg(target_os = "macos")]
 fn provider_state() -> Result<std::path::PathBuf, String> {
     Ok(dirs::home_dir().ok_or("Home directory unavailable")?.join(
-        "Library/Containers/cloudreve.desktop.dev.fileprovider/Data/Library/Application Support/CloudreveFileProvider"))
+        "Library/Containers/cloudreve.desktop.fileprovider/Data/Library/Application Support/CloudreveFileProvider"))
 }
 
 #[cfg(target_os = "macos")]

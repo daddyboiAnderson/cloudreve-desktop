@@ -3,7 +3,7 @@
 cloudreve-api/target/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+# Application releases commit Cargo.lock for reproducible dependency resolution.
 
 # IDE
 .vscode/

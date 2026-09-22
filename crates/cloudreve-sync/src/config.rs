@@ -72,7 +72,7 @@ impl Default for AppConfig {
             notify_file_conflict: true,
             fast_popup_launch: true,
             log_to_file: true,
-            log_level: LogLevel::Debug,
+            log_level: if cfg!(debug_assertions) { LogLevel::Debug } else { LogLevel::Info },
             log_max_files: 5,
             language: None,
         }

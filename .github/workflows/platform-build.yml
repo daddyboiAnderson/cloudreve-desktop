@@ -2,7 +2,7 @@ name: Platform builds
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -42,15 +42,19 @@ jobs:
       - name: Compile desktop application
         run: cargo build --manifest-path src-tauri/Cargo.toml
 
+      - name: Test sync service
+        run: cargo test -p cloudreve-sync --lib
+
+      - name: Test desktop commands
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
       - name: Test macOS upload encryption
         if: runner.os == 'macOS'
         run: ./macos/scripts/test-upload-encryption.sh
 
-      - name: Compile macOS File Provider extension
+      - name: Test macOS state migration
         if: runner.os == 'macOS'
-        env:
-          FP_CONFIGURATION: Release
-        run: ./macos/scripts/build-extension.sh
+        run: ./macos/scripts/test-state-database.sh
 
       - name: Build macOS application bundle
         if: runner.os == 'macOS'
@@ -58,18 +62,21 @@ jobs:
 
       - name: Embed File Provider extension
         if: runner.os == 'macOS'
+        env:
+          FP_CONFIGURATION: Release
+          FP_REGISTER_EXTENSION: '0'
+          FP_BUILD_NUMBER: '${{ github.run_number }}'
+          FP_SHORT_VERSION: '0.2.1'
         run: |
-          app="target/release/bundle/macos/Cloudreve.app"
-          mkdir -p "$app/Contents/PlugIns"
-          cp -R macos/build/CloudreveFileProvider.appex "$app/Contents/PlugIns/"
-          codesign --force --sign - --timestamp=none "$app"
-          ditto -c -k --keepParent "$app" Cloudreve-macOS.zip
+          bash macos/scripts/embed-into-app.sh
+          codesign --verify --deep --strict target/release/bundle/macos/Cloudreve.app
+          tar -czf Cloudreve-macOS.app.tar.gz -C target/release/bundle/macos Cloudreve.app
 
       - name: Upload macOS test application
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: Cloudreve-macOS
-          path: Cloudreve-macOS.zip
+          path: Cloudreve-macOS.app.tar.gz
           if-no-files-found: error
           retention-days: 14

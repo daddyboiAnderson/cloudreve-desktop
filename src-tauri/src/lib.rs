@@ -1,5 +1,6 @@
 use anyhow::Context;
 mod saved_items;
+mod app_update;
 #[cfg(windows)]
 mod windows_shell;
 use cloudreve_sync::{
@@ -149,6 +150,18 @@ async fn init_sync_service(app: AppHandle) -> anyhow::Result<()> {
         .context("Failed to initialize logging system")?;
 
     tracing::info!(target: "main", "Starting Cloudreve Sync Service (Tauri)...");
+
+    #[cfg(target_os = "macos")]
+    if let Err(error) = commands::migrate_macos_login_item() {
+        tracing::warn!(%error, "Could not migrate login preference");
+    }
+
+    #[cfg(target_os = "macos")]
+    match cloudreve_sync::fileprovider_db::StateDb::open()
+        .and_then(|mut db| db.migrate_and_cleanup()) {
+        Ok(count) => tracing::info!(count, "Migrated legacy File Provider state"),
+        Err(error) => tracing::warn!(%error, "Legacy state retained; migration will retry next launch"),
+    }
 
     // Initialize EventBroadcaster
     let event_broadcaster = Arc::new(EventBroadcaster::new(100));
@@ -470,8 +483,9 @@ pub fn run() {
 
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
+        .manage(app_update::UpdateState::default())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            tracing::info!("a new app instance was opened with {argv:?} and the deep link event was already triggered");
+            tracing::info!("Another app instance was opened");
             if argv.len() > 1 {
                 defer_deep_link(app, &argv[1]);
             }
@@ -479,6 +493,9 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init());
+
+    #[cfg(target_os = "macos")]
+    { builder = builder.plugin(tauri_plugin_updater::Builder::new().build()); }
 
     #[cfg(windows)]
     {
@@ -505,7 +522,7 @@ pub fn run() {
             app.listen("deep-link://new-url", move |event: tauri::Event| {
                 if let Ok(urls) = serde_json::from_str::<Vec<String>>(event.payload()) {
                     if let Some(url) = urls.first() {
-                        tracing::info!(target: "main", "Received deep-link URL: {}", url);
+                        tracing::info!(target: "main", "Received deep-link request");
                         defer_deep_link(&app_handle, url);
                     }
                 }
@@ -532,6 +549,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_update::check_app_update,
+            app_update::install_app_update,
             commands::is_dir_empty,
             commands::list_drives,
             saved_items::list_saved_items,

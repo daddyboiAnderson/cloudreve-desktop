@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Box, Typography, Link, Chip, Stack } from "@mui/material";
 import { useTranslation } from "react-i18next";
 import { getVersion } from "@tauri-apps/api/app";
-import { type as platformType } from "@tauri-apps/plugin-os";
+import Updates from "./Updates";
 import GitHubIcon from "@mui/icons-material/GitHub";
 import BugReportIcon from "@mui/icons-material/BugReportRounded";
 import ForumIcon from "@mui/icons-material/ForumRounded";
@@ -10,7 +10,6 @@ import logo from "../../assets/cloudreve.svg";
 import { HomeRounded } from "@mui/icons-material";
 
 function isPreviewVersion(version: string): boolean {
-  if (version.startsWith("0.")) return true;
   if (version.includes("-")) return true;
   return false;
 }
@@ -18,8 +17,6 @@ function isPreviewVersion(version: string): boolean {
 export default function AboutSection() {
   const { t } = useTranslation();
   const [version, setVersion] = useState<string>("");
-  const macOSRelease = import.meta.env.VITE_MACOS_RELEASE;
-  const isMacOS = platformType() === "macos";
 
   useEffect(() => {
     getVersion().then(setVersion);
@@ -36,12 +33,12 @@ export default function AboutSection() {
     {
       icon: <GitHubIcon fontSize="small" />,
       label: "GitHub",
-      href: "https://github.com/cloudreve/desktop",
+      href: "https://github.com/daddyboiAnderson/cloudreve-desktop",
     },
     {
       icon: <BugReportIcon fontSize="small" />,
       label: t("about.reportIssue"),
-      href: "https://github.com/cloudreve/desktop/issues",
+      href: "https://github.com/daddyboiAnderson/cloudreve-desktop/issues",
     },
     {
       icon: <ForumIcon fontSize="small" />,
@@ -79,14 +76,10 @@ export default function AboutSection() {
               />
             )}
           </Stack>
-          {isMacOS && macOSRelease && (
-            <Typography variant="caption" color="text.secondary">
-              macOS release {macOSRelease}
-            </Typography>
-          )}
         </Box>
       </Stack>
 
+      <Updates />
       <Stack spacing={1}>
         {links.map((link) => (
           <Link

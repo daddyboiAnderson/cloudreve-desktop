@@ -42,16 +42,16 @@ final class FileProviderItem: NSObject, NSFileProviderItem, NSFileProviderItemDe
     ]
     static let keepDownloadedDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.keep-downloaded-v2")
+            "cloudreve.desktop.fileprovider.keep-downloaded-v2")
     static let sharedDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.shared-v2")
+            "cloudreve.desktop.fileprovider.shared-v2")
     static let sharedWithMeDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.shared-with-me-v2")
+            "cloudreve.desktop.fileprovider.shared-with-me-v2")
     static let lockedDecoration =
         NSFileProviderItemDecorationIdentifier(
-            "cloudreve.desktop.dev.fileprovider.upload-conflict-v1")
+            "cloudreve.desktop.fileprovider.upload-conflict-v1")
 
     init(
         identifier: NSFileProviderItemIdentifier,

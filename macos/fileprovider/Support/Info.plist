@@ -11,7 +11,7 @@
 	<key>CFBundleIconFile</key>
 	<string>Cloudreve.icns</string>
 	<key>CFBundleIdentifier</key>
-	<string>cloudreve.desktop.dev.fileprovider</string>
+	<string>cloudreve.desktop.fileprovider</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleIcons</key>
@@ -44,9 +44,9 @@
 		<array>
 			<dict>
 				<key>Identifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.upload-conflict-v1</string>
+				<string>cloudreve.desktop.fileprovider.upload-conflict-v1</string>
 				<key>BadgeImageType</key>
-				<string>cloudreve.desktop.dev.fileprovider.decoration.upload-conflict-v1</string>
+				<string>cloudreve.desktop.fileprovider.decoration.upload-conflict-v1</string>
 				<key>Category</key>
 				<string>Badge</string>
 				<key>Label</key>
@@ -54,9 +54,9 @@
 			</dict>
 			<dict>
 				<key>Identifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.keep-downloaded-v2</string>
+				<string>cloudreve.desktop.fileprovider.keep-downloaded-v2</string>
 				<key>BadgeImageType</key>
-				<string>cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2</string>
+				<string>cloudreve.desktop.fileprovider.decoration.keep-downloaded-v2</string>
 				<key>Category</key>
 				<string>Badge</string>
 				<key>Label</key>
@@ -64,9 +64,9 @@
 			</dict>
 			<dict>
 				<key>Identifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.shared-v2</string>
+				<string>cloudreve.desktop.fileprovider.shared-v2</string>
 				<key>BadgeImageType</key>
-				<string>cloudreve.desktop.dev.fileprovider.decoration.shared-v1</string>
+				<string>cloudreve.desktop.fileprovider.decoration.shared-v1</string>
 				<key>Category</key>
 				<string>Sharing</string>
 				<key>Label</key>
@@ -74,7 +74,7 @@
 			</dict>
 			<dict>
 				<key>Identifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.shared-with-me-v2</string>
+				<string>cloudreve.desktop.fileprovider.shared-with-me-v2</string>
 				<key>Category</key>
 				<string>Sharing</string>
 				<key>Label</key>
@@ -87,7 +87,7 @@
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>fileproviderItems.@count == 1</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.OpenInBrowser</string>
+				<string>cloudreve.desktop.fileprovider.OpenInBrowser</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>View Online</string>
 			</dict>
@@ -95,7 +95,7 @@
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayKeepDownloaded == true ).@count &gt; 0</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.KeepDownloaded</string>
+				<string>cloudreve.desktop.fileprovider.KeepDownloaded</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Keep Downloaded</string>
 			</dict>
@@ -103,7 +103,7 @@
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayRemoveKeepDownloaded == true ).@count &gt; 0</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded</string>
+				<string>cloudreve.desktop.fileprovider.RemoveKeepDownloaded</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Remove Keep Downloaded</string>
 			</dict>
@@ -111,7 +111,7 @@
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>fileproviderItems.@count == 1 AND SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayShare == true ).@count == 1</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.Share</string>
+				<string>cloudreve.desktop.fileprovider.Share</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Share</string>
 			</dict>
@@ -119,7 +119,7 @@
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>fileproviderItems.@count == 1 AND SUBQUERY ( fileproviderItems, $fileproviderItem, $fileproviderItem.userInfo.displayResolveUploadConflict == true ).@count == 1</string>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>cloudreve.desktop.dev.fileprovider.ResolveUploadConflict</string>
+				<string>cloudreve.desktop.fileprovider.ResolveUploadConflict</string>
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Resolve Upload Conflict</string>
 			</dict>

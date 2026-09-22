@@ -2017,9 +2017,27 @@ pub fn show_settings_window_impl(app: &AppHandle) {
 #[cfg(windows)]
 const STARTUP_TASK_ID: &str = "cloudreve";
 #[cfg(target_os = "macos")]
-const MACOS_LAUNCH_AGENT_FILE: &str = "cloudreve.desktop.dev.plist";
+const MACOS_LAUNCH_AGENT_FILE: &str = "cloudreve.desktop.plist";
 #[cfg(target_os = "macos")]
-const MACOS_LAUNCH_AGENT_LABEL: &str = "cloudreve.desktop.dev";
+const MACOS_LAUNCH_AGENT_LABEL: &str = "cloudreve.desktop";
+
+/// Preserve the user's login preference when adopting the production identity.
+/// Do not unload the old agent: it may own this running process.
+#[cfg(target_os = "macos")]
+pub(crate) fn migrate_macos_login_item() -> CommandResult<()> {
+    let destination = macos_launch_agent_path()?;
+    let legacy = destination.with_file_name("cloudreve.desktop.dev.plist");
+    let content = match std::fs::read_to_string(&legacy) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !content.contains("<string>cloudreve.desktop.dev</string>") { return Ok(()); }
+    if !destination.exists() && content.contains("<key>RunAtLoad</key>") && content.contains("<true/>") {
+        std::fs::write(&destination, macos_launch_agent_entry()?).map_err(|e| e.to_string())?;
+    }
+    std::fs::remove_file(legacy).map_err(|e| e.to_string())
+}
 
 #[cfg(target_os = "macos")]
 fn macos_launch_agent_path() -> CommandResult<std::path::PathBuf> {

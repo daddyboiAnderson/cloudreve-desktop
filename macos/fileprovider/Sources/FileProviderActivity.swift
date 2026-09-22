@@ -50,7 +50,7 @@ private enum FileProviderUploadReceiptStore {
                 id: id, driveID: driveID, uri: uri, completedAt: completedAt)
             try FileProviderStateDatabase().put("fileprovider-upload-receipts", "\(id).json", JSONEncoder().encode(receipt))
         } catch {
-            Logger(subsystem: "cloudreve.desktop.dev.fileprovider", category: "activity").error(
+            Logger(subsystem: "cloudreve.desktop.fileprovider", category: "activity").error(
                 "could not persist upload receipt: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -59,7 +59,7 @@ private enum FileProviderUploadReceiptStore {
 
 enum FileProviderActivityStore {
     private static let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "activity")
+        subsystem: "cloudreve.desktop.fileprovider", category: "activity")
     private static let namespace = "fileprovider-activity"
 
     /// Preserve other transfers when multiple extension processes update a drive.

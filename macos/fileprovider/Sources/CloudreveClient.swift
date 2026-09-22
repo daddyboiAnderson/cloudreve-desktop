@@ -40,7 +40,7 @@ enum DriveStore {
     }
 
     static func loadDrive(driveID: String) -> DriveConfig? {
-        let logger = Logger(subsystem: "cloudreve.desktop.dev.fileprovider", category: "config")
+        let logger = Logger(subsystem: "cloudreve.desktop.fileprovider", category: "config")
         do {
             let data = try Data(contentsOf: drivesURL)
             let file = try JSONDecoder().decode(DrivesFile.self, from: data)
@@ -263,7 +263,7 @@ func mapApiError(code: Int, message: String?, responseData: Data? = nil) -> Clou
 /// Tokens are refreshed in memory only; the main app owns drives.json.
 final class CloudreveClient {
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "client")
+        subsystem: "cloudreve.desktop.fileprovider", category: "client")
 
     let baseURL: URL
     private var credentials: Credentials
@@ -847,7 +847,7 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     let onProgress: ((Int64, Int64) -> Void)?
     var continuation: CheckedContinuation<Void, Error>?
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "download")
+        subsystem: "cloudreve.desktop.fileprovider", category: "download")
 
     init(
         dest: URL,

@@ -86,13 +86,13 @@ ensure_exported_uti() {
 }
 
 ensure_exported_uti \
-    "cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2" \
+    "cloudreve.desktop.fileprovider.decoration.keep-downloaded-v2" \
     "Cloudreve Keep Downloaded badge" KeepDownloaded.icns
 ensure_exported_uti \
-    "cloudreve.desktop.dev.fileprovider.decoration.shared-v1" \
+    "cloudreve.desktop.fileprovider.decoration.shared-v1" \
     "Cloudreve Shared badge" Shared.icns
 ensure_exported_uti \
-    "cloudreve.desktop.dev.fileprovider.decoration.upload-conflict-v1" \
+    "cloudreve.desktop.fileprovider.decoration.upload-conflict-v1" \
     "Cloudreve Upload Conflict badge" UploadConflict.icns
 
 echo "==> Setting app and extension version to $SHORT_VERSION ($BUILD_NUMBER)"
@@ -113,5 +113,5 @@ fi
 
 echo "==> Done"
 if [[ "$REGISTER_EXTENSION" != "0" ]]; then
-    pluginkit -m -i cloudreve.desktop.dev.fileprovider
+    pluginkit -m -i cloudreve.desktop.fileprovider
 fi

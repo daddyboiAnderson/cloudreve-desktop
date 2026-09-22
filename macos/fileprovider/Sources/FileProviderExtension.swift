@@ -7,7 +7,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
     NSFileProviderThumbnailing, NSFileProviderCustomAction
 {
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "extension")
+        subsystem: "cloudreve.desktop.fileprovider", category: "extension")
 
     private static let domainPrefix = "cloudreve.drive."
 
@@ -847,15 +847,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
     // MARK: - Custom actions
 
     private static let keepDownloadedAction =
-        "cloudreve.desktop.dev.fileprovider.KeepDownloaded"
+        "cloudreve.desktop.fileprovider.KeepDownloaded"
     private static let removeKeepDownloadedAction =
-        "cloudreve.desktop.dev.fileprovider.RemoveKeepDownloaded"
+        "cloudreve.desktop.fileprovider.RemoveKeepDownloaded"
     private static let shareAction =
-        "cloudreve.desktop.dev.fileprovider.Share"
+        "cloudreve.desktop.fileprovider.Share"
     private static let openInBrowserAction =
-        "cloudreve.desktop.dev.fileprovider.OpenInBrowser"
+        "cloudreve.desktop.fileprovider.OpenInBrowser"
     private static let resolveUploadConflictAction =
-        "cloudreve.desktop.dev.fileprovider.ResolveUploadConflict"
+        "cloudreve.desktop.fileprovider.ResolveUploadConflict"
 
     /// Handles Finder actions and forwards Share targets to the main app.
     func performAction(

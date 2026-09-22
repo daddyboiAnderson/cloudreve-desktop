@@ -4,7 +4,7 @@ import OSLog
 /// Enumerates Cloudreve containers and replays remote changes.
 final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "enumerator")
+        subsystem: "cloudreve.desktop.fileprovider", category: "enumerator")
 
     private let containerIdentifier: NSFileProviderItemIdentifier
     private let store: RemoteStore

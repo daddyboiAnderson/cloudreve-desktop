@@ -183,9 +183,11 @@ write operations and activity updates use cross-process transactions. Pending
 errors remain a snapshot of macOS-owned pending items, not a replacement queue.
 Finder still owns materialization and transfer scheduling.
 
-Legacy directories are imported once within transactions. Their files remain
-untouched for recovery, and import markers prevent consumed requests from being
-re-imported. They are not active mirrors and must not be copied over the database.
+Legacy directories are imported once within transactions. Starting in 0.2.1 the
+host removes recognized legacy metadata files after the import commits; import
+markers prevent consumed requests from being re-imported. Failed imports retain
+their sources and retry on a later launch. They are not active mirrors and must
+not be copied over the database.
 Do not run old and new app builds simultaneously during migration. A rollback
 to the old file-based build cannot see new database-only requests.
 
@@ -210,11 +212,21 @@ whose guessed URI identifier differs from Finder's stable remote identifier.
 The extension's private identity/pin/policy snapshots remain in its own container
 in this migration; preserving them avoids changing Finder identity or resetting
 the domain. Logs, icons, backups, content, and drive configuration remain files.
-Existing unknown/obsolete directories are not deleted automatically.
+Unknown files, symlinks, nonempty unknown directories and manual backups are not
+deleted automatically. Cleanup never recursively deletes a directory.
 
 ### Cleaning up a migrated installation
 
-After confirming the installed host and extension use the database-backed build,
+The host runs `StateDb::migrate_and_cleanup` before loading drives. It imports
+record namespaces, including historical reset markers as inert recovery data,
+then removes recognized source files. Inactive drives' UUID-named event logs are
+also imported before removal. Historical `fp-health` records are archived in
+the database but never executed. Live databases, configuration, logs, icons and
+the extension's private state are outside the cleanup allowlist. Older and newer
+builds must not run simultaneously.
+
+For manual cleanup of pre-0.2.1 builds, after confirming the installed host and
+extension use the database-backed build,
 check `PRAGMA quick_check`, completed namespaces in `fp_imports`, and the active
 drive's `fp_event_heads.imported` flag. Legacy directories can then be moved to a
 dated backup outside `~/.cloudreve`; preserve unimported historical drives there
@@ -282,3 +294,27 @@ codesign --verify --deep --strict \
 Do not package a raw `cargo build --release` binary as the app: it lacks Tauri's
 production custom-protocol configuration and attempts to load the development
 server. For local handoff, provide the `.app` bundle directly rather than a ZIP.
+Public releases use a DMG for installation and a separately signed `.app.tar.gz`
+for the updater; both contain the same final embedded bundle. See
+[`RELEASING.md`](RELEASING.md) for the required packaging and publication order.
+
+## Production identity and updates (0.2.1)
+
+The app uses `cloudreve.desktop` and the extension uses
+`cloudreve.desktop.fileprovider`. Users upgrading from `.dev` builds must
+reconnect and reapply Keep Downloaded selections; see
+[`releases/0.2.1.md`](releases/0.2.1.md). This transition does not delete the old
+extension container or Finder content. The old login preference is migrated to
+the new LaunchAgent filename when the recognized legacy entry exists.
+
+Settings → About checks this fork's GitHub `latest.json` over HTTPS. The host
+retains the checked update and verifies its package with the pinned public key
+before installation. It accepts initial download URLs only under this repository's
+GitHub release path. An operation lock prevents overlapping checks/installs. The
+user explicitly approves installation and is asked to save and close documents;
+after installation the host shuts down its sync service and restarts. Windows
+retains its existing package-managed update mechanism and Explorer integration.
+
+Updater signatures are not Apple code-signing certificates. Current ad-hoc
+releases are not notarized and cannot promise that security warnings appear only
+once. No Gatekeeper or quarantine bypass is implemented.

@@ -34,7 +34,7 @@
 			<key>UTTypeIconFile</key>
 			<string>KeepDownloaded.icns</string>
 			<key>UTTypeIdentifier</key>
-			<string>cloudreve.desktop.dev.fileprovider.decoration.keep-downloaded-v2</string>
+			<string>cloudreve.desktop.fileprovider.decoration.keep-downloaded-v2</string>
 		</dict>
 		<dict>
 			<key>UTTypeConformsTo</key>
@@ -46,7 +46,7 @@
 			<key>UTTypeIconFile</key>
 			<string>Shared.icns</string>
 			<key>UTTypeIdentifier</key>
-			<string>cloudreve.desktop.dev.fileprovider.decoration.shared-v1</string>
+			<string>cloudreve.desktop.fileprovider.decoration.shared-v1</string>
 		</dict>
 		<dict>
 			<key>UTTypeConformsTo</key>
@@ -58,7 +58,7 @@
 			<key>UTTypeIconFile</key>
 			<string>UploadConflict.icns</string>
 			<key>UTTypeIdentifier</key>
-			<string>cloudreve.desktop.dev.fileprovider.decoration.upload-conflict-v1</string>
+			<string>cloudreve.desktop.fileprovider.decoration.upload-conflict-v1</string>
 		</dict>
 	</array>
 </dict>

@@ -54,7 +54,7 @@ private actor MetadataRefreshCoordinator {
 /// Maps a File Provider domain to a Cloudreve drive.
 final class RemoteStore {
     private let logger = Logger(
-        subsystem: "cloudreve.desktop.dev.fileprovider", category: "store")
+        subsystem: "cloudreve.desktop.fileprovider", category: "store")
 
     let drive: DriveConfig
     let client: CloudreveClient

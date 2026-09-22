@@ -33,6 +33,61 @@ pub struct StateDb {
 }
 
 impl StateDb {
+    /// Only legacy metadata owned by this migration is eligible. Never recurse:
+    /// user content, backups, symlinks and unknown files must survive upgrades.
+    pub fn migrate_and_cleanup(&mut self) -> Result<usize> {
+        let namespaces = ["fileprovider-activity", "fileprovider-download-retries",
+            "fileprovider-pending", "fileprovider-upload-receipts", "fp-share-state",
+            "pin-requests", "upload-conflicts", "fp-reset", "fp-health"];
+        let mut removed = 0;
+        for namespace in namespaces {
+            let directory = self.root.join(namespace);
+            let entries = match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_dir() => std::fs::read_dir(&directory)?,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // Commit every record before removing any source. Import markers
+            // mean previously consumed requests must NOT be imported again.
+            self.import_records(namespace)?;
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() { continue; }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue; };
+                let extension = entry.path().extension().and_then(|s| s.to_str()).map(str::to_owned);
+                let recognized = match namespace {
+                    "fp-reset" => extension.as_deref() == Some("marker"),
+                    "fileprovider-download-retries" => name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "upload-conflicts" => matches!(extension.as_deref(), Some("json" | "refresh")),
+                    _ => extension.as_deref() == Some("json"),
+                };
+                if !recognized || name.starts_with('.') { continue; }
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+            // Failure here can simply mean there are unknown files to preserve.
+            let _ = std::fs::remove_dir(directory);
+        }
+        let directory = self.root.join("fp-events");
+        if std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir()) {
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() { continue; }
+                let name = entry.file_name();
+                let Some(drive) = name.to_str().and_then(|n| n.strip_suffix(".jsonl")) else { continue; };
+                if uuid::Uuid::parse_str(drive).is_err() { continue; }
+                // Includes inactive drives, so removing old logs loses no history.
+                self.append_events(drive, &mut [])?;
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+            let _ = std::fs::remove_dir(directory);
+        }
+        Ok(removed)
+    }
+
     pub fn open() -> Result<Self> {
         Self::at(
             &dirs::home_dir()
@@ -261,6 +316,49 @@ mod tests {
             to: String::new(),
             local_echo: false,
         }
+    }
+
+    #[test]
+    fn cleanup_imports_before_deletion_and_preserves_unknown_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let requests = temp.path().join("pin-requests");
+        std::fs::create_dir(&requests).unwrap();
+        std::fs::write(requests.join("request.json"), "{\"uri\":\"kept\"}").unwrap();
+        std::fs::write(requests.join("notes.txt"), "do not delete").unwrap();
+        std::fs::create_dir(temp.path().join("backup-pre-fp-reset")).unwrap();
+        std::fs::create_dir(temp.path().join("fp-reset")).unwrap();
+        std::fs::write(temp.path().join("fp-reset/drive.marker"), "old-reset").unwrap();
+        let mut db = StateDb::at(temp.path()).unwrap();
+        assert_eq!(db.migrate_and_cleanup().unwrap(), 2);
+        assert!(!requests.join("request.json").exists());
+        assert!(requests.join("notes.txt").exists());
+        assert!(temp.path().join("backup-pre-fp-reset").exists());
+        let records = db.records("pin-requests").unwrap();
+        assert!(records.iter().any(|r| r.key == "request.json"));
+        assert!(db.records("fp-reset-requests-v2").unwrap().is_empty());
+        assert!(db.consume("pin-requests", records.iter().find(|r| r.key == "request.json").unwrap()).unwrap());
+        assert_eq!(db.migrate_and_cleanup().unwrap(), 0);
+        assert!(!db.records("pin-requests").unwrap().iter().any(|r| r.key == "request.json"));
+    }
+
+    #[test]
+    fn cleanup_preserves_failed_event_import_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("important.json"), "keep").unwrap();
+        symlink(outside.path(), temp.path().join("pin-requests")).unwrap();
+        let events = temp.path().join("fp-events");
+        std::fs::create_dir(&events).unwrap();
+        let log = events.join("df3d7708-4131-5518-89eb-8ef8cd4dc0db.jsonl");
+        std::fs::write(&log, "{broken").unwrap();
+        let mut db = StateDb::at(temp.path()).unwrap();
+        assert!(db.migrate_and_cleanup().is_err());
+        assert!(log.exists());
+        assert!(outside.path().join("important.json").exists());
+        std::fs::write(&log, serde_json::to_string(&event()).unwrap()).unwrap();
+        assert_eq!(db.migrate_and_cleanup().unwrap(), 1);
+        assert!(!log.exists());
     }
 
     fn number(db: &mut StateDb, sql: &str) -> i64 {
