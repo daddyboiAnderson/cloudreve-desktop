@@ -65,6 +65,10 @@ impl InventoryDb {
                         .filter(fileprovider_remote_items::drive_id.eq(drive)),
                 )
                 .execute(tx_conn)?;
+                #[cfg(target_os = "macos")]
+                diesel::sql_query("DELETE FROM fileprovider_outbox WHERE drive=?")
+                    .bind::<diesel::sql_types::Text, _>(drive)
+                    .execute(tx_conn)?;
                 diesel::delete(
                     file_metadata_dsl::file_metadata.filter(file_metadata_dsl::drive_id.eq(drive)),
                 )

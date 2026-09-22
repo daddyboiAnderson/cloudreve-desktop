@@ -151,6 +151,20 @@ impl Mount {
                 Ok(Ok(Some(event))) => match event {
                     FileEvent::Event(events) => {
                         tracing::trace!(target: "drive::remote_events", events = ?events, "Handling file events batch");
+                        #[cfg(target_os = "macos")]
+                        {
+                            let mut retry = BackoffState::new();
+                            loop {
+                                match self.handle_file_events(sync_path.clone(), events.clone()).await {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        tracing::warn!(target: "drive::remote_events", %error, "Retrying uncommitted File Provider events");
+                                        tokio::time::sleep(retry.next_delay()).await;
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         if let Err(e) = self.handle_file_events(sync_path.clone(), events).await {
                             tracing::error!(target: "drive::remote_events", error = ?e, "Failed to handle file events");
                         }
@@ -255,6 +269,7 @@ impl Mount {
             let mut verified_events: Vec<&FileEventData> = Vec::new();
             let mut content_refresh_candidates = Vec::new();
             let mut local_upload_echo_paths = HashSet::new();
+            let mut upload_receipts = Vec::new();
             let mut needs_rescan = false;
             for e in &events {
                 match e.event_type {
@@ -270,18 +285,14 @@ impl Mount {
                         match info {
                             Ok(info) => {
                                 let local_upload_echo = if info.file_type == file_type::FILE {
-                                    match crate::fileprovider::consume_upload_receipt(
+                                    match crate::fileprovider::matching_upload_receipt(
                                         &drive_id, &uri,
-                                    ) {
-                                        Ok(consumed) => consumed,
-                                        Err(error) => {
-                                            tracing::warn!(
-                                                target: "drive::remote_events",
-                                                error = %error,
-                                                "Failed to match File Provider upload receipt"
-                                            );
-                                            false
+                                    )? {
+                                        Some(receipt) => {
+                                            upload_receipts.push(receipt);
+                                            true
                                         }
+                                        None => false,
                                     }
                                 } else {
                                     false
@@ -304,20 +315,18 @@ impl Mount {
             }
 
             if needs_rescan {
-                if let Err(e) = crate::fileprovider::append_rescan_marker(&drive_id) {
-                    tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP rescan marker");
-                }
+                crate::fileprovider::append_rescan_marker(&drive_id)?;
             }
             let events_to_log: Vec<FileEventData> =
                 verified_events.iter().map(|e| (*e).clone()).collect();
             if !events_to_log.is_empty() {
-                if let Err(e) = crate::fileprovider::append_domain_events(
+                crate::fileprovider::append_domain_events(
                     &drive_id,
                     &events_to_log,
                     &local_upload_echo_paths,
-                ) {
-                    tracing::warn!(target: "drive::remote_events", error = %e, "Failed to record FP domain events");
-                } else {
+                    &upload_receipts,
+                )?;
+                {
                     for event in &events_to_log {
                         tracing::info!(
                             target: "drive::remote_events",

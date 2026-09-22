@@ -60,22 +60,13 @@ pub struct FileProviderActivityRecord {
 }
 
 pub fn read_activity(drive_id: &str) -> Result<Vec<FileProviderActivityRecord>> {
-    let home = dirs::home_dir().context("Failed to get user home directory")?;
-    let path = home
-        .join(".cloudreve")
-        .join(ACTIVITY_DIRECTORY)
-        .join(format!("{drive_id}.json"));
-    let data = match std::fs::read(&path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).context("Failed to read File Provider activity"),
+    let mut db = crate::fileprovider_db::StateDb::open()?;
+    let records = db.records(ACTIVITY_DIRECTORY)?;
+    let Some(record) = records.into_iter().find(|record| record.key == format!("{drive_id}.json")) else {
+        return Ok(Vec::new());
     };
-    let records: Vec<FileProviderActivityRecord> =
-        serde_json::from_slice(&data).context("Failed to parse File Provider activity")?;
-    Ok(records
-        .into_iter()
-        .filter(|record| record.drive_id == drive_id)
-        .collect())
+    Ok(serde_json::from_str::<Vec<FileProviderActivityRecord>>(&record.payload)?
+        .into_iter().filter(|record| record.drive_id == drive_id).collect())
 }
 
 #[derive(serde::Deserialize)]
@@ -85,36 +76,19 @@ struct FileProviderUploadReceipt {
     completed_at: i64,
 }
 
-pub fn consume_upload_receipt(drive_id: &str, uri: &str) -> Result<bool> {
-    static RECEIPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = RECEIPT_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-    let home = dirs::home_dir().context("Failed to get user home directory")?;
-    let directory = home.join(".cloudreve").join(UPLOAD_RECEIPT_DIRECTORY);
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).context("Failed to read File Provider upload receipts"),
-    };
+pub fn matching_upload_receipt(drive_id: &str, uri: &str) -> Result<Option<crate::fileprovider_db::Record>> {
+    let mut db = crate::fileprovider_db::StateDb::open()?;
     let now = chrono::Utc::now().timestamp();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(data) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(receipt) = serde_json::from_slice::<FileProviderUploadReceipt>(&data) else {
-            continue;
-        };
+    for record in db.records(UPLOAD_RECEIPT_DIRECTORY)? {
+        let receipt: FileProviderUploadReceipt = serde_json::from_str(&record.payload)?;
         let age = now.saturating_sub(receipt.completed_at);
         if age > 5 * 60 {
-            let _ = std::fs::remove_file(path);
-            continue;
-        }
-        if age >= -10 && receipt.drive_id == drive_id && receipt.uri == uri {
-            std::fs::remove_file(path).context("Failed to consume File Provider upload receipt")?;
-            return Ok(true);
+            db.consume(UPLOAD_RECEIPT_DIRECTORY, &record)?;
+        } else if age >= -10 && receipt.drive_id == drive_id && receipt.uri == uri {
+            return Ok(Some(record));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 pub fn domain_identifier(drive_id: &str) -> String {
@@ -329,34 +303,17 @@ fn download_retry_identifier(drive_id: &str, item_identifier: &str) -> String {
 
 fn mark_download_retry(domain_id: &str, item_identifier: &str) -> Result<()> {
     let drive_id = domain_id.strip_prefix(DOMAIN_PREFIX).unwrap_or(domain_id);
-    let directory = dirs::home_dir()
-        .context("could not locate the home directory")?
-        .join(".cloudreve")
-        .join(DOWNLOAD_RETRY_DIRECTORY);
-    std::fs::create_dir_all(&directory).context("could not create download retry directory")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-    }
-
-    let path = directory.join(download_retry_identifier(drive_id, item_identifier));
-    let timestamp = chrono::Utc::now().timestamp_millis().to_string();
-    std::fs::write(&path, timestamp).context("could not record download retry")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::fileprovider_db::StateDb::open()?.put(
+        DOWNLOAD_RETRY_DIRECTORY,
+        &download_retry_identifier(drive_id, item_identifier),
+        &chrono::Utc::now().timestamp_millis().to_string(),
+    )
 }
 
 // MARK: - Shared event log
 
-/// One recorded remote event. Serialized as JSON lines, one per line, in
-/// `~/.cloudreve/fp-events/<drive-id>.jsonl`. The file provider extension
-/// reads this file to answer `enumerateChanges` precisely (it cannot run a
+/// One recorded remote event, stored transactionally in fileprovider.db.
+/// The File Provider extension replays the journal in enumerateChanges (it cannot run a
 /// long-lived SSE listener itself: XPC services get suspended when idle).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct FpEventRecord {
@@ -372,212 +329,56 @@ pub struct FpEventRecord {
     pub local_echo: bool,
 }
 
-static EVENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-const MAX_EVENT_LOG_BYTES: u64 = 256 * 1024;
-
-fn trim_event_log_if_needed(path: &std::path::Path, file: std::fs::File) -> Result<()> {
-    if file.metadata()?.len() <= MAX_EVENT_LOG_BYTES {
-        return Ok(());
-    }
-    drop(file);
-    let content = std::fs::read_to_string(path)?;
-    let all: Vec<&str> = content.lines().collect();
-    let keep = &all[all.len().saturating_sub(500)..];
-    std::fs::write(path, keep.join("\n") + "\n")?;
-    Ok(())
-}
-
-fn next_event_timestamp(path: &std::path::Path) -> Result<i64> {
-    let latest = match std::fs::read_to_string(path) {
-        Ok(content) => content
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<FpEventRecord>(line).ok())
-            .map(|record| record.ts)
-            .unwrap_or_default(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
-    };
-    Ok(chrono::Utc::now()
-        .timestamp_millis()
-        .max(latest.saturating_add(1)))
-}
-
-fn events_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().context("Failed to get user home directory")?;
-    Ok(home.join(".cloudreve").join("fp-events"))
-}
 
 /// Ask the next extension process to discard its local identity and pin state.
 pub fn request_local_state_reset(drive_id: &str) -> Result<()> {
-    let home = dirs::home_dir().context("Failed to get user home directory")?;
-    let dir = home.join(".cloudreve").join("fp-reset");
-    std::fs::create_dir_all(&dir)?;
     let token = format!(
         "{}-{}\n",
         chrono::Utc::now().timestamp_millis(),
         uuid::Uuid::new_v4()
     );
-    std::fs::write(dir.join(format!("{drive_id}.marker")), token)?;
-    Ok(())
+    crate::fileprovider_db::StateDb::open()?.put("fp-reset", &format!("{drive_id}.marker"), &token)
 }
 
-/// Append remote events to the drive's FP event log, keeping the file bounded.
+/// Commit a batch before signalling Finder. Sequence allocation is transactional.
 pub fn append_domain_events(
     drive_id: &str,
     events: &[cloudreve_api::models::explorer::FileEventData],
     local_echo_paths: &std::collections::HashSet<String>,
+    receipts: &[crate::fileprovider_db::Record],
 ) -> Result<()> {
-    use std::io::Write;
-    let _guard = EVENT_LOG_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-
-    let dir = events_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{drive_id}.jsonl"));
-
-    let now = next_event_timestamp(&path)?;
-    let mut lines = String::new();
-    for (i, e) in events.iter().enumerate() {
-        let record = FpEventRecord {
-            ts: now + i as i64, // preserve order within the batch
-            event_type: format!("{:?}", e.event_type).to_lowercase(),
-            from: e.from.clone(),
-            to: e.to.clone(),
-            local_echo: local_echo_paths.contains(&e.from)
-                || (!e.to.is_empty() && local_echo_paths.contains(&e.to)),
-        };
-        lines.push_str(&serde_json::to_string(&record)?);
-        lines.push('\n');
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    file.write_all(lines.as_bytes())?;
-
-    trim_event_log_if_needed(&path, file)?;
-    Ok(())
+    let mut records = events.iter().map(|event| FpEventRecord {
+        ts: 0,
+        event_type: format!("{:?}", event.event_type).to_lowercase(),
+        from: event.from.clone(),
+        to: event.to.clone(),
+        local_echo: local_echo_paths.contains(&event.from) || (!event.to.is_empty() && local_echo_paths.contains(&event.to)),
+    }).collect::<Vec<_>>();
+    crate::fileprovider_db::StateDb::open()?.append_events_consuming(drive_id, &mut records, receipts)
 }
 
-/// Append a "rescan" marker: tells the extension its change log can't be
-/// trusted past this point (e.g. the SSE stream was down), forcing a full
-/// rescan via `syncAnchorExpired`.
 pub fn append_rescan_marker(drive_id: &str) -> Result<()> {
-    use std::io::Write;
-    let _guard = EVENT_LOG_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-
-    let dir = events_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{drive_id}.jsonl"));
-    let record = FpEventRecord {
-        ts: next_event_timestamp(&path)?,
-        event_type: "rescan".to_string(),
-        from: String::new(),
-        to: String::new(),
-        local_echo: false,
-    };
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(file, "{}", serde_json::to_string(&record)?)?;
-    trim_event_log_if_needed(&path, file)?;
-    Ok(())
+    append_state_events(drive_id, "rescan", &[String::new()])
 }
 
-/// Record metadata-only changes, such as a share being added or removed.
 pub fn append_metadata_events(drive_id: &str, source_uris: &[String]) -> Result<()> {
-    use std::io::Write;
-
     if source_uris.is_empty() {
-        let _guard = EVENT_LOG_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
-        let dir = events_dir()?;
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{drive_id}.jsonl"));
-        let record = FpEventRecord {
-            ts: next_event_timestamp(&path)?,
-            event_type: "metadata_rescan".to_string(),
-            from: String::new(),
-            to: String::new(),
-            local_echo: false,
-        };
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{}", serde_json::to_string(&record)?)?;
-        trim_event_log_if_needed(&path, file)?;
-        return Ok(());
+        append_state_events(drive_id, "metadata_rescan", &[String::new()])
+    } else {
+        append_state_events(drive_id, "metadata", source_uris)
     }
-    let _guard = EVENT_LOG_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-
-    let dir = events_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{drive_id}.jsonl"));
-    let now = next_event_timestamp(&path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-
-    for (index, source_uri) in source_uris.iter().enumerate() {
-        let record = FpEventRecord {
-            ts: now + index as i64,
-            event_type: "metadata".to_string(),
-            from: source_uri.clone(),
-            to: String::new(),
-            local_echo: false,
-        };
-        writeln!(file, "{}", serde_json::to_string(&record)?)?;
-    }
-
-    trim_event_log_if_needed(&path, file)?;
-    Ok(())
 }
 
-/// Record share changes by filename when Cloudreve omits the source URI.
 pub fn append_metadata_name_events(drive_id: &str, names: &[String]) -> Result<()> {
-    use std::io::Write;
-    if names.is_empty() {
-        return Ok(());
-    }
-    let _guard = EVENT_LOG_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap();
-    let dir = events_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{drive_id}.jsonl"));
-    let now = next_event_timestamp(&path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    for (index, name) in names.iter().enumerate() {
-        let record = FpEventRecord {
-            ts: now + index as i64,
-            event_type: "metadata_name".to_string(),
-            from: name.clone(),
-            to: String::new(),
-            local_echo: false,
-        };
-        writeln!(file, "{}", serde_json::to_string(&record)?)?;
-    }
-    trim_event_log_if_needed(&path, file)?;
-    Ok(())
+    append_state_events(drive_id, "metadata_name", names)
+}
+
+fn append_state_events(drive_id: &str, kind: &str, paths: &[String]) -> Result<()> {
+    let mut records = paths.iter().map(|path| FpEventRecord {
+        ts: 0, event_type: kind.into(), from: path.clone(),
+        to: String::new(), local_echo: false,
+    }).collect::<Vec<_>>();
+    crate::fileprovider_db::StateDb::open()?.append_events(drive_id, &mut records)
 }
 
 /// Tell the system that new content is available in the given containers of a

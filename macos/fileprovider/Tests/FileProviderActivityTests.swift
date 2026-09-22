@@ -5,11 +5,7 @@ enum FileProviderActivityTests {
     static func main() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("cloudreve-file-provider-activity-tests-\(UUID().uuidString)")
-        setenv("CLOUDREVE_FP_ACTIVITY_DIR", directory.path, 1)
-        setenv(
-            "CLOUDREVE_FP_UPLOAD_RECEIPT_DIR",
-            directory.appendingPathComponent("receipts").path,
-            1)
+        setenv("CLOUDREVE_FP_STATE_ROOT", directory.path, 1)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let activity = FileProviderActivity(

@@ -3,7 +3,7 @@ pub mod callback;
 pub mod commands;
 pub mod event_blocker;
 #[cfg(target_os = "macos")]
-mod fileprovider_audit;
+pub(crate) mod fileprovider_audit;
 pub mod ignore;
 pub mod manager;
 pub mod mounts;

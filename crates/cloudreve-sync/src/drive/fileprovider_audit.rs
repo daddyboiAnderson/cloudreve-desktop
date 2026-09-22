@@ -13,7 +13,6 @@ use std::{
 
 const PAGE_SIZE: i32 = 200;
 const DIRECTORY_DELAY: Duration = Duration::from_millis(20);
-const EVENT_BATCH_SIZE: usize = 100;
 
 fn canonical_uri(uri: &str) -> String {
     urlencoding::decode(uri)
@@ -56,8 +55,16 @@ impl Mount {
         }
         let mount = Arc::clone(self);
         *slot = Some(tokio::spawn(async move {
-            if let Err(error) = mount.run_fileprovider_recovery().await {
-                tracing::warn!(target: "fileprovider_audit", id=%mount.id, %error, "File Provider recovery audit failed; it will retry after the next reconnect");
+            let mut delay = 2;
+            loop {
+                match mount.run_fileprovider_recovery().await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(target: "fileprovider_audit", id=%mount.id, %error, delay, "File Provider recovery will retry automatically");
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        delay = (delay * 2).min(60);
+                    }
+                }
             }
         }));
     }
@@ -72,6 +79,8 @@ impl Mount {
             )
         };
         let generation = chrono::Utc::now().timestamp_millis();
+        self.inventory.deliver_fileprovider_outbox(&drive_id)?;
+        signal_changes(&drive_id, &drive_name);
         let previous = self
             .inventory
             .fileprovider_remote_items(&drive_id)?
@@ -144,8 +153,22 @@ impl Mount {
                     }
                     seen += 1;
                 }
-                self.inventory.upsert_fileprovider_remote_items(&rows)?;
-                self.flush_fileprovider_audit_events(&drive_id, &drive_name, &mut events)?;
+                let records = events
+                    .drain(..)
+                    .map(|event| crate::fileprovider::FpEventRecord {
+                        ts: 0,
+                        event_type: format!("{:?}", event.event_type).to_lowercase(),
+                        from: event.from,
+                        to: event.to,
+                        local_echo: false,
+                    })
+                    .collect::<Vec<_>>();
+                self.inventory
+                    .upsert_fileprovider_remote_items_with_events(&rows, &records)?;
+                self.inventory.deliver_fileprovider_outbox(&drive_id)?;
+                if !records.is_empty() {
+                    signal_changes(&drive_id, &drive_name);
+                }
                 if !more {
                     break;
                 }
@@ -154,54 +177,28 @@ impl Mount {
             tokio::time::sleep(DIRECTORY_DELAY).await;
         }
 
-        let missing = self
-            .inventory
+        self.inventory
             .finish_fileprovider_remote_generation(&drive_id, generation)?;
-        if !establishing_baseline {
-            for item in collapse_missing_items(missing) {
-                events.push(FileEventData {
-                    event_type: FileEventType::Delete,
-                    file_id: item.remote_id,
-                    from: canonical_uri(&item.uri),
-                    to: String::new(),
-                });
-            }
-        }
-        flush_events(&drive_id, &drive_name, &mut events)?;
+        self.inventory.deliver_fileprovider_outbox(&drive_id)?;
+        signal_changes(&drive_id, &drive_name);
         tracing::info!(target: "fileprovider_audit", id=%drive_id, seen, "Metadata-only File Provider recovery audit completed");
         Ok(())
     }
-
-    fn flush_fileprovider_audit_events(
-        &self,
-        drive_id: &str,
-        drive_name: &str,
-        events: &mut Vec<FileEventData>,
-    ) -> Result<()> {
-        if events.len() < EVENT_BATCH_SIZE {
-            return Ok(());
-        }
-        flush_events(drive_id, drive_name, events)
-    }
 }
 
-fn flush_events(drive_id: &str, drive_name: &str, events: &mut Vec<FileEventData>) -> Result<()> {
-    if events.is_empty() {
-        return Ok(());
-    }
-    crate::fileprovider::append_domain_events(drive_id, events, &HashSet::new())?;
-    events.clear();
+fn signal_changes(drive_id: &str, drive_name: &str) {
     crate::fileprovider::signal_containers(
         &crate::fileprovider::domain_identifier(drive_id),
         drive_name,
         &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
     );
-    Ok(())
 }
 
 /// Reporting a missing folder removes its descendants too, so avoid sending
 /// redundant child deletions that can confuse File Provider ordering.
-fn collapse_missing_items(mut items: Vec<FileProviderRemoteItem>) -> Vec<FileProviderRemoteItem> {
+pub(crate) fn collapse_missing_items(
+    mut items: Vec<FileProviderRemoteItem>,
+) -> Vec<FileProviderRemoteItem> {
     items.sort_by_key(|item| item.uri.matches('/').count());
     let mut roots: Vec<FileProviderRemoteItem> = Vec::new();
     for item in items {

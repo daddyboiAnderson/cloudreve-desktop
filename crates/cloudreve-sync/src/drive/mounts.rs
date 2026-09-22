@@ -937,22 +937,16 @@ impl Mount {
         #[cfg(windows)]
         let sync_path = config.sync_path.clone();
         drop(config);
-        #[cfg(target_os = "macos")]
-        let share_state_path = dirs::home_dir().map(|home| {
-            home.join(".cloudreve")
-                .join("fp-share-state")
-                .join(format!("{mount_id}.json"))
-        });
 
         let handle = spawn(async move {
             let interval = Duration::from_secs(10);
             // The first poll establishes the baseline and repairs stale share
             // flags left behind by a previous process.
             #[cfg(target_os = "macos")]
-            let mut known: Option<std::collections::BTreeMap<String, String>> = share_state_path
-                .as_ref()
-                .and_then(|path| std::fs::read(path).ok())
-                .and_then(|data| serde_json::from_slice(&data).ok());
+            let mut known: Option<std::collections::BTreeMap<String, String>> = crate::fileprovider_db::StateDb::open()
+                .and_then(|mut db| db.records("fp-share-state")).ok()
+                .and_then(|records| records.into_iter().find(|record| record.key == format!("{mount_id}.json")))
+                .and_then(|record| serde_json::from_str(&record.payload).ok());
             // Windows deliberately starts without a persisted baseline. The
             // first pass repairs Explorer state for Web UI changes made while
             // the desktop client was not running.
@@ -1009,7 +1003,7 @@ impl Mount {
                     );
                     #[cfg(target_os = "macos")]
                     {
-                        if let Some(previous) = &known {
+                        let recorded = if let Some(previous) = &known {
                             let mut names = std::collections::BTreeSet::new();
                             for (id, name) in previous {
                                 if shares.get(id) != Some(name) && !name.is_empty() {
@@ -1021,18 +1015,25 @@ impl Mount {
                                     names.insert(name.clone());
                                 }
                             }
-                            crate::fileprovider::signal_metadata_name_refresh(
+                            crate::fileprovider::append_metadata_name_events(
                                 &mount_id,
-                                &drive_name,
                                 &names.into_iter().collect::<Vec<_>>(),
-                            );
+                            )
                         } else {
-                            crate::fileprovider::signal_metadata_refresh(
+                            crate::fileprovider::append_metadata_events(
                                 &mount_id,
-                                &drive_name,
                                 &[],
-                            );
+                            )
+                        };
+                        if let Err(error) = recorded {
+                            tracing::warn!(target: "fileprovider", %error, "Retrying share change journal write");
+                            tokio::time::sleep(interval).await;
+                            continue;
                         }
+                        crate::fileprovider::signal_containers(
+                            &crate::fileprovider::domain_identifier(&mount_id), &drive_name,
+                            &[crate::fileprovider::WORKING_SET_CONTAINER.to_string()],
+                        );
                     }
                     #[cfg(windows)]
                     if let Err(error) = mount.command_tx.send(MountCommand::Sync {
@@ -1050,12 +1051,12 @@ impl Mount {
                 }
                 known = Some(shares);
                 #[cfg(target_os = "macos")]
-                if let (Some(path), Some(current)) = (&share_state_path, &known) {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    if let Ok(data) = serde_json::to_vec(current) {
-                        let _ = std::fs::write(path, data);
+                if let Some(current) = &known {
+                    let result = crate::fileprovider_db::StateDb::open().and_then(|mut db| {
+                        db.put("fp-share-state", &format!("{mount_id}.json"), &serde_json::to_string(current)?)
+                    });
+                    if let Err(error) = result {
+                        tracing::warn!(target: "fileprovider", %error, "Could not persist share baseline");
                     }
                 }
                 tokio::time::sleep(interval).await;

@@ -642,19 +642,17 @@ pub async fn remove_saved_pin(
     }
     #[cfg(target_os = "macos")]
     {
-        let directory = dirs::home_dir()
-            .ok_or("Home directory unavailable")?
-            .join(".cloudreve/pin-requests");
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        let path = directory.join(format!("{}.json", uuid::Uuid::new_v4()));
-        let temporary = path.with_extension("tmp");
+        let key = format!("{}.json", uuid::Uuid::new_v4());
         let request = serde_json::json!({"drive_id":drive_id,"uri":uri});
-        std::fs::write(&temporary, request.to_string()).map_err(|e| e.to_string())?;
-        std::fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+        cloudreve_sync::fileprovider_db::StateDb::open()
+            .and_then(|mut db| db.put("pin-requests", &key, &request.to_string()))
+            .map_err(|e| e.to_string())?;
         cloudreve_sync::fileprovider::signal_metadata_refresh(&drive_id, &config.name, &[uri]);
         for _ in 0..40 {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            if !path.exists() {
+            let records = cloudreve_sync::fileprovider_db::StateDb::open()
+                .and_then(|mut db| db.records("pin-requests")).map_err(|e| e.to_string())?;
+            if !records.iter().any(|record| record.key == key) {
                 return Ok(());
             }
         }

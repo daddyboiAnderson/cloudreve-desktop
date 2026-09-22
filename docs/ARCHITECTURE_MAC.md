@@ -15,7 +15,7 @@ The Tauri app owns long-lived work:
 - drive configuration, authentication, and token refresh;
 - the Cloudreve server-sent events (SSE) connection;
 - the durable SQLite inventory used for missed-event recovery;
-- the JSON-lines change feed shared with the extension;
+- the transactional SQLite change journal shared with the extension;
 - File Provider domain registration and enumerator signalling;
 - menu-bar UI, activity history, sharing, and conflict windows.
 
@@ -53,8 +53,10 @@ metadata and content. SSE is not treated as a durable replay log.
 The normal change path is:
 
 1. The desktop app maintains an SSE subscription for every mounted drive.
-2. A create, modify, rename, or delete event is validated and appended to
-   `~/.cloudreve/fp-events/<drive-id>.jsonl`.
+2. A create, modify, rename, or delete event is validated and committed to
+   `~/.cloudreve/fileprovider.db` before the app signals Finder. Upload receipts
+   are acknowledged in that same transaction, preserving local-upload echo
+   handling if a write fails.
 3. The app calls `NSFileProviderManager.signalEnumerator` for the domain's
    working-set container.
 4. macOS launches or wakes the extension and calls `enumerateChanges`.
@@ -88,8 +90,11 @@ On every confirmed subscription or reconnection:
 3. Each item is compared by stable remote ID with the
    `fileprovider_remote_items` SQLite table. New, modified, renamed, and deleted
    items become normal File Provider events.
-4. A generation is committed only after the complete traversal succeeds.
-   Deletions are never inferred from a partial or failed audit.
+4. Each page updates inventory and inserts its outgoing events into an outbox
+   in the same `meta.db` transaction. The outbox delivers to `fileprovider.db`
+   using unique batch IDs, making retries after a crash idempotent. Deletions
+   are inferred only after the complete traversal succeeds, and their events
+   are queued in the same transaction that removes the inventory rows.
 5. Descendant deletions are collapsed when an absent parent folder already
    represents the subtree.
 
@@ -118,9 +123,14 @@ requests it and schedules refreshes for remotely modified materialized files.
 - Items prefer a stable identifier derived from the Cloudreve remote ID.
 - The extension persists identifier-to-URI mappings so renames preserve Finder
   identity.
-- Change anchors use `evt-<timestamp>` values from the append-only JSON-lines
-  feed. Timestamps are monotonic within a drive even when events arrive in the
-  same millisecond.
+- Change anchors retain the compatible `evt-<number>` encoding. The database
+  allocates increasing sequence numbers per drive, at least as large as the
+  current millisecond timestamp. Legacy event timestamps are imported unchanged.
+- The journal retains the latest 100,000 events per drive. Pruning and its
+  minimum valid anchor are committed together. An older or future anchor
+  explicitly expires; unread database errors fail enumeration instead of
+  advancing an anchor. Event records and the journal head are read in one
+  consistent snapshot.
 - Rescan markers intentionally expire anchors when continuity is uncertain.
 
 The recently presented-folder cache is an optimization for fast reconciliation,
@@ -140,11 +150,68 @@ native File Provider items and excluded from recursive recovery traversal.
 - SSE uses a fresh client ID on each macOS subscription attempt and reconnects
   with bounded exponential backoff.
 - An idle event stream is treated as disconnected and re-established.
-- A failed recovery audit leaves the previous SQLite generation intact and is
-  retried after a later reconnect.
+- A failed recovery audit never infers deletions from a partial traversal.
+  Already processed pages remain durable with their outgoing events. Audits
+  retry automatically with backoff, including while SSE remains connected.
+- Failed live-event journal writes retry the received batch with backoff.
 - Large change sets are paged through `enumerateChanges`.
 - Reset Finder Integration is a last-resort maintenance action. Normal upgrades,
   reconnects, and missed events must recover without deleting the domain.
+
+## Persistent state and migration
+
+`meta.db` belongs to the Rust inventory layer. `fileprovider.db` is the smaller,
+versioned contract shared by the host and extension. It uses SQLite WAL mode,
+FULL synchronous durability, a five-second busy timeout, and short transactions.
+There is no network work inside a shared-database transaction. The canonical
+schema is `macos/fileprovider/state-schema.sql`; the standalone Swift build
+embeds an equivalent schema, with cross-language schema parity tests.
+
+The shared database contains:
+
+- `fp_event_heads` and `fp_events`: per-drive sequence, retention floor, and
+  ordered event payloads;
+- `fp_deliveries`: deduplication tokens for inventory outbox batches;
+- `fp_records`: namespaced records for activity, pending errors, upload
+  receipts, retry/pin requests, conflict metadata/actions, share baselines,
+  and explicit reset requests;
+- `fp_imports`: completed legacy-directory imports.
+
+Snapshots and small request payloads retain their existing JSON encoding inside
+database rows; they no longer require one file per record. Conflict read/modify/
+write operations and activity updates use cross-process transactions. Pending
+errors remain a snapshot of macOS-owned pending items, not a replacement queue.
+Finder still owns materialization and transfer scheduling.
+
+Legacy directories are imported once within transactions. Their files remain
+untouched for recovery, and import markers prevent consumed requests from being
+re-imported. They are not active mirrors and must not be copied over the database.
+Do not run old and new app builds simultaneously during migration. A rollback
+to the old file-based build cannot see new database-only requests.
+
+The extension's private identity/pin/policy snapshots remain in its own container
+in this migration; preserving them avoids changing Finder identity or resetting
+the domain. Logs, icons, backups, content, and drive configuration remain files.
+Existing unknown/obsolete directories are not deleted automatically.
+
+Current development signing uses temporary sandbox exceptions for the shared
+database and its WAL/SHM/journal sidecars, plus legacy paths needed for import.
+A distributed build should move shared storage to an entitled App Group using
+a configured signing team. This migration does not change the signing identity
+or pretend that an App Group is available to the current ad-hoc build.
+
+Validation includes:
+
+```bash
+bash macos/scripts/test-state-database.sh
+bash macos/scripts/test-pin-requests.sh
+bash macos/scripts/test-file-provider-activity.sh
+cargo test -p cloudreve-sync --lib fileprovider
+```
+
+These tests use isolated temporary databases and cover migration, transaction
+rollback, concurrent writers, receipt acknowledgement, outbox deduplication,
+Rust/Swift interoperability, retention floors, and Finder's 100-event pages.
 
 ## Packaging and verification
 
@@ -163,4 +230,3 @@ codesign --verify --deep --strict \
 Do not package a raw `cargo build --release` binary as the app: it lacks Tauri's
 production custom-protocol configuration and attempts to load the development
 server. For local handoff, provide the `.app` bundle directly rather than a ZIP.
-

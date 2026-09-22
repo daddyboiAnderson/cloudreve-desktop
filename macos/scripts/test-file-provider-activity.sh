@@ -14,6 +14,7 @@ swiftc -swift-version 5 \
     -framework Foundation \
     -o "$TEST_BINARY" \
     "$ROOT/macos/fileprovider/Sources/FileProviderActivity.swift" \
+    "$ROOT/macos/fileprovider/Sources/FileProviderStateDatabase.swift" \
     "$ROOT/macos/fileprovider/Tests/FileProviderActivityTests.swift"
 
 "$TEST_BINARY"

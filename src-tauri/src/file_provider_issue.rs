@@ -1,11 +1,9 @@
 #![cfg(target_os = "macos")]
 
 use crate::upload_conflict::UploadConflictRecord;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize)]
 struct PendingSnapshot {
@@ -46,38 +44,14 @@ pub struct FileProviderIssue {
 }
 
 pub fn list(known_drive_ids: &HashSet<String>) -> Result<Vec<FileProviderIssue>> {
-    let home = dirs::home_dir().context("Could not find the home directory")?;
-    let snapshots = read_pending_snapshots(&home.join(".cloudreve/fileprovider-pending"))?;
+    let snapshots = cloudreve_sync::fileprovider_db::StateDb::open()?
+        .records("fileprovider-pending")?
+        .into_iter()
+        .filter(|record| record.key.ends_with(".json"))
+        .map(|record| serde_json::from_str::<PendingSnapshot>(&record.payload))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let conflicts = crate::upload_conflict::list()?;
     Ok(merge(snapshots, conflicts, known_drive_ids))
-}
-
-fn read_pending_snapshots(directory: &Path) -> Result<Vec<PendingSnapshot>> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-
-    let mut snapshots = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        match fs::read(&path)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-        {
-            Some(snapshot) => snapshots.push(snapshot),
-            None => tracing::warn!(
-                target: "fileprovider",
-                path = %path.display(),
-                "Ignoring an invalid pending-item snapshot"
-            ),
-        }
-    }
-    Ok(snapshots)
 }
 
 fn merge(

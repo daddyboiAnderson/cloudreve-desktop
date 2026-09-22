@@ -6,8 +6,9 @@ enum PinRequestTests {
     static func main() async throws {
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("cloudreve-pin-tests-\(UUID().uuidString)")
+        setenv("CLOUDREVE_FP_STATE_ROOT", temporary.path, 1)
         defer { try? FileManager.default.removeItem(at: temporary) }
-        let requests = temporary.appendingPathComponent("requests")
+        let requests = temporary.appendingPathComponent("pin-requests")
         try FileManager.default.createDirectory(at: requests, withIntermediateDirectories: true)
         let drive = DriveConfig(id: "test", name: "Test", instance_url: "https://example.invalid",
             remote_path: "cloudreve://my", user_id: "test", enabled: true,
@@ -26,11 +27,45 @@ enum PinRequestTests {
         await store.withActionLock { store.applyPinRequests() }
         precondition(!store.isPinned(folder))
         precondition(store.isPinned(child))
-        precondition(!FileManager.default.fileExists(atPath: request.path))
+        let database = try FileProviderStateDatabase(root: temporary)
+        let consumed = try database.get("pin-requests", "request.json")
+        precondition(consumed == nil)
         let persisted = try JSONDecoder().decode([String].self,
             from: Data(contentsOf: temporary.appendingPathComponent("pinned-test.json")))
         precondition(!persisted.contains(folder.rawValue))
         precondition(persisted.contains(child.rawValue))
+        // Exercise actual Finder replay, including folders never presented.
+        try database.execute("INSERT INTO fp_event_heads VALUES('test',253,0,1)")
+        try database.transaction {
+            for index in 1...253 {
+                let event = RemoteStore.FpEvent(ts: Int64(index), type: "create",
+                    from: "/Unvisited/Deep/\(index).af", to: nil, localEcho: false)
+                let payload = String(decoding: try JSONEncoder().encode(event), as: UTF8.self)
+                try database.execute("INSERT INTO fp_events VALUES('test',?,?)", [String(index), payload])
+            }
+        }
+        var anchor = Data("evt-0".utf8)
+        var delivered: [Int64] = []
+        var sizes: [Int] = []
+        while true {
+            let (events, next, more) = try store.changes(since: anchor, for: .workingSet)
+            delivered += events.map(\.ts)
+            sizes.append(events.count)
+            anchor = next.rawValue
+            if !more { break }
+        }
+        precondition(sizes == [100, 100, 53])
+        precondition(delivered == Array(1...253).map(Int64.init))
+        try database.execute("UPDATE fp_event_heads SET floor=100 WHERE drive='test'")
+        do {
+            _ = try store.changes(since: Data("evt-99".utf8), for: .workingSet)
+            preconditionFailure("An expired anchor must trigger reconciliation")
+        } catch let error as NSFileProviderError { precondition(error.code == .syncAnchorExpired) }
+        try database.execute("DROP TABLE fp_events")
+        do {
+            _ = try store.changes(since: anchor, for: .workingSet)
+            preconditionFailure("A database failure must not acknowledge unread events")
+        } catch {}
         print("PinRequestTests: all tests passed")
     }
 }

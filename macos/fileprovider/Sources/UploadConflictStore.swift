@@ -41,19 +41,9 @@ struct UploadConflictRecord: Codable {
 }
 
 enum UploadConflictStore {
-    private static let lock = NSLock()
+    private static let namespace = "upload-conflicts"
     private static let presentationInterval: Int64 = 30_000
     private static let refreshLifetime: TimeInterval = 24 * 60 * 60
-
-    static var directoryURL: URL {
-        let home: URL
-        if let pw = getpwuid(getuid()), let dir = pw.pointee.pw_dir {
-            home = URL(fileURLWithPath: String(cString: dir))
-        } else {
-            home = URL(fileURLWithPath: "/Users/\(NSUserName())")
-        }
-        return home.appendingPathComponent(".cloudreve/upload-conflicts", isDirectory: true)
-    }
 
     static func identifier(driveID: String, uri: String) -> String {
         var hash: UInt64 = 0xcbf29ce484222325
@@ -64,8 +54,25 @@ enum UploadConflictStore {
         return String(format: "%016llx", hash)
     }
 
+    private static func withDatabase<T>(_ work: (FileProviderStateDatabase) throws -> T) throws -> T {
+        let database = try FileProviderStateDatabase()
+        try database.importRecords(namespace)
+        return try database.transaction { try work(database) }
+    }
+
+    private static func read(_ database: FileProviderStateDatabase, _ id: String) throws -> UploadConflictRecord? {
+        guard id.count == 16, id.allSatisfy(\.isHexDigit) else { return nil }
+        guard let payload = try database.rows("SELECT payload FROM fp_records WHERE namespace=? AND key=?", [namespace, "\(id).json"]).first?.first else { return nil }
+        return try JSONDecoder().decode(UploadConflictRecord.self, from: Data(payload.utf8))
+    }
+
+    private static func write(_ database: FileProviderStateDatabase, _ record: UploadConflictRecord) throws {
+        let payload = String(decoding: try JSONEncoder().encode(record), as: UTF8.self)
+        try database.execute("INSERT INTO fp_records(namespace,key,payload) VALUES(?,?,?) ON CONFLICT(namespace,key) DO UPDATE SET payload=excluded.payload", [namespace, "\(record.id).json", payload])
+    }
+
     static func load(id: String) -> UploadConflictRecord? {
-        withLock { loadUnlocked(id: id) }
+        try? withDatabase { try read($0, id) }
     }
 
     static func load(driveID: String, uri: String) -> UploadConflictRecord? {
@@ -73,137 +80,67 @@ enum UploadConflictStore {
     }
 
     static func saveConflict(
-        drive: DriveConfig,
-        uri: String,
-        itemIdentifier: NSFileProviderItemIdentifier,
-        filename: String,
-        kind: UploadConflictKind,
-        application: String?,
-        ownerID: String?,
-        previousVersion: String?
+        drive: DriveConfig, uri: String, itemIdentifier: NSFileProviderItemIdentifier,
+        filename: String, kind: UploadConflictKind, application: String?,
+        ownerID: String?, previousVersion: String?
     ) throws -> UploadConflictRecord {
-        try withLock {
+        try withDatabase { database in
             let id = identifier(driveID: drive.id, uri: uri)
-            let now = Int64(Date().timeIntervalSince1970 * 1_000)
-            var record = UploadConflictRecord(
-                id: id,
-                driveID: drive.id,
-                driveName: drive.name,
-                uri: RemoteStore.canonicalURI(uri),
-                itemIdentifier: itemIdentifier.rawValue,
-                filename: filename,
-                kind: kind,
-                application: application,
-                ownerID: ownerID,
-                previousVersion: previousVersion,
-                action: nil,
-                presentedAt: loadUnlocked(id: id)?.presentedAt ?? 0,
-                updatedAt: now)
-            if let existing = loadUnlocked(id: id), existing.action != nil {
-                record.action = existing.action
-            }
-            try writeUnlocked(record)
+            let existing = try read(database, id)
+            let record = UploadConflictRecord(
+                id: id, driveID: drive.id, driveName: drive.name,
+                uri: RemoteStore.canonicalURI(uri), itemIdentifier: itemIdentifier.rawValue,
+                filename: filename, kind: kind, application: application, ownerID: ownerID,
+                previousVersion: previousVersion, action: existing?.action,
+                presentedAt: existing?.presentedAt ?? 0,
+                updatedAt: Int64(Date().timeIntervalSince1970 * 1_000))
+            try write(database, record)
             return record
         }
     }
 
     static func consumeAction(id: String) throws -> UploadConflictAction? {
-        try withLock {
-            guard var record = loadUnlocked(id: id),
-                let rawAction = record.action,
-                let action = UploadConflictAction(rawValue: rawAction)
-            else { return nil }
+        try withDatabase { database in
+            guard var record = try read(database, id),
+                let raw = record.action, let action = UploadConflictAction(rawValue: raw) else { return nil }
             record.action = nil
             record.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
-            try writeUnlocked(record)
+            try write(database, record)
             return action
         }
     }
 
     static func claimPresentation(id: String, force: Bool = false) -> UploadConflictRecord? {
-        try? withLock {
-            guard var record = loadUnlocked(id: id) else { return nil }
+        try? withDatabase { database in
+            guard var record = try read(database, id) else { return nil }
             let now = Int64(Date().timeIntervalSince1970 * 1_000)
             guard force || now - record.presentedAt >= presentationInterval else { return nil }
             record.presentedAt = now
             record.updatedAt = now
-            try writeUnlocked(record)
+            try write(database, record)
             return record
         }
     }
 
     static func remove(id: String) {
-        withLock {
-            try? FileManager.default.removeItem(at: fileURL(id: id))
-        }
+        try? FileProviderStateDatabase().remove(namespace, "\(id).json")
     }
 
     static func requestContentRefresh(driveID: String, uri: String) throws {
-        try withLock {
-            try prepareDirectory()
-            let id = identifier(driveID: driveID, uri: uri)
-            let data = Data(String(Date().timeIntervalSince1970).utf8)
-            try data.write(to: refreshURL(id: id), options: .atomic)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: refreshURL(id: id).path)
-        }
+        try FileProviderStateDatabase().put(namespace,
+            "\(identifier(driveID: driveID, uri: uri)).refresh",
+            Data(String(Date().timeIntervalSince1970).utf8))
     }
 
     static func needsContentRefresh(driveID: String, uri: String) -> Bool {
-        withLock {
-            let id = identifier(driveID: driveID, uri: uri)
-            let url = refreshURL(id: id)
-            guard let data = try? Data(contentsOf: url),
-                let value = String(data: data, encoding: .utf8),
-                let timestamp = TimeInterval(value),
-                Date().timeIntervalSince1970 - timestamp <= refreshLifetime
-            else {
-                try? FileManager.default.removeItem(at: url)
-                return false
-            }
-            return true
-        }
+        let key = "\(identifier(driveID: driveID, uri: uri)).refresh"
+        guard let database = try? FileProviderStateDatabase(),
+            let data = try? database.get(namespace, key),
+            let value = String(data: data, encoding: .utf8), let timestamp = TimeInterval(value) else { return false }
+        return Date().timeIntervalSince1970 - timestamp <= refreshLifetime
     }
 
     static func finishContentRefresh(driveID: String, uri: String) {
-        withLock {
-            let id = identifier(driveID: driveID, uri: uri)
-            try? FileManager.default.removeItem(at: refreshURL(id: id))
-        }
-    }
-
-    private static func loadUnlocked(id: String) -> UploadConflictRecord? {
-        guard id.count == 16, id.allSatisfy(\.isHexDigit),
-            let data = try? Data(contentsOf: fileURL(id: id))
-        else { return nil }
-        return try? JSONDecoder().decode(UploadConflictRecord.self, from: data)
-    }
-
-    private static func writeUnlocked(_ record: UploadConflictRecord) throws {
-        try prepareDirectory()
-        let data = try JSONEncoder().encode(record)
-        try data.write(to: fileURL(id: record.id), options: .atomic)
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: fileURL(id: record.id).path)
-    }
-
-    private static func fileURL(id: String) -> URL {
-        directoryURL.appendingPathComponent("\(id).json")
-    }
-
-    private static func refreshURL(id: String) -> URL {
-        directoryURL.appendingPathComponent("\(id).refresh")
-    }
-
-    private static func prepareDirectory() throws {
-        try FileManager.default.createDirectory(
-            at: directoryURL, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-    }
-
-    private static func withLock<T>(_ work: () throws -> T) rethrows -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return try work()
+        try? FileProviderStateDatabase().remove(namespace, "\(identifier(driveID: driveID, uri: uri)).refresh")
     }
 }

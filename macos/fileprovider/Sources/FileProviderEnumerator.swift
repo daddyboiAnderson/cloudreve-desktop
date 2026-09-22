@@ -124,7 +124,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     // Reconcile after an expired anchor.
                     logger.notice("anchor expired; reconciling working set with the server")
                     // Keep events received during reconciliation for the next pass.
-                    let reconciliationAnchor = store.currentSyncAnchor()
+                    let reconciliationAnchor = try store.currentSyncAnchor()
                     logger.notice(
                         "reconciliation captured anchor \(String(data: reconciliationAnchor.rawValue, encoding: .utf8) ?? "?", privacy: .public)"
                     )
@@ -293,7 +293,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     func currentSyncAnchor(
         completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void
     ) {
-        completionHandler(store.currentSyncAnchor())
+        completionHandler(try? store.currentSyncAnchor())
     }
 
     static func mapError(_ error: Error) -> Error {

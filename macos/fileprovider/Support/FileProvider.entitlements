@@ -17,9 +17,14 @@
 	<array>
 		<string>/.cloudreve/drives.json</string>
 		<string>/.cloudreve/fp-events/</string>
+		<string>/.cloudreve/fp-reset/</string>
 	</array>
 	<key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
 	<array>
+		<string>/.cloudreve/fileprovider.db</string>
+		<string>/.cloudreve/fileprovider.db-wal</string>
+		<string>/.cloudreve/fileprovider.db-shm</string>
+		<string>/.cloudreve/fileprovider.db-journal</string>
 		<string>/.cloudreve/pin-requests/</string>
 		<string>/.cloudreve/fileprovider-activity/</string>
 		<string>/.cloudreve/fileprovider-upload-receipts/</string>

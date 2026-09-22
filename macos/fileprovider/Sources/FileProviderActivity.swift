@@ -46,125 +46,70 @@ private struct FileProviderUploadReceipt: Codable {
 private enum FileProviderUploadReceiptStore {
     static func save(id: String, driveID: String, uri: String, completedAt: Int64) {
         do {
-            let directory = directoryURL
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
             let receipt = FileProviderUploadReceipt(
                 id: id, driveID: driveID, uri: uri, completedAt: completedAt)
-            let destination = directory.appendingPathComponent("\(id).json")
-            try JSONEncoder().encode(receipt).write(to: destination, options: .atomic)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            try FileProviderStateDatabase().put("fileprovider-upload-receipts", "\(id).json", JSONEncoder().encode(receipt))
         } catch {
             Logger(subsystem: "cloudreve.desktop.dev.fileprovider", category: "activity").error(
                 "could not persist upload receipt: \(error.localizedDescription, privacy: .public)")
         }
     }
 
-    private static var directoryURL: URL {
-        if let override = ProcessInfo.processInfo.environment["CLOUDREVE_FP_UPLOAD_RECEIPT_DIR"] {
-            return URL(fileURLWithPath: override, isDirectory: true)
-        }
-        let home: URL
-        if let pw = getpwuid(getuid()), let directory = pw.pointee.pw_dir {
-            home = URL(fileURLWithPath: String(cString: directory))
-        } else {
-            home = URL(fileURLWithPath: "/Users/\(NSUserName())")
-        }
-        return home.appendingPathComponent(
-            ".cloudreve/fileprovider-upload-receipts", isDirectory: true)
-    }
 }
 
 enum FileProviderActivityStore {
-    private static let lock = NSLock()
     private static let logger = Logger(
         subsystem: "cloudreve.desktop.dev.fileprovider", category: "activity")
-    private static let maximumRecords = 100
-    private static let completedLifetime: Int64 = 24 * 60 * 60
+    private static let namespace = "fileprovider-activity"
+
+    /// Preserve other transfers when multiple extension processes update a drive.
+    private static func update(driveID: String, _ body: (inout [FileProviderActivityRecord]) -> Void) {
+        do {
+            let database = try FileProviderStateDatabase()
+            try database.importRecords(namespace)
+            try database.transaction {
+                let payload = try database.rows("SELECT payload FROM fp_records WHERE namespace=? AND key=?", [namespace, "\(driveID).json"]).first?.first
+                var records = try payload.map { try JSONDecoder().decode([FileProviderActivityRecord].self, from: Data($0.utf8)) } ?? []
+                body(&records)
+                let value = String(decoding: try JSONEncoder().encode(records), as: UTF8.self)
+                try database.execute("INSERT INTO fp_records(namespace,key,payload) VALUES(?,?,?) ON CONFLICT(namespace,key) DO UPDATE SET payload=excluded.payload", [namespace, "\(driveID).json", value])
+            }
+        } catch {
+            logger.error("could not persist activity: \(error.localizedDescription, privacy: .public)")
+        }
+    }
 
     static func upsert(_ record: FileProviderActivityRecord) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var records = load(driveID: record.driveID)
-        if let index = records.firstIndex(where: { $0.id == record.id }) {
-            records[index] = record
-        } else {
-            records.append(record)
+        update(driveID: record.driveID) { records in
+            if let index = records.firstIndex(where: { $0.id == record.id }) {
+                records[index] = record
+            } else { records.append(record) }
+            let cutoff = Int64(Date().timeIntervalSince1970) - 24 * 60 * 60
+            let running = records.filter { $0.status == "running" }
+            let completed = records.filter { $0.status != "running" && $0.updatedAt >= cutoff }
+                .sorted { $0.updatedAt > $1.updatedAt }.prefix(100)
+            records = running + completed
         }
-
-        let cutoff = now() - completedLifetime
-        records = records
-            .filter { $0.status == "running" || $0.updatedAt >= cutoff }
-            .sorted { $0.updatedAt > $1.updatedAt }
-        if records.count > maximumRecords {
-            records.removeLast(records.count - maximumRecords)
-        }
-        write(records, driveID: record.driveID)
     }
 
     static func markInterruptedActivitiesFailed(driveID: String) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        var records = load(driveID: driveID)
-        var changed = false
-        for index in records.indices where records[index].status == "running" {
-            records[index].status = "failed"
-            records[index].error = "The transfer was interrupted."
-            records[index].updatedAt = now()
-            changed = true
+        update(driveID: driveID) { records in
+            for index in records.indices where records[index].status == "running" {
+                records[index].status = "failed"
+                records[index].error = "The transfer was interrupted."
+                records[index].updatedAt = Int64(Date().timeIntervalSince1970)
+            }
         }
-        if changed { write(records, driveID: driveID) }
     }
 
     static func records(driveID: String) -> [FileProviderActivityRecord] {
-        lock.lock()
-        defer { lock.unlock() }
-        return load(driveID: driveID)
-    }
-
-    private static func load(driveID: String) -> [FileProviderActivityRecord] {
-        guard let data = try? Data(contentsOf: fileURL(driveID: driveID)) else { return [] }
-        return (try? JSONDecoder().decode([FileProviderActivityRecord].self, from: data)) ?? []
-    }
-
-    private static func write(_ records: [FileProviderActivityRecord], driveID: String) {
         do {
-            try FileManager.default.createDirectory(
-                at: directoryURL, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            let destination = fileURL(driveID: driveID)
-            try JSONEncoder().encode(records).write(to: destination, options: .atomic)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            guard let data = try FileProviderStateDatabase().get(namespace, "\(driveID).json") else { return [] }
+            return try JSONDecoder().decode([FileProviderActivityRecord].self, from: data)
         } catch {
-            logger.error(
-                "could not persist transfer activity: \(error.localizedDescription, privacy: .public)")
+            logger.error("could not read activity: \(error.localizedDescription, privacy: .public)")
+            return []
         }
-    }
-
-    private static func fileURL(driveID: String) -> URL {
-        directoryURL.appendingPathComponent("\(driveID).json")
-    }
-
-    private static var directoryURL: URL {
-        if let override = ProcessInfo.processInfo.environment["CLOUDREVE_FP_ACTIVITY_DIR"] {
-            return URL(fileURLWithPath: override, isDirectory: true)
-        }
-        let home: URL
-        if let pw = getpwuid(getuid()), let directory = pw.pointee.pw_dir {
-            home = URL(fileURLWithPath: String(cString: directory))
-        } else {
-            home = URL(fileURLWithPath: "/Users/\(NSUserName())")
-        }
-        return home.appendingPathComponent(".cloudreve/fileprovider-activity", isDirectory: true)
-    }
-
-    private static func now() -> Int64 {
-        Int64(Date().timeIntervalSince1970)
     }
 }
 

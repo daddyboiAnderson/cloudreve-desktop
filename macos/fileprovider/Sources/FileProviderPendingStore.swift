@@ -9,7 +9,7 @@ enum FileProviderDownloadRetryStore {
     static func isRequested(driveID: String, itemIdentifier: String) -> Bool {
         let marker = markerURL(driveID: driveID, itemIdentifier: itemIdentifier)
         guard
-            let data = try? Data(contentsOf: marker),
+            let data = try? FileProviderStateDatabase().get("fileprovider-download-retries", marker.lastPathComponent),
             let value = String(data: data, encoding: .utf8),
             let timestamp = Int64(value.trimmingCharacters(in: .whitespacesAndNewlines))
         else {
@@ -18,15 +18,15 @@ enum FileProviderDownloadRetryStore {
 
         let age = Int64(Date().timeIntervalSince1970 * 1_000) - timestamp
         guard age >= -10_000, age <= lifetime else {
-            try? FileManager.default.removeItem(at: marker)
+            try? FileProviderStateDatabase().remove("fileprovider-download-retries", marker.lastPathComponent)
             return false
         }
         return true
     }
 
     static func finish(driveID: String, itemIdentifier: String) {
-        try? FileManager.default.removeItem(
-            at: markerURL(driveID: driveID, itemIdentifier: itemIdentifier))
+        try? FileProviderStateDatabase().remove("fileprovider-download-retries",
+            markerURL(driveID: driveID, itemIdentifier: itemIdentifier).lastPathComponent)
     }
 
     private static func markerURL(driveID: String, itemIdentifier: String) -> URL {
@@ -225,14 +225,7 @@ final class FileProviderPendingMonitor {
             driveName: drive.name,
             updatedAt: Int64(Date().timeIntervalSince1970 * 1_000),
             items: failures)
-        let directory = Self.directoryURL
-        try FileManager.default.createDirectory(
-            at: directory, withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-        let destination = directory.appendingPathComponent("\(drive.id).json")
-        try JSONEncoder().encode(snapshot).write(to: destination, options: .atomic)
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        try FileProviderStateDatabase().put("fileprovider-pending", "\(drive.id).json", JSONEncoder().encode(snapshot))
         logger.notice("recorded \(failures.count) failed pending item(s)")
     }
 

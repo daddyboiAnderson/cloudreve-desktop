@@ -96,7 +96,7 @@ final class RemoteStore {
 
     // MARK: - Change feed (shared event log)
 
-    /// Remote event recorded by the main app as JSON lines.
+    /// Remote event recorded by the main app in the shared SQLite journal.
     struct FpEvent: Codable {
         let ts: Int64  // unix epoch milliseconds
         let type: String  // create | modify | metadata | rename | delete
@@ -108,12 +108,6 @@ final class RemoteStore {
             case ts, type, from, to
             case localEcho = "local_echo"
         }
-    }
-
-    private var eventsFileURL: URL {
-        DriveStore.drivesURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("fp-events/\(drive.id).jsonl")
     }
 
     /// Keep each File Provider callback short.  macOS immediately requests
@@ -230,18 +224,14 @@ final class RemoteStore {
             .appendingPathComponent("policy-rescan-\(drive.id).marker")
     }
 
-    private var resetMarkerURL: URL {
-        DriveStore.drivesURL.deletingLastPathComponent()
-            .appendingPathComponent("fp-reset/\(drive.id).marker")
-    }
-
     private var resetAcknowledgementURL: URL {
         stateDirectoryURL
             .appendingPathComponent("reset-applied-\(drive.id).marker")
     }
 
     private func resetLocalStateIfRequested() {
-        let request = try? Data(contentsOf: resetMarkerURL)
+        let request = try? FileProviderStateDatabase(root: stateDirectoryOverride ?? FileProviderStateDatabase.defaultRoot)
+            .get("fp-reset", "\(drive.id).marker")
         let acknowledged = try? Data(contentsOf: resetAcknowledgementURL)
         guard ResetRequest.shouldApply(request: request, acknowledged: acknowledged),
             let request
@@ -1174,21 +1164,19 @@ final class RemoteStore {
         pinRequestLock.lock()
         defer { pinRequestLock.unlock() }
         struct Request: Decodable { let drive_id: String; let uri: String }
-        let directory = pinRequestDirectoryOverride ?? DriveStore.drivesURL.deletingLastPathComponent()
-            .appendingPathComponent("pin-requests")
-        let urls: [URL]
+        let database: FileProviderStateDatabase
+        let requests: [[String]]
         do {
-            urls = try FileManager.default.contentsOfDirectory(
-                at: directory, includingPropertiesForKeys: nil)
+            database = try FileProviderStateDatabase(root: pinRequestDirectoryOverride?.deletingLastPathComponent()
+                ?? FileProviderStateDatabase.defaultRoot)
+            try database.importRecords("pin-requests")
+            requests = try database.rows("SELECT key,payload FROM fp_records WHERE namespace='pin-requests' ORDER BY key")
         } catch {
-            if (error as NSError).code != NSFileReadNoSuchFileError {
-                logger.error("could not read pin requests: \(error.localizedDescription, privacy: .public)")
-            }
+            logger.error("could not read pin requests: \(error.localizedDescription, privacy: .public)")
             return
         }
-        for url in urls where url.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: url),
-                let request = try? JSONDecoder().decode(Request.self, from: data),
+        for row in requests where row[0].hasSuffix(".json") {
+            guard let request = try? JSONDecoder().decode(Request.self, from: Data(row[1].utf8)),
                 request.drive_id == self.drive.id else { continue }
             let uri = Self.canonicalURI(request.uri)
             let root = Self.canonicalURI(self.rootPath).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -1203,7 +1191,7 @@ final class RemoteStore {
                 let pins = try? JSONDecoder().decode([String].self, from: saved),
                 Set(pins).isDisjoint(with: matches) {
                 do {
-                    try FileManager.default.removeItem(at: url)
+                    try database.execute("DELETE FROM fp_records WHERE namespace='pin-requests' AND key=? AND payload=?", row)
                     logger.notice("applied pin removal for \(uri, privacy: .public)")
                 } catch {
                     logger.error("could not acknowledge pin removal: \(error.localizedDescription, privacy: .public)")
@@ -1250,21 +1238,11 @@ final class RemoteStore {
         }
     }
 
-    private func readEvents() -> [FpEvent] {
-        guard let data = try? Data(contentsOf: eventsFileURL),
-            let text = String(data: data, encoding: .utf8)
-        else { return [] }
-        let decoder = JSONDecoder()
-        return text.split(separator: "\n").compactMap {
-            try? decoder.decode(FpEvent.self, from: Data($0.utf8))
-        }
-    }
-
     // MARK: Anchors and change replay
 
     /// Anchor for the last delivered event: "evt-<millis>".
-    func currentSyncAnchor() -> NSFileProviderSyncAnchor {
-        let lastTs = readEvents().last?.ts ?? 0
+    func currentSyncAnchor() throws -> NSFileProviderSyncAnchor {
+        let lastTs = try FileProviderStateDatabase().eventSnapshot(drive: drive.id, since: nil).latest
         return NSFileProviderSyncAnchor(Data("evt-\(lastTs)".utf8))
     }
 
@@ -1277,7 +1255,11 @@ final class RemoteStore {
         else {
             throw NSFileProviderError(.syncAnchorExpired)
         }
-        let events = readEvents()
+        let snapshot = try FileProviderStateDatabase().eventSnapshot(drive: drive.id, since: since)
+        guard since >= snapshot.floor, since <= snapshot.latest else {
+            throw NSFileProviderError(.syncAnchorExpired)
+        }
+        let events = try snapshot.events.map { try JSONDecoder().decode(FpEvent.self, from: $0) }
         // A rescan marker invalidates all later anchors.
         if events.contains(where: { $0.type == "rescan" && $0.ts > since }) {
             throw NSFileProviderError(.syncAnchorExpired)
@@ -1289,7 +1271,7 @@ final class RemoteStore {
         // If this container has no more applicable events, it may safely
         // advance past unrelated records. Otherwise stop at the last event in
         // this page so the next callback continues without losing anything.
-        let nextTimestamp = moreComing ? (page.last?.ts ?? since) : (events.last?.ts ?? since)
+        let nextTimestamp = moreComing ? (page.last?.ts ?? since) : snapshot.latest
         let newAnchor = NSFileProviderSyncAnchor(Data("evt-\(nextTimestamp)".utf8))
         logger.notice(
             "changes for \(container.rawValue, privacy: .public): anchor \(since), relevant \(relevant.count), delivered \(page.count), next \(nextTimestamp), moreComing \(moreComing)"

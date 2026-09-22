@@ -8,6 +8,8 @@ pub mod drive;
 pub mod events;
 #[cfg(target_os = "macos")]
 pub mod fileprovider;
+#[cfg(target_os = "macos")]
+pub mod fileprovider_db;
 pub mod inventory;
 pub mod logging;
 #[cfg(windows)]
