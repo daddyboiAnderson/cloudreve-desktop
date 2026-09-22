@@ -4,7 +4,7 @@
 #
 # Env overrides:
 #   FP_SIGN_IDENTITY  codesign identity ("-" = ad-hoc, default)
-#   FP_CONFIGURATION  Debug (default) | Release
+#   FP_CONFIGURATION  Debug | Release (default)
 #   FP_BUILD_NUMBER   numeric CFBundleVersion (default: 5.1)
 #   FP_SHORT_VERSION  release version (default: 0.2.0)
 set -euo pipefail

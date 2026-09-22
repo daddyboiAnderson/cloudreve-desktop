@@ -18,6 +18,7 @@ delete old domains, private state or downloaded content.
      FP_SHORT_VERSION=0.2.1 FP_BUILD_NUMBER=184 \
      bash macos/scripts/embed-into-app.sh
    TAURI_SIGNING_PRIVATE_KEY_PATH=/secure/path/updater.key \
+     TAURI_SIGNING_PRIVATE_KEY_PASSWORD='' \
      bash macos/scripts/package-release.sh
    ```
 
@@ -41,6 +42,9 @@ The updater private key is stored outside Git and outside `.cloudreve`. Back it
 up securely: losing it prevents future updates for installed clients. Only its
 public key belongs in `tauri.conf.json`. Do not print the private key or include
 it in artifacts. A key rotation requires a separately planned trust transition.
+The example explicitly supplies an empty password for the current passwordless
+key. For an encrypted key, supply its real password through a secret environment
+variable instead; do not put that password in shell history or committed files.
 
 App bundles must be archived and signed **after** embedding the extension and
 re-signing the outer bundle. Tauri's automatic pre-embedding updater artifacts
