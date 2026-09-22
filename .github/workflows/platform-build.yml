@@ -54,7 +54,7 @@ jobs:
 
       - name: Test macOS state migration
         if: runner.os == 'macOS'
-        run: ./macos/scripts/test-state-database.sh
+        run: bash macos/scripts/test-state-database.sh
 
       - name: Build macOS application bundle
         if: runner.os == 'macOS'
