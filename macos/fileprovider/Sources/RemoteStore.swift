@@ -93,6 +93,8 @@ final class RemoteStore {
     private let actionGate = OperationGate()
     private let managerCallGate = OperationGate()
     private let metadataRefreshCoordinator = MetadataRefreshCoordinator()
+    private let migrationRecoveryGate = OperationGate()
+    private var migrationRecoveryCompleted = false
 
     // MARK: - Change feed (shared event log)
 
@@ -231,7 +233,7 @@ final class RemoteStore {
 
     private func resetLocalStateIfRequested() {
         let request = try? FileProviderStateDatabase(root: stateDirectoryOverride ?? FileProviderStateDatabase.defaultRoot)
-            .get("fp-reset", "\(drive.id).marker")
+            .get("fp-reset-requests-v2", "\(drive.id).marker")
         let acknowledged = try? Data(contentsOf: resetAcknowledgementURL)
         guard ResetRequest.shouldApply(request: request, acknowledged: acknowledged),
             let request
@@ -1016,6 +1018,7 @@ final class RemoteStore {
         for uri in pendingItemUpdatesSnapshot() {
             do {
                 let file = try await client.fileInfoWithShareState(uri: uri)
+                for parent in try await parentItemsForUpdate(file) { add(parent) }
                 let pendingItem = makeItem(file)
                 add(pendingItem)
                 if pendingItem.contentType.conforms(to: .folder) {
@@ -1436,6 +1439,95 @@ final class RemoteStore {
     }
 
     // MARK: - Item construction
+
+    /// An event can arrive before its parent was ever enumerated, or after a
+    /// local identity cache was lost. Never publish a child under a guessed URI
+    /// identifier when Finder already knows its parent by a stable remote ID.
+    func parentItemsForUpdate(_ file: RemoteFile) async throws -> [FileProviderItem] {
+        var path = parentPath(of: Self.canonicalURI(file.path))
+        var ancestors: [RemoteFile] = []
+        var visited = Set<String>()
+        while path != rootPath && path != "cloudreve:" && visited.insert(path).inserted {
+            if identityMapsSnapshot().byURI[path] != nil { break }
+            let parent = try await client.fileInfoWithShareState(uri: path)
+            ancestors.append(parent)
+            path = parentPath(of: path)
+        }
+        return ancestors.reversed().map { makeItem($0) }
+    }
+
+    /// Build 181 accidentally imported historical reset commands as new work.
+    /// Recover only that migration from macOS's retained metadata, once. Normal
+    /// resets use a separate namespace and cannot trigger this recovery.
+    func recoverMigrationStateIfNeeded() async throws {
+        await migrationRecoveryGate.acquire()
+        do {
+            try await recoverMigrationState()
+            await migrationRecoveryGate.release()
+        } catch {
+            await migrationRecoveryGate.release()
+            throw error
+        }
+    }
+
+    private func recoverMigrationState() async throws {
+        if migrationRecoveryCompleted { return }
+        let database = try FileProviderStateDatabase(root: stateDirectoryOverride ?? FileProviderStateDatabase.defaultRoot)
+        let key = "\(drive.id).marker"
+        let recovered = try database.get("fp-migration-repair-v183", key)
+        let legacy = try database.get("fp-reset", key)
+        let acknowledged = try? Data(contentsOf: resetAcknowledgementURL)
+        guard recovered == nil, let legacy, legacy == acknowledged else {
+            migrationRecoveryCompleted = true
+            return
+        }
+        guard let manager = NSFileProviderManager(for: domain) else {
+            throw NSFileProviderError(.providerNotFound)
+        }
+        let items = try await MaterializedStateRecovery.read(manager: manager)
+        let recoveredState = MaterializedStateRecovery.reconstruct(items, root: rootPath,
+            existing: identityMapsSnapshot().byIdentifier)
+        mergeRecoveredIdentities(recoveredState.identities)
+        for identifier in recoveredState.pins {
+            setPinned(true, for: NSFileProviderItemIdentifier(identifier))
+        }
+        // Persist errors must not mark a partial repair as finished.
+        try JSONEncoder().encode(identityMapsSnapshot().byIdentifier).write(to: identityFileURL, options: .atomic)
+        try JSONEncoder().encode(Array(pinnedIdentifiersSnapshot())).write(to: pinnedFileURL, options: .atomic)
+        // Replay metadata delivered with missing parent mappings after the reset.
+        let date = try resetAcknowledgementURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
+        let snapshot = try database.eventSnapshot(drive: drive.id, since: Int64(date.timeIntervalSince1970 * 1000))
+        let events = try snapshot.events.map { try JSONDecoder().decode(FpEvent.self, from: $0) }
+        let paths = events.compactMap { event -> String? in
+            switch event.type {
+            case "create", "modify", "metadata": return uri(forEventPath: event.from)
+            case "rename": return event.to.map { uri(forEventPath: $0) }
+            default: return nil
+            }
+        }
+        recordPendingItemUpdates(uris: paths)
+        let queued = try JSONDecoder().decode([String].self, from: Data(contentsOf: pendingPolicyUpdatesFileURL))
+        guard Set(paths).isSubset(of: Set(queued)) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try database.put("fp-migration-repair-v183", key, Data("recovered".utf8))
+        migrationRecoveryCompleted = true
+        logger.notice("recovered \(recoveredState.identities.count) identities and \(recoveredState.pins.count) pin selections from Finder")
+    }
+
+    private func mergeRecoveredIdentities(_ identities: [String: String]) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        for (identifier, uri) in identities {
+            // Do not replace an identity learned by a concurrent live callback.
+            if let existing = identifierByURI[uri], existing != identifier { continue }
+            if let previous = uriByIdentifier[identifier], previous != uri {
+                identifierByURI.removeValue(forKey: previous)
+            }
+            uriByIdentifier[identifier] = uri
+            identifierByURI[uri] = identifier
+        }
+    }
 
     /// Writable capabilities; trash is handled by the server.
     private static let writableCapabilities: NSFileProviderItemCapabilities = [

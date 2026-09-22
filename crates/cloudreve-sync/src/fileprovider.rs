@@ -337,7 +337,8 @@ pub fn request_local_state_reset(drive_id: &str) -> Result<()> {
         chrono::Utc::now().timestamp_millis(),
         uuid::Uuid::new_v4()
     );
-    crate::fileprovider_db::StateDb::open()?.put("fp-reset", &format!("{drive_id}.marker"), &token)
+    // Destructive commands must never be imported from legacy state directories.
+    crate::fileprovider_db::StateDb::open()?.put("fp-reset-requests-v2", &format!("{drive_id}.marker"), &token)
 }
 
 /// Commit a batch before signalling Finder. Sequence allocation is transactional.

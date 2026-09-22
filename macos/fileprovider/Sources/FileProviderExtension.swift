@@ -29,7 +29,15 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension,
             )
             // Resume downloads for persisted pins.
             if let store = self.store {
-                Task { await store.requestDownloadsForPinnedItems() }
+                Task { [logger] in
+                    do {
+                        try await store.recoverMigrationStateIfNeeded()
+                        await store.signalWorkingSet()
+                        await store.requestDownloadsForPinnedItems()
+                    } catch {
+                        logger.error("state recovery failed: \(error.localizedDescription, privacy: .public)")
+                    }
+                }
             }
         } else {
             self.store = nil

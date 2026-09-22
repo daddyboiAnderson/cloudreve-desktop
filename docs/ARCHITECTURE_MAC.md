@@ -189,6 +189,22 @@ re-imported. They are not active mirrors and must not be copied over the databas
 Do not run old and new app builds simultaneously during migration. A rollback
 to the old file-based build cannot see new database-only requests.
 
+Destructive reset commands are an exception: new explicit requests use
+`fp-reset-requests-v2`. Historical `fp-reset` files/rows are never executed.
+Build 181 incorrectly replayed those commands during import. Build 183 performs
+a one-time repair for affected domains using macOS's materialized-item enumerator:
+it restores identity paths from the native parent/name hierarchy, attempts to
+recover pins from retained metadata, then requeues metadata received after the
+accidental reset. If custom userInfo is absent but contentPolicy or the extension's
+persisted `#kd` metadata marker is exposed, it restores the topmost Keep Downloaded
+policy roots without promoting every inherited child to a separate pin.
+On the affected macOS 27 installation, the native enumerator omitted all pin-policy
+fields: identity recovery succeeded, but pins required a targeted restoration
+from Finder's diagnostic `cp:keepDownloaded` state. Automatic pin recovery is
+therefore best-effort, not guaranteed. Never infer pins merely from downloaded
+contents. Missing parent identities
+are also resolved and published before child updates in normal change replay.
+
 The extension's private identity/pin/policy snapshots remain in its own container
 in this migration; preserving them avoids changing Finder identity or resetting
 the domain. Logs, icons, backups, content, and drive configuration remain files.

@@ -28,6 +28,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         if containerIdentifier == .workingSet {
             Task {
                 do {
+                    try await store.recoverMigrationStateIfNeeded()
                     store.applyPinRequests()
                     let items = try await store.workingSetItems()
                     observer.didEnumerate(items)
@@ -62,6 +63,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
         Task {
             do {
+                try await store.recoverMigrationStateIfNeeded()
                 store.applyPinRequests()
                 _ = consumePresentedContainerRefresh()
                 let (items, nextPage) = try await store.children(
@@ -92,6 +94,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         )
         Task {
             do {
+                try await store.recoverMigrationStateIfNeeded()
                 store.applyPinRequests()
                 if containerIdentifier != .workingSet,
                     containerIdentifier != .trashContainer,
@@ -171,6 +174,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                             }
                             do {
                                 let file = try await store.client.fileInfoWithShareState(uri: uri)
+                                items.append(contentsOf: try await store.parentItemsForUpdate(file))
                                 items.append(store.makeItem(file))
                             } catch CloudreveError.noSuchItem {
                                 // The remote delete superseded this update.
@@ -244,6 +248,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             // Refresh metadata; a disappeared item becomes a delete.
             do {
                 let file = try await store.client.fileInfoWithShareState(uri: fromURI)
+                let parents = try await store.parentItemsForUpdate(file)
+                if !parents.isEmpty { observer.didUpdate(parents) }
                 let item = store.makeItem(file)
                 var refreshContent = false
                 if containerIdentifier == .workingSet && change.type == "modify"
@@ -276,6 +282,8 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 let toURI = store.uri(forEventPath: to)
                 do {
                     let file = try await store.client.fileInfoWithShareState(uri: toURI)
+                    let parents = try await store.parentItemsForUpdate(file)
+                    if !parents.isEmpty { observer.didUpdate(parents) }
                     observer.didUpdate([
                         store.makeItem(file, preservingIdentifier: identifier)
                     ])

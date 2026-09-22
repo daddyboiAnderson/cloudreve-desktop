@@ -14,8 +14,24 @@ enum PinRequestTests {
             remote_path: "cloudreve://my", user_id: "test", enabled: true,
             credentials: Credentials(refresh_token: ""))
         let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier("test"), displayName: "Test")
+        // Migration must never execute a historical destructive command.
+        let migrationDB = try FileProviderStateDatabase(root: temporary)
+        try migrationDB.put("fp-reset", "test.marker", Data("historical reset".utf8))
+        try JSONEncoder().encode(["cloudreve://my/Preserved"]).write(to: temporary.appendingPathComponent("pinned-test.json"))
         let store = RemoteStore(drive: drive, domain: domain,
             stateDirectory: temporary, pinRequestDirectory: requests)
+        precondition(store.isPinned(NSFileProviderItemIdentifier("cloudreve://my/Preserved")), "Import must preserve existing pins")
+        let recovered = MaterializedStateRecovery.reconstruct([
+            .init(identifier: "child", parent: "parent", name: "a b.pdf", explicitlyPinned: false),
+            .init(identifier: "parent", parent: NSFileProviderItemIdentifier.rootContainer.rawValue, name: "Folder", explicitlyPinned: true),
+        ], root: "cloudreve://my", existing: [:])
+        precondition(recovered.identities["child"] == "cloudreve://my/Folder/a b.pdf")
+        precondition(recovered.pins == ["parent"], "Inherited pins must not become explicit selections")
+        let policyRecovery = MaterializedStateRecovery.reconstruct([
+            .init(identifier: "child", parent: "parent", name: "a.pdf", explicitlyPinned: false, effectivelyPinned: true),
+            .init(identifier: "parent", parent: NSFileProviderItemIdentifier.rootContainer.rawValue, name: "Folder", explicitlyPinned: false, effectivelyPinned: true),
+        ], root: "cloudreve://my", existing: [:])
+        precondition(policyRecovery.pins == ["parent"], "Missing userInfo must recover policy roots, not every child")
         let folder = NSFileProviderItemIdentifier("cloudreve://my/Test Folder")
         let child = NSFileProviderItemIdentifier("cloudreve://my/Test Folder/child.txt")
         store.setPinned(true, for: folder)
