@@ -202,13 +202,49 @@ On the affected macOS 27 installation, the native enumerator omitted all pin-pol
 fields: identity recovery succeeded, but pins required a targeted restoration
 from Finder's diagnostic `cp:keepDownloaded` state. Automatic pin recovery is
 therefore best-effort, not guaranteed. Never infer pins merely from downloaded
-contents. Missing parent identities
-are also resolved and published before child updates in normal change replay.
+contents. Missing parent identities are also resolved through authoritative
+server metadata and published top-down before child updates in normal change
+replay. This prevents new nested items from waiting indefinitely for a parent
+whose guessed URI identifier differs from Finder's stable remote identifier.
 
 The extension's private identity/pin/policy snapshots remain in its own container
 in this migration; preserving them avoids changing Finder identity or resetting
 the domain. Logs, icons, backups, content, and drive configuration remain files.
 Existing unknown/obsolete directories are not deleted automatically.
+
+### Cleaning up a migrated installation
+
+After confirming the installed host and extension use the database-backed build,
+check `PRAGMA quick_check`, completed namespaces in `fp_imports`, and the active
+drive's `fp_event_heads.imported` flag. Legacy directories can then be moved to a
+dated backup outside `~/.cloudreve`; preserve unimported historical drives there
+rather than treating them as current events. An empty legacy request directory
+has no payload to migrate. Do not delete database import markers or re-submit
+archived reset/pin requests.
+
+The expected active directory contains:
+
+- `drives.json`: drive configuration;
+- `meta.db`: host inventory and recovery outbox;
+- `fileprovider.db`: shared journal and operational records;
+- `icos/` and `logs/`: icons and diagnostic logs.
+
+SQLite may also create `-wal`, `-shm`, or journal sidecars. These are active
+database files, not cleanup candidates. Never move them independently of their
+database. The extension's private container and Finder's domain are not part of
+this cleanup; keep their identity, pin, and policy state intact.
+
+Legacy archive candidates are `fileprovider-activity`,
+`fileprovider-download-retries`, `fileprovider-pending`,
+`fileprovider-upload-receipts`, `fp-events`, `fp-health`, `fp-reset`,
+`fp-share-state`, `pin-requests`, and `upload-conflicts`, plus existing manual
+backups. Archiving is reversible, but restoring these files alone does not roll
+back the database migration. Do not launch an older build against this cleaned
+installation as a verification step.
+
+Verify database integrity and retained Finder entries after cleanup. A fresh
+remote change appearing in Finder is the end-to-end sync check; merely removing
+legacy folders or seeing an existing placeholder does not prove event delivery.
 
 Current development signing uses temporary sandbox exceptions for the shared
 database and its WAL/SHM/journal sidecars, plus legacy paths needed for import.
